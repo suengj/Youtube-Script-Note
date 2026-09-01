@@ -1,4 +1,4 @@
-# p03_speech2text
+# Youtube Script Note (P03)
 
 YouTube discovery → subtitles or audio → Whisper MLX fallback → LLM transcript preprocessing → structured Markdown summarization → optional Google Drive Desktop synchronization.
 
@@ -36,8 +36,8 @@ See [docs/PROJECT.md](docs/PROJECT.md) for full pipeline documentation.
 ## Quick start
 
 ```bash
-git clone https://github.com/suengj/p03_speech2text.git
-cd p03_speech2text
+git clone https://github.com/suengj/Youtube-Script-Note.git
+cd Youtube-Script-Note
 cp .env.example .env   # fill API keys and paths
 python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
