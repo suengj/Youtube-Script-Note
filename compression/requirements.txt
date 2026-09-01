@@ -1,0 +1,19 @@
+# 오디오 압축 도구 의존성
+# 기본 라이브러리 (Python 내장)
+# - os, subprocess, pathlib, argparse, json, datetime
+
+# 외부 의존성
+# FFmpeg는 별도 설치 필요 (brew install ffmpeg)
+
+# 기존 프로젝트 의존성
+openai>=1.0.0
+pytubefix>=6.0.0
+moviepy>=1.0.3
+mlx-whisper>=0.0.1
+tiktoken>=0.5.0
+pandas>=1.5.0
+tqdm>=4.64.0
+
+# 오디오 처리 관련 (선택사항)
+# pydub>=0.25.1  # 고급 오디오 처리용
+# librosa>=0.10.0  # 오디오 분석용

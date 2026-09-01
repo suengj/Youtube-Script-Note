@@ -1,0 +1,161 @@
+{
+  "schema_version": 1,
+  "description": "P03 representative transcript samples for LLM benchmark (paths relative to repo root)",
+  "samples": [
+    {
+      "id": "s01_en_academic",
+      "video_id": "rXcYPHfyyRQ",
+      "title": "Bioethics (English lecture)",
+      "category": "english_to_korean",
+      "source_path": "experiments/llm_blind_test_20260616/vtt/rXcYPHfyyRQ.en.vtt",
+      "source_type": "vtt",
+      "max_input_chars": 12000,
+      "retention": [80, 95],
+      "auto_subs": false
+    },
+    {
+      "id": "s02_en_economics",
+      "video_id": "dr5z2WvEXBI",
+      "title": "Mexico/China economics (English)",
+      "category": "english_to_korean",
+      "source_path": "experiments/llm_blind_test_20260616/vtt/dr5z2WvEXBI.en.vtt",
+      "source_type": "vtt",
+      "max_input_chars": 12000,
+      "retention": [80, 95],
+      "auto_subs": false
+    },
+    {
+      "id": "s03_ko_general",
+      "video_id": "tprCX5OaoA4",
+      "title": "Korean general (uploader subs)",
+      "category": "korean_general",
+      "source_path": "quarantine/subtitles/tprCX5OaoA4/tprCX5OaoA4.ko-orig.vtt",
+      "source_type": "vtt",
+      "max_input_chars": 10000,
+      "retention": [80, 95],
+      "auto_subs": false
+    },
+    {
+      "id": "s04_ko_general_2",
+      "video_id": "ZjHHEwhHrh4",
+      "title": "Korean general 2",
+      "category": "korean_general",
+      "source_path": "quarantine/subtitles/ZjHHEwhHrh4/ZjHHEwhHrh4.ko-orig.vtt",
+      "source_type": "vtt",
+      "max_input_chars": 10000,
+      "retention": [80, 95],
+      "auto_subs": false
+    },
+    {
+      "id": "s05_tech_dev",
+      "video_id": "jfxHHglA5Eo",
+      "title": "Tech/dev English auto subs",
+      "category": "tech_dev",
+      "source_path": "cache/transcripts/jfxHHglA5Eo.json",
+      "source_type": "cache",
+      "max_input_chars": 12000,
+      "retention": [60, 80],
+      "auto_subs": true
+    },
+    {
+      "id": "s06_numbers_entities",
+      "video_id": "Yx7YrJEORxY",
+      "title": "Numbers and proper nouns heavy",
+      "category": "numbers_proper_nouns",
+      "source_path": "cache/transcripts/Yx7YrJEORxY.json",
+      "source_type": "cache",
+      "max_input_chars": 10000,
+      "retention": [60, 80],
+      "auto_subs": true
+    },
+    {
+      "id": "s07_long_english",
+      "video_id": "qkqtAjhVRSQ",
+      "title": "Long English podcast (truncated)",
+      "category": "long_video",
+      "source_path": "cache/transcripts/qkqtAjhVRSQ.json",
+      "source_type": "cache",
+      "max_input_chars": 15000,
+      "retention": [60, 80],
+      "auto_subs": true
+    },
+    {
+      "id": "s08_noisy_auto",
+      "video_id": "jNQXAC9IVRw",
+      "title": "Noisy auto subs (legacy EN)",
+      "category": "noisy_auto_subs",
+      "source_path": "quarantine/subtitles/jNQXAC9IVRw/jNQXAC9IVRw.en.vtt",
+      "source_type": "vtt",
+      "max_input_chars": 8000,
+      "retention": [60, 80],
+      "auto_subs": true
+    },
+    {
+      "id": "s09_ko_auto",
+      "video_id": "82OyFv4ni0c",
+      "title": "Korean auto subs long",
+      "category": "korean_general",
+      "source_path": "cache/transcripts/82OyFv4ni0c.json",
+      "source_type": "cache",
+      "max_input_chars": 12000,
+      "retention": [60, 80],
+      "auto_subs": true
+    },
+    {
+      "id": "s10_mixed_ko_en",
+      "video_id": "g4gxmfg0QP4",
+      "title": "Mixed Korean/English",
+      "category": "mixed_ko_en",
+      "source_path": "cache/transcripts/g4gxmfg0QP4.json",
+      "source_type": "cache",
+      "max_input_chars": 10000,
+      "retention": [60, 80],
+      "auto_subs": true
+    },
+    {
+      "id": "s11_low_quality_short",
+      "video_id": "A9nnvw2wqmE",
+      "title": "Short fragmentary auto subs",
+      "category": "low_quality_subs",
+      "source_path": "cache/transcripts/A9nnvw2wqmE.json",
+      "source_type": "cache",
+      "max_input_chars": 8000,
+      "retention": [60, 80],
+      "auto_subs": true
+    },
+    {
+      "id": "s12_finance_entities",
+      "video_id": "COmxq7bh-fM",
+      "title": "Finance with product/company names",
+      "category": "numbers_proper_nouns",
+      "source_path": "cache/transcripts/COmxq7bh-fM.json",
+      "source_type": "cache",
+      "max_input_chars": 10000,
+      "retention": [60, 80],
+      "auto_subs": true
+    }
+  ],
+  "model_candidates": {
+    "preprocess": [
+      {"label": "current_nano", "provider": "openai", "model": "gpt-5-nano-2025-08-07", "is_current": true},
+      {"label": "candidate_41_nano", "provider": "openai", "model": "gpt-4.1-nano-2025-04-14", "is_current": false}
+    ],
+    "main": [
+      {"label": "current_mini", "provider": "openai", "model": "gpt-5-mini-2025-08-07", "is_current": true},
+      {"label": "candidate_41_mini", "provider": "openai", "model": "gpt-4.1-mini-2025-04-14", "is_current": false},
+      {"label": "candidate_deepseek", "provider": "openrouter", "model": "deepseek/deepseek-v4-flash", "is_current": false}
+    ]
+  },
+  "e2e_combinations": [
+    {"label": "A_current", "preprocess": "gpt-5-nano-2025-08-07", "main": "gpt-5-mini-2025-08-07", "is_current": true},
+    {"label": "B_cheap_pre", "preprocess": "gpt-4.1-nano-2025-04-14", "main": "gpt-5-mini-2025-08-07"},
+    {"label": "C_cheap_main", "preprocess": "gpt-5-nano-2025-08-07", "main": "gpt-4.1-mini-2025-04-14"},
+    {"label": "D_both_cheap", "preprocess": "gpt-4.1-nano-2025-04-14", "main": "gpt-4.1-mini-2025-04-14"}
+  ],
+  "fallback_candidate": {
+    "primary": "gpt-5-mini-2025-08-07",
+    "fallback_provider": "openrouter",
+    "fallback_model": "deepseek/deepseek-v4-flash"
+  },
+  "judge_model": "gpt-4.1-mini-2025-04-14"
+}

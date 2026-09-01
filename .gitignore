@@ -1,0 +1,54 @@
+# User-requested exclusions (runtime / bulky)
+/audio/
+/backup/
+/cache/
+/data/
+/index/
+/logs/
+/output_new/
+/output_old/
+/tmp/
+/quarantine/
+/YTT_AUDIO/
+/yt_subs/
+/*.csv
+
+# Secrets & local runtime
+.env
+.env.*
+!.env.example
+youtube_cookies.txt
+youtube.com_cookies.txt
+cookies.txt
+*.cookies.txt
+*cookies*.txt
+.p03_speech2text.lock
+
+# Python / IDE
+__pycache__/
+*.py[cod]
+.ipynb_checkpoints/
+.DS_Store
+
+# Large metadata (CSV is tracked; jsonl stays local)
+video_metadata_*.jsonl
+
+# Prompt logs, scratch, archives
+/prompt/
+/url_history/
+/_pywork/
+.taskmaster/
+
+# LLM benchmark artifacts (harness code tracked)
+/artifacts/
+
+# Blind-test artifacts (script + SCORING.md kept)
+experiments/**/vtt/
+experiments/**/00_preprocessed/
+experiments/**/sample_*/
+experiments/**/mapping.json
+experiments/**/run_meta.json
+
+# Recovery bundles (never commit)
+*.bundle
+*_private_archive/

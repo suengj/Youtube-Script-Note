@@ -1,0 +1,21 @@
+# Core pipeline (Python 3.9+)
+python-dotenv>=1.0.0
+pandas>=2.0.0
+tqdm>=4.66.0
+openai>=1.0.0
+yt-dlp>=2024.1.0
+
+# macOS Apple Silicon — Whisper MLX (required for audio fallback)
+mlx-whisper>=0.4.0
+
+# Optional: audio processing (used by stt_function_v3)
+moviepy>=1.0.3
+
+# Tests
+pytest>=7.0.0
+
+# Optional: channel crawl / HTTP
+requests>=2.28.0
+
+# Optional: M4A archive compression (zip_process.py)
+zstandard>=0.21.0
