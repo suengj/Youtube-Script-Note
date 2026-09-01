@@ -37,7 +37,7 @@ Rationale:
 - PR #4 hosted metadata cannot be certified clean without abandoning PR history.
 - In-place history rewrite cannot purge GitHub PR comments/refs.
 
-Private archive retains existing repository object and history. Certified sanitized tree publishes as fresh `main` with clean history at canonical `suengj/p03_speech2text` after owner approval.
+Private archive retains existing repository object and history. Certified sanitized tree publishes as fresh `main` with clean history after owner approval.
 
 ## Remediation plan
 
@@ -46,3 +46,7 @@ Private archive retains existing repository object and history. Certified saniti
 3. Fresh orphan commit on implementation branch (SUE-422).
 4. Independent certification (SUE-424).
 5. Human approval gate before visibility change (SUE-425).
+
+## Post-release repository name
+
+The sanitized public repository was later renamed to `suengj/Youtube-Script-Note`. The historical repository and PR metadata remain isolated in the private archive `suengj/p03_speech2text_private_archive`.
