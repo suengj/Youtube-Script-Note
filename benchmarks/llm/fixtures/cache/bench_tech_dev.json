@@ -1,0 +1,4 @@
+{
+  "video_id": "bench_tech_dev",
+  "text": "Kubernetes schedules pods across nodes using requests and limits. Horizontal Pod Autoscaler scales replicas from CPU or custom metrics. Ingress controllers terminate TLS and route HTTP traffic."
+}

@@ -90,6 +90,16 @@ def test_manifest_loads():
     assert m["model_candidates"]["preprocess"]
 
 
+def test_fixture_sources_exist():
+    from benchmarks.llm.runner import load_sample_text
+
+    root = Path(__file__).resolve().parents[1]
+    m = load_manifest(root / "benchmarks" / "llm" / "dataset_manifest.json")
+    for sample in m["samples"]:
+        text = load_sample_text(sample, root)
+        assert len(text) > 10, sample["id"]
+
+
 def test_failing_primary_raises():
     with pytest.raises(Exception):
         FailingPrimaryClient.chat.completions.create(model="x", messages=[])

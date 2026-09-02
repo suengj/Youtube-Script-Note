@@ -1,14 +1,14 @@
 {
-  "rXcYPHfyyRQ": {
-    "path": "experiments/mobile_md_pilot/rXcYPHfyyRQ_v2.md",
+  "bench_en_academic": {
+    "path": "experiments/mobile_md_pilot/bench_en_academic_v2.md",
     "format_version": "4.1",
-    "title": "PHILOSOPHY - BIOETHICS 2",
+    "title": "Bioethics lecture (synthetic)",
     "tags": ["philosophy", "bioethics"]
   },
-  "dr5z2WvEXBI": {
-    "path": "experiments/mobile_md_pilot/dr5z2WvEXBI_v2.md",
+  "bench_en_economics": {
+    "path": "experiments/mobile_md_pilot/bench_en_economics_v2.md",
     "format_version": "4.1",
-    "title": "Mexico Will Not Be the Next China",
+    "title": "Supply chain economics (synthetic)",
     "tags": ["economics", "trade"]
   }
 }

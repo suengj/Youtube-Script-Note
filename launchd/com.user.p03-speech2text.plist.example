@@ -1,0 +1,50 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.user.p03-speech2text</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/YOU/Library/Application Support/com.user.p03-speech2text/run-p03-speech2text.sh</string>
+    </array>
+    <key>WorkingDirectory</key>
+    <string>/path/to/Youtube-Script-Note</string>
+    <key>StartCalendarInterval</key>
+    <array>
+        <dict>
+            <key>Hour</key>
+            <integer>2</integer>
+            <key>Minute</key>
+            <integer>0</integer>
+        </dict>
+        <dict>
+            <key>Hour</key>
+            <integer>14</integer>
+            <key>Minute</key>
+            <integer>0</integer>
+        </dict>
+    </array>
+    <key>StandardOutPath</key>
+    <string>/Users/YOU/Library/Logs/p03-speech2text/launchd_stdout.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/YOU/Library/Logs/p03-speech2text/launchd_stderr.log</string>
+    <key>RunAtLoad</key>
+    <false/>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>LAUNCHD_SCHEDULED</key>
+        <string>1</string>
+        <key>WORK_PATH</key>
+        <string>/path/to/Youtube-Script-Note</string>
+        <key>TMPDIR</key>
+        <string>/path/to/Youtube-Script-Note/tmp</string>
+        <key>XDG_CACHE_HOME</key>
+        <string>/path/to/Youtube-Script-Note/cache</string>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+        <key>PYTHONUNBUFFERED</key>
+        <string>1</string>
+    </dict>
+</dict>
+</plist>

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Export blog post candidates from note_catalog (LLM $0).
+Export content candidates from note_catalog to CSV (no LLM).
 
 Usage:
   python scripts/export_blog_candidates.py --days 7 --tags ai,crypto,llm
@@ -36,7 +36,7 @@ from scripts.note_catalog_utils import (  # noqa: E402
     strip_leading_frontmatter,
 )
 
-# p02_blog input.csv compatible columns (subset + YT metadata)
+# CSV columns for downstream publishing workflows (topic, keywords, context, etc.)
 CSV_FIELDS = [
     "group_id_hint",
     "group_name",
@@ -320,7 +320,7 @@ def main() -> None:
         writer.writeheader()
         writer.writerows(rows)
     print(f"Wrote {len(rows)} rows -> {out_path}")
-    print("Next: review → p02_blog/dev/input.csv (see p02_blog/docs/YT_SOURCE_GUIDE.md)")
+    print("Next: review the CSV and import into your downstream publishing workflow.")
 
 
 if __name__ == "__main__":

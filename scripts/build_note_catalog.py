@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Build YTT_AUDIO/index/note_catalog.jsonl from local JSONL + output_df (no LLM, no full MD scan).
+Build index/note_catalog.jsonl from local JSONL + output_df (no LLM, no full MD scan).
 
 Usage:
   python scripts/build_note_catalog.py [--dry-run]

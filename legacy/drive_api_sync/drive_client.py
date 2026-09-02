@@ -133,7 +133,7 @@ class DriveYtSummaryClient:
             detail = (
                 "Service accounts cannot create files in My Drive (no storage quota). "
                 "Share YT_summary on a Shared Drive with the service account, or grant "
-                "domain-wide delegation — not installed-app OAuth (SUE-401 authority)."
+                "domain-wide delegation — not installed-app OAuth (retired API path)."
             )
             return DriveAccessError(f"{detail}; underlying: {exc}")
         return DriveAccessError(str(exc))

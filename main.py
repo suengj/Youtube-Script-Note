@@ -693,9 +693,9 @@ INSIGHTS_GROUNDING_QUERY = """
 Grounding (A4) — tag placement by section:
 - 한눈에 보기 / 본문: [확정]/[정황] only; source facts.
 - Insights: [외부지식] or [추정] only; general domain context OK; no invented specifics (stats, quotes, named events not in source).
-- Key Takeaways: implications (risks, decisions, watch-items, investment/business hooks); synthesize across topics — do not restate 한눈에 보기.
-Good Key Takeaway: "미국 의존도가 80%+이면 USMCA 재협상 리스크를 포트폴리오에 반영해야 함."
-Bad Key Takeaway: "멕시코는 제조업 기회를 가졌으나 구조적 문제로 번영하지 못함." (한눈에 보기 복붙)
+- Key Takeaways: implications (risks, decisions, watch-items); synthesize across topics — do not restate 한눈에 보기.
+Good Key Takeaway: "의존도가 80% 이상이면 공급망 리스크를 운영 계획에 반영해야 함."
+Bad Key Takeaway: "해당 국가는 기회를 가졌으나 구조적 문제로 성장하지 못함." (한눈에 보기 복붙)
 """
 
 TONE_QUERY = """

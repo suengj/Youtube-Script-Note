@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Resolve Google Drive credentials for YT_summary sync (SUE-401: service account default)."""
+"""Resolve Google Drive credentials for YT_summary sync (retired API path)."""
 
 from __future__ import annotations
 

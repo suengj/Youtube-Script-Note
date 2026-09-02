@@ -11,7 +11,7 @@ Do **not** open `mapping.json` until scoring is done.
 4. **Density** — appropriate detail level (~1.3–1.5× input)
 5. **Hallucination** — Insights section stays grounded in source
 
-## Sample 1 (`rXcYPHfyyRQ` — Bioethics)
+## Sample 1 (`bench_en_academic` — synthetic bioethics)
 
 | Label | Faith | Korean | Structure | Density | Hallucination | Notes |
 |-------|-------|--------|-----------|---------|---------------|-------|
@@ -19,7 +19,7 @@ Do **not** open `mapping.json` until scoring is done.
 | B | | | | | | |
 | C | | | | | | |
 
-## Sample 2 (`dr5z2WvEXBI` — Mexico/China)
+## Sample 2 (`bench_en_economics` — synthetic economics)
 
 | Label | Faith | Korean | Structure | Density | Hallucination | Notes |
 |-------|-------|--------|-----------|---------|---------------|-------|

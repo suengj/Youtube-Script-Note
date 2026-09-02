@@ -64,26 +64,34 @@ def test_extract_callout_insights_and_takeaways():
     assert extract_callout(body, "Missing") == ""
 
 
-def test_extract_callout_from_pilot_fixtures():
-    mexico = (PILOT_DIR / "dr5z2WvEXBI_v2.md").read_text(encoding="utf-8")
-    bio = (PILOT_DIR / "rXcYPHfyyRQ_v2.md").read_text(encoding="utf-8")
+def test_extract_callout_from_inline_fixture():
+    fixture = """# Title
 
-    m_insights = extract_callout(mexico, "Insights")
-    m_takeaways = extract_callout(mexico, "Key Takeaways")
-    assert len(m_insights.splitlines()) >= 2
-    assert "[외부지식]" in m_insights or "[추정]" in m_insights
-    assert len(m_takeaways.splitlines()) >= 3
+## 한눈에 보기
+- [확정] supply chain fact
 
-    b_insights = extract_callout(bio, "Insights")
-    b_takeaways = extract_callout(bio, "Key Takeaways")
-    assert len(b_insights.splitlines()) >= 2
-    assert "[외부지식]" in b_insights or "[추정]" in b_insights
-    assert len(b_takeaways.splitlines()) >= 3
+> [!note]- Insights
+> - [외부지식] diversification reduces single-source risk
+> - [추정] nearshoring may raise labor costs
+
+> [!note]- Key Takeaways
+> - watch lead-time exposure
+> - review vendor concentration quarterly
+> - plan buffer inventory for critical SKUs
+
+## Tags
+- supply-chain
+"""
+    insights = extract_callout(fixture, "Insights")
+    takeaways = extract_callout(fixture, "Key Takeaways")
+    assert len(insights.splitlines()) >= 2
+    assert "[외부지식]" in insights
+    assert len(takeaways.splitlines()) >= 3
 
 
 if __name__ == "__main__":
     test_normalize_callout_body_prefix()
     test_unchanged_when_already_ok()
     test_extract_callout_insights_and_takeaways()
-    test_extract_callout_from_pilot_fixtures()
+    test_extract_callout_from_inline_fixture()
     print("ok")

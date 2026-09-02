@@ -57,7 +57,7 @@ Manifest: `benchmarks/llm/dataset_manifest.json`
 | s11_low_quality_short | low_quality_subs | cache JSON | 8000 |
 | s12_finance_entities | numbers_proper_nouns | cache JSON | 10000 |
 
-Sources: `experiments/llm_blind_test_20260616/vtt/`, `quarantine/subtitles/`, `cache/transcripts/`. No secrets or full transcripts in this document.
+Sources: `benchmarks/llm/fixtures/` (synthetic VTT + cache JSON). No secrets or production corpus IDs in this document.
 
 ---
 

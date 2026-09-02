@@ -35,9 +35,10 @@ PRE_DIR = OUT_DIR / "00_preprocessed"
 WHISPER_DIR = PROJECT_ROOT / "output_new" / "full"
 
 SAMPLES = [
-    {"video_id": "rXcYPHfyyRQ", "title": "PHILOSOPHY - BIOETHICS 2"},
-    {"video_id": "dr5z2WvEXBI", "title": "Mexico Will Not Be the Next China"},
+    {"video_id": "bench_en_academic", "title": "Bioethics lecture (synthetic)"},
+    {"video_id": "bench_en_economics", "title": "Supply chain economics (synthetic)"},
 ]
+FIXTURE_VTT_DIR = PROJECT_ROOT / "benchmarks" / "llm" / "fixtures" / "vtt"
 
 MODELS = {
     "gpt5_mini": "openai/gpt-5-mini",
@@ -104,10 +105,13 @@ class UsageTracker:
 
 
 def find_vtt(video_id: str) -> Path | None:
-    if not VTT_DIR.is_dir():
-        return None
-    candidates = sorted(VTT_DIR.glob(f"{video_id}*.vtt"))
-    return candidates[0] if candidates else None
+    for base in (VTT_DIR, FIXTURE_VTT_DIR):
+        if not base.is_dir():
+            continue
+        candidates = sorted(base.glob(f"{video_id}*.vtt"))
+        if candidates:
+            return candidates[0]
+    return None
 
 
 def find_whisper_fallback(video_id: str) -> Path | None:
@@ -177,7 +181,7 @@ def write_scoring_md() -> None:
         "4. **Density** — appropriate detail level (~1.3–1.5× input)",
         "5. **Hallucination** — Insights section stays grounded in source",
         "",
-        "## Sample 1 (`rXcYPHfyyRQ` — Bioethics)",
+        "## Sample 1 (`bench_en_academic` — synthetic bioethics)",
         "",
         "| Label | Faith | Korean | Structure | Density | Hallucination | Notes |",
         "|-------|-------|--------|-----------|---------|---------------|-------|",
@@ -185,7 +189,7 @@ def write_scoring_md() -> None:
         "| B | | | | | | |",
         "| C | | | | | | |",
         "",
-        "## Sample 2 (`dr5z2WvEXBI` — Mexico/China)",
+        "## Sample 2 (`bench_en_economics` — synthetic economics)",
         "",
         "| Label | Faith | Korean | Structure | Density | Hallucination | Notes |",
         "|-------|-------|--------|-----------|---------|---------------|-------|",

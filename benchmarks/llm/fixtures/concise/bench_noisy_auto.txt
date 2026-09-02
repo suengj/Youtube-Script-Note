@@ -1,0 +1,1 @@
+API returns JSON. Handle rate limits and retries.

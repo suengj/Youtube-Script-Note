@@ -1,0 +1,4 @@
+{
+  "video_id": "bench_mixed_ko_en",
+  "text": "이번 세션에서는 REST API와 GraphQL을 비교합니다. REST는 resource-oriented이고 GraphQL은 single endpoint query language입니다."
+}

@@ -198,8 +198,8 @@ if "members" in err.lower() and ("level" in err.lower() or "only" in err.lower()
 | 파일 | 변경 내용 |
 |------|----------|
 | stt_function_v3.py | extract_info 후 live_status 사전 Skip; DownloadError에 멤버 전용 매칭 추가; live event 에러 시 was_live/post_live면 Skip 금지 |
-| launchd/com.user.p03-speech2text.plist | StartCalendarInterval 3:00, 9:00 두 개로 변경 (이후 운영상 15:00 추가·실행/로그 경로 변경 — [LAUNCHD.md](LAUNCHD.md)) |
-| docs/SCHEDULING.md | 3시·9시 실행 문서화 (이후 15:00·launchd 로그 경로 등 갱신됨) |
+| launchd/com.user.p03-speech2text.plist | `StartCalendarInterval` 조정·실행/로그 경로 변경 — [LAUNCHD.md](LAUNCHD.md) |
+| docs/SCHEDULING.md | launchd 스케줄·로그 경로 문서화 |
 
 **구현 완료 (2026-01)**
 

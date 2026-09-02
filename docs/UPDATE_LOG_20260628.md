@@ -1,5 +1,7 @@
 # 업데이트 로그 (2026-06-28)
 
+> **Historical note:** Owner-specific paths in this log were superseded by the unified `$PROJECT_ROOT` layout — see [MIGRATION_20260711.md](MIGRATION_20260711.md).
+
 DeepSeek V4 Flash 전환, 로컬 경로 정본화, LLM 블라인드 파일럿 결과 반영.
 
 > **후속 (v4.1.1):** Obsidian mobile MD Phase 0~1c — [UPDATE_LOG_v4_mobile_catalog.md](UPDATE_LOG_v4_mobile_catalog.md)  

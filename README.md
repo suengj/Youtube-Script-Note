@@ -82,7 +82,7 @@ Offline/unit tests do not require API keys or personal paths.
 
 ## Optional Drive Desktop sync
 
-When `P03_DRIVE_SYNC_ENABLED=1` and `P03_DRIVE_SYNC_ROOT` points to a local Google Drive Desktop `YT_summary` folder, finalized Markdown is copied to `source/` with an idempotent manifest. See [docs/SUE-401-DRIVE-YT-SUMMARY-SYNC.md](docs/SUE-401-DRIVE-YT-SUMMARY-SYNC.md).
+When `P03_DRIVE_SYNC_ENABLED=1` and `P03_DRIVE_SYNC_ROOT` points to a local Google Drive Desktop `YT_summary` folder, finalized Markdown is copied to `source/` with an idempotent manifest. See [docs/DRIVE_SYNC.md](docs/DRIVE_SYNC.md).
 
 ## License / reuse
 
@@ -93,4 +93,4 @@ Source is published for reference. **No license grant is included** unless a `LI
 - [docs/PROJECT.md](docs/PROJECT.md) — pipeline reference
 - [docs/YOUTUBE_API_SETUP.md](docs/YOUTUBE_API_SETUP.md) — API key setup
 - [docs/LAUNCHD.md](docs/LAUNCHD.md) — macOS scheduling
-- [docs/PUBLIC_RELEASE_AUDIT.md](docs/PUBLIC_RELEASE_AUDIT.md) — public release audit summary
+- [docs/DRIVE_SYNC.md](docs/DRIVE_SYNC.md) — optional Google Drive Desktop sync

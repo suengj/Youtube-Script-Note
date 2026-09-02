@@ -35,9 +35,9 @@ main.py는 수동 실행 시 `launchctl list`로 해당 launchd 잡이 로드돼
 **plist가 한 번 돌 때 처리하는 것:**  
 채널 크롤(스케줄 시각 배치) URL + **input_df.csv에 있는 URL**을 같이 처리합니다. (CHANNEL_CRAWL=true일 때 채널 후보와 input_df를 병합해 실행.)
 
-**conda 환경:**  
-- 터미널에서 **launchctl 명령**(bootout, bootstrap, kickstart)은 conda base/ai 구분 없이 아무 환경에서나 실행해도 됨.  
-- **실제 스케줄에 main.py가 실행될 때**는 래퍼 스크립트가 **`.../envs/ai/bin/python`** 으로 `exec` 하므로 **항상 conda ai 환경**에서 실행됨.
+**conda / Python environment:**  
+- Terminal **launchctl** commands work from any shell.  
+- Scheduled runs use the Python interpreter path in your **wrapper script** (`launchd/run-p03-speech2text.sh`).
 
 ---
 
@@ -47,11 +47,10 @@ macOS에서는 **launchd**를 쓰는 편이 좋습니다. 로그인 후에도 �
 
 ### plist 위치 (Developer/PJT)
 
-- **경로:** `~/Developer/PJT/launchd/com.user.p03-speech2text.plist`
-- **설치:** `scripts/install_launchd.sh` (래퍼 → Application Support, plist 하드 링크, bootstrap)
+- **경로:** `launchd/com.user.p03-speech2text.plist.example` (copy and edit before install)
+- **설치:** `scripts/install_launchd.sh` with `P03_LAUNCHD_SRC` pointing at your `launchd/` directory
 - **환경:** `WORK_PATH` = 프로젝트 루트, `TMPDIR`/`XDG_CACHE_HOME` = `{WORK_PATH}/tmp`, `{WORK_PATH}/cache`, `DATA_ROOT` = `{WORK_PATH}/data` (`.env`)
-- **yt-dlp:** 주기적으로 `ai` 환경에서 업데이트 권장:  
-  `/opt/homebrew/Caskroom/miniforge/base/envs/ai/bin/python -m pip install -U yt-dlp`
+- **yt-dlp:** 주기적으로 업데이트 권장: `python -m pip install -U yt-dlp`
 - **자막 Errno 11 완화:** `stt_function_v3`에서 자막 재시도 전에 해당 `video_id`의 `.part`/`.tmp`/0바이트 vtt·srt를 `yt_subs`에서 삭제 후 재시도.
 - **WORK_PATH / DATA_ROOT:** plist의 `WORK_PATH`를 바꾸면 `TMPDIR`·`XDG_CACHE_HOME` 경로도 같은 루트로 맞춘 뒤 `bootout`→`bootstrap`.
 - **md_relocate:** plist 해제·제거됨. STT는 저장 시 날짜 폴더(`YYYY_MM_DD/`)에 직접 저장. [OBSIDIAN_MD_RELOCATE.md](OBSIDIAN_MD_RELOCATE.md) 참고.
@@ -87,11 +86,11 @@ plist를 수정한 뒤에는 `launchctl bootout` → `launchctl bootstrap` 로 �
 cd $PROJECT_ROOT && ./scripts/install_launchd.sh
 ```
 
-수동 하드 링크:
+수동 하드 링크 (install 스크립트 대신):
 
 ```
 rm -f ~/Library/LaunchAgents/com.user.p03-speech2text.plist
-ln ~/Developer/PJT/launchd/com.user.p03-speech2text.plist ~/Library/LaunchAgents/com.user.p03-speech2text.plist
+ln "$PROJECT_ROOT/launchd/com.user.p03-speech2text.plist" ~/Library/LaunchAgents/com.user.p03-speech2text.plist
 ```
 
 **2. 등록 (스케줄 시작)**
@@ -106,7 +105,7 @@ launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.user.p03-speech2text
 launchctl kickstart -k gui/$(id -u)/com.user.p03-speech2text
 ```
 
-`-k`는 이미 실행 중이어도 한 번 더 돌리라는 뜻. 3시/9시가 안 돌아갔을 때 수동으로 한 번 돌릴 때 사용.
+`-k`는 이미 실행 중이어도 한 번 더 돌리라는 뜻. 스케줄이 기대대로 동작하지 않을 때 수동으로 한 번 돌릴 때 사용.
 
 **4. 중지 (다음 주기까지 실행 안 함)**
 
@@ -139,7 +138,7 @@ launchctl bootout gui/$(id -u) ~/Library/LaunchAgents/com.user.p03-speech2text.p
 3. **그래도 실패하면**
    - **plist 링크:** `ls -li` 로 LaunchAgents 항목과 Code 쪽 plist의 **inode가 같은지**(하드 링크) 또는 심볼릭 링크가 깨지지 않았는지 확인.
    - **plist 문법:** `plutil -lint ~/Library/LaunchAgents/com.user.p03-speech2text.plist`
-   - **디렉터리:** `mkdir -p ~/Library/Logs/p03-speech2text` 및 `mkdir -p ~/Library/Application Support/com.user.p03-speech2text` — 래퍼는 Code에서 `cp` 해 두었는지 확인 ([`launchd/README.md`](../../../../launchd/README.md)).
+   - **디렉터리:** `mkdir -p ~/Library/Logs/p03-speech2text` 및 `mkdir -p ~/Library/Application Support/com.user.p03-speech2text` — 래퍼가 배포되었는지 확인 ([`launchd/README.md`](../launchd/README.md)).
    - **`78 EX_CONFIG`:** [LAUNCHD.md](LAUNCHD.md) 의 해당 절 — Documents 아래 스크립트만 실행하거나, 예전 `p03_speech2text/logs/launchd_*.log` 에 `macl`이 붙은 채 plist가 가리키는 경우 등.
 
 **6. 지금 돌고 있는 실행만 멈추기**
@@ -174,11 +173,11 @@ tail -f ~/Library/Logs/p03-speech2text/launchd_stdout.log
 
 ### plist 값 참고
 
-- **StartCalendarInterval**: 여러 dict 배열로 하루 중 여러 시각 지정 (현재 plist: 3·9·15시).
+- **StartCalendarInterval**: 여러 dict 배열로 하루 중 여러 시각 지정 (예시 plist: 2·14시).
 - **RunAtLoad**: `true`면 LaunchAgent 로드 시 한 번 실행(스케줄 보조).
-- **Python(conda ai 환경)**: plist에 python을 직접 넣지 않고, **래퍼 스크립트**가 `exec …/envs/ai/bin/python main.py` 를 수행합니다. 인터프리터 경로가 바뀌면 `run-p03-speech2text.sh` 를 고친 뒤 `~/Library/Application Support/...` 로 `cp` 배포.
+- **Python**: plist에 python을 직접 넣지 않고, **래퍼 스크립트**가 `exec /path/to/python main.py` 를 수행합니다. 인터프리터 경로가 바뀌면 래퍼를 고친 뒤 `~/Library/Application Support/...` 로 `cp` 배포.
 - **PATH 환경변수**: launchd는 기본 PATH만 사용하므로, plist의 `EnvironmentVariables`에 `PATH=/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin`을 추가해야 ffmpeg 등을 찾을 수 있음.
-- plist·운영 상세는 Code 폴더 [`launchd/README.md`](../../../../launchd/README.md) 및 [LAUNCHD.md](LAUNCHD.md) 참고.
+- plist·운영 상세는 [`launchd/README.md`](../launchd/README.md) 및 [LAUNCHD.md](LAUNCHD.md) 참고.
 
 ---
 
@@ -292,7 +291,7 @@ launchd 대신 **cron**으로 주기 실행할 때 참고용입니다. **이미 
 |-------------|-------------|
 | **input_df만 한 번 돌리기** (채널 크롤 없이) | `cd $PROJECT_ROOT && python main.py` (config에서 `CHANNEL_CRAWL=false`인 상태에서) |
 | **채널 크롤 포함 한 번 수동 실행** | 먼저 launchd 해제(아래 "launchd 끄기"), 그다음 `cd $PROJECT_ROOT && python main.py` |
-| **launchd 켜기** (스케줄 자동 실행 시작) | `launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.user.p03-speech2text.plist` (최초 1회: plist **하드 링크**·래퍼 `cp` 등, 위 "로드·시작·중지"·[`launchd/README.md`](../../../../launchd/README.md) 참고) |
+| **launchd 켜기** (스케줄 자동 실행 시작) | `launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.user.p03-speech2text.plist` (최초 1회: plist 링크·래퍼 `cp` 등, 위 "로드·시작·중지"·[`launchd/README.md`](../launchd/README.md) 참고) |
 | **launchd 끄기** (스케줄 해제) | `launchctl bootout gui/$(id -u)/com.user.p03-speech2text` |
 | **launchd 지금 한 번만 테스트 실행** | `launchctl kickstart -k gui/$(id -u)/com.user.p03-speech2text` |
 | **launchd 중지** (다음 주기까지 실행 안 함, 나중에 다시 켜려면 kickstart 또는 bootstrap) | `launchctl stop gui/$(id -u)/com.user.p03-speech2text` |

@@ -397,7 +397,6 @@ def _resolve_youtube_cookies_file(work_path=None):
     if work_path:
         candidates.append(os.path.join(work_path, "youtube_cookies.txt"))
     candidates.extend([
-        os.path.expanduser("~/Developer/PJT/p03_speech2text/youtube_cookies.txt"),
         os.path.join(os.path.dirname(__file__), "youtube_cookies.txt"),
     ])
     for p in candidates:

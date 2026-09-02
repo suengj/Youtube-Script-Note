@@ -156,6 +156,6 @@ os.replace(tmp_path, path)
 | **iCloud “최적화 저장”** | 자료가 **클라우드만 있고 로컬에 없음(evicted)** 이면, 터미널과 달리 **launchd** 백그라운드에서 접근이 꼬일 수 있음. 해당 폴더는 Finder에서 **다운로드 / 이 Mac에 항상 유지** 하거나, 데이터 루트를 **비동기화 로컬 폴더**(`$PROJECT_ROOT/data`)로 둔다. |
 | **launchd** | `com.user.p03-speech2text.plist`: `WORK_PATH`, `TMPDIR`, `XDG_CACHE_HOME` 이 **같은 프로젝트 루트**로 맞는지 확인. 설치: `./scripts/install_launchd.sh`. 실행: **`~/Library/Application Support/.../run-p03-speech2text.sh`**, 로그: **`~/Library/Logs/p03-speech2text/`**. 상세: [SCHEDULING.md](SCHEDULING.md), [LAUNCHD.md](LAUNCHD.md). |
 | **단일 실행** | `run_lock.acquire_run_lock` + 스케줄과 수동 실행 충돌 방지. 같은 영상·같은 출력에 **두 프로세스가 동시에 쓰지 않게** 한다. |
-| **yt-dlp** | `python -m pip install -U yt-dlp` (conda `ai` 환경)로 주기적 업데이트. |
+| **yt-dlp** | `python -m pip install -U yt-dlp` 로 주기적 업데이트. |
 | **자막 `.part`** | `_yt_download_subs_only` / `_yt_download_auto_subs_only` 에 **`nopart: True`** 적용됨. |
 | **백신/실시간 검사(선택)** | 서드파티 백신이 `.part`/다운로드 파일을 스캔하며 잠그면 rename 단계에서 Errno 11이 날 수 있음. `WORK_PATH`·`TMPDIR`·`XDG_CACHE_HOME` 트리를 **실시간 검사 제외**에 넣고 동일 영상으로 재시도. |

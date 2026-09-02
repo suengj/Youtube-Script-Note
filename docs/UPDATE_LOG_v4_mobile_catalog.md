@@ -167,13 +167,13 @@ Date: 2026-06-28
 | Path | Role |
 |------|------|
 | `scripts/note_catalog_utils.py` | Shared catalog + frontmatter helpers |
-| `scripts/build_note_catalog.py` | Phase 0 — `YTT_AUDIO/index/note_catalog.jsonl` |
+| `scripts/build_note_catalog.py` | Phase 0 — `index/note_catalog.jsonl` |
 | `scripts/audit_note_catalog.py` | Phase 0 — gap report JSON |
 | `scripts/backfill_frontmatter_recent.py` | Phase 1.5 — YAML on recent MD (`--force` for re-apply) |
 
 ### Outputs (local, not iCloud)
 
-- `{P03}/index/note_catalog.jsonl` (~11MB, ~24k rows) — 2026-07+ unified layout (`~/Developer/PJT/p03_speech2text/index/`)
+- `{P03}/index/note_catalog.jsonl` — unified layout under project `index/`
 - `{P03}/index/note_catalog_audit.json`
 - Obsidian `002_YT_Script/digest/`
 
@@ -197,7 +197,7 @@ source_url: https://youtube.com/watch?v=...
 ## Usage
 
 ```bash
-cd ~/Developer/PJT/p03_speech2text
+cd $PROJECT_ROOT
 
 # Phase 0
 python scripts/build_note_catalog.py
@@ -222,12 +222,9 @@ launchctl kickstart -k gui/$(id -u)/com.user.p03-speech2text
 
 ---
 
-## Content reuse (blog / AI·투자, R0/R1)
+## Catalog CSV export (downstream workflows)
 
-- [CONTENT_REUSE_PLAN.md](CONTENT_REUSE_PLAN.md) — 활용 기획서
-- [NOTIFICATION_SPEC.md](NOTIFICATION_SPEC.md) — 알림 spec (R3 deferred)
-- `scripts/export_blog_candidates.py` — catalog → blog CSV
-- [p02_blog YT_SOURCE_GUIDE.md](../../p02_blog/docs/YT_SOURCE_GUIDE.md)
+- `scripts/export_blog_candidates.py` — catalog → CSV export for downstream workflows
 
 ```bash
 python scripts/export_blog_candidates.py --days 7 --tags ai,crypto,llm --dry-run

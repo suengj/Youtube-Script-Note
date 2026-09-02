@@ -169,7 +169,7 @@ launchctl bootout gui/$(id -u)/com.user.p03-md-relocate
 - **30~40초 통일** 유지 (자막 전용/음원 다운로드 구분 없음)
 - 이유: 분기 시 이득(비디오당 5~15초)은 작고, 429 리스크가 큼. 20~25초 안전성 실증 없음. 단순성 유지.
 
-**코드 변경 없음.** 문서만 [RISK_ANALYSIS.md](RISK_ANALYSIS.md) 섹션 6, [PROJECT.md](PROJECT.md) Rate Limiting 참조에 반영.
+**코드 변경 없음.** 문서만 [PROJECT.md](PROJECT.md) Rate Limiting 참조에 반영.
 
 ---
 
@@ -275,7 +275,7 @@ python scripts/retry_small_summary_auto_subs.py [--base-path DIR] [--size-limit 
 | docs/SCHEDULING.md | md_relocate plist, use-case 테이블 |
 | docs/UPDATE_LOG_20260128.md | 본 로그, auto_sub_only, 자동 자막 단일 언어 다운로드 |
 | docs/AUTO_SUBS_SINGLE_LANG_PLAN.md | 자동 자막 단일 언어 다운로드 기획·구현 |
-| docs/RISK_ANALYSIS.md | Cooling period 분기 검토·결정 (섹션 6) |
+| docs/PROJECT.md | Cooling period 분기 검토·결정 (Rate Limiting) |
 | docs/PROJECT.md | Rate Limiting 참조 (yt-dlp/timedtext, 분기 유지) |
 | stt_function_v3.py | live_status 사전 Skip, 멤버 전용, post_live Skip 금지 |
 | launchd/com.user.p03-speech2text.plist | StartCalendarInterval 3:00, 9:00 (당시; 이후 운영 변경은 아래 2026-05 메모·LAUNCHD.md) |
@@ -293,7 +293,7 @@ python scripts/retry_small_summary_auto_subs.py [--base-path DIR] [--size-limit 
 
 ## 운영 메모 (2026-05): launchd `78` / TCC / 로그 경로
 
-- **실행:** plist의 `ProgramArguments`는 `~/Library/Application Support/com.user.p03-speech2text/run-p03-speech2text.sh` (원본 편집은 `Documents/Code/launchd/run-p03-speech2text.sh` → 수정 후 `cp`).
+- **실행:** plist의 `ProgramArguments`는 `~/Library/Application Support/com.user.p03-speech2text/run-p03-speech2text.sh` (래퍼 편집 후 `cp` 배포).
 - **표준 출력·에러:** `~/Library/Logs/p03-speech2text/launchd_stdout.log` / `launchd_stderr.log` (예전 `p03_speech2text/logs/launchd_*.log` + `com.apple.macl` 조합으로 `78 EX_CONFIG` 나던 케이스 회피).
-- **스케줄:** `StartCalendarInterval` 03:00, 09:00, 15:00; `RunAtLoad` true.
-- 상세: [LAUNCHD.md](LAUNCHD.md), [`launchd/README.md`](../../../../launchd/README.md).
+- **스케줄:** `StartCalendarInterval` (사용자 plist에 정의); `RunAtLoad` true.
+- 상세: [LAUNCHD.md](LAUNCHD.md), [`launchd/README.md`](../launchd/README.md).

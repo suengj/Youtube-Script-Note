@@ -1,0 +1,20 @@
+#!/bin/sh
+# launchd wrapper — copy to ~/Library/Application Support/com.user.p03-speech2text/
+# and point the plist ProgramArguments at this script.
+set -eu
+P03_HOME="/path/to/Youtube-Script-Note"
+PYTHON="/path/to/python"
+WRAPPER_LOG="${HOME}/Library/Logs/p03-speech2text/wrapper.log"
+mkdir -p "${HOME}/Library/Logs/p03-speech2text"
+COOKIES_DST="${WORK_PATH:-${P03_HOME}}/youtube_cookies.txt"
+COOKIES_SRC="${P03_HOME}/youtube_cookies.txt"
+if [ -f "$COOKIES_SRC" ] && [ -n "${WORK_PATH:-}" ]; then
+  mkdir -p "$(dirname "$COOKIES_DST")"
+  cp "$COOKIES_SRC" "$COOKIES_DST" 2>/dev/null || true
+fi
+export YOUTUBE_COOKIES_FILE="${YOUTUBE_COOKIES_FILE:-$COOKIES_DST}"
+{
+  echo "---- $(date '+%Y-%m-%d %H:%M:%S %z') wrapper pid=$$ uid=$(id -u) ----"
+  echo "LAUNCHD_SCHEDULED=${LAUNCHD_SCHEDULED:-} WORK_PATH=${WORK_PATH:-} P03_HOME=${P03_HOME}"
+} >>"$WRAPPER_LOG" 2>&1
+exec "$PYTHON" "${P03_HOME}/main.py"

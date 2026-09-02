@@ -1,8 +1,8 @@
-# SUE-401 — P03 → Google Drive Desktop YT_summary sync
+# Google Drive Desktop — YT_summary sync
 
 ## Active transport (V1)
 
-P03 finalized Obsidian Markdown → **local Google Drive Desktop mount** → `YT_summary/source/` + `manifest.yaml` → Google Drive Desktop cloud sync.
+Finalized Markdown summaries are copied to a **local Google Drive Desktop mount** under `YT_summary/source/` with an idempotent `manifest.yaml`. Google Drive Desktop handles cloud sync.
 
 No Google Drive API upload, OAuth, or service-account credentials in the active path.
 
@@ -10,9 +10,9 @@ No Google Drive API upload, OAuth, or service-account credentials in the active 
 
 | Variable | Purpose |
 |----------|---------|
-| `OUTPUT_MD_PATH` | P03 summary source (Obsidian) |
+| `OUTPUT_MD_PATH` | Pipeline Markdown output directory |
 | `P03_DRIVE_SYNC_ROOT` | Local `YT_summary` folder (auto-discovered if unset) |
-| `P03_DRIVE_SYNC_ENABLED` | `0` disables sync (P03 summary unaffected) |
+| `P03_DRIVE_SYNC_ENABLED` | `0` disables sync (pipeline output unaffected) |
 
 ## CLI
 
@@ -33,4 +33,4 @@ Service accounts can access shared personal My Drive folders but cannot upload f
 
 ## State
 
-`{index}/drive_yt_summary_sync_state.json` — local idempotent sync state (not a workflow DB).
+`{index}/drive_yt_summary_sync_state.json` — local idempotent sync state (not a workflow database).

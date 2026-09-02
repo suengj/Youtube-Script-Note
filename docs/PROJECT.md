@@ -727,7 +727,7 @@ IP 블록 방지 및 OOM 방지를 위한 설정은 **`config.py`**에서 합니
 
 `config.py`이 없거나 키가 없으면 위 기본값이 사용됩니다. 자세한 항목 설명과 예시는 위 "config.py" 섹션을 참조하세요.
 
-**참고:** 자막 다운로드는 yt-dlp를 사용하며, yt-dlp는 내부적으로 YouTube timedtext 엔드포인트를 호출합니다. timedtext는 rate limit이 엄격하므로 429 발생 시 IP 차단이 수 시간 지속될 수 있습니다. 자막 전용/음원 다운로드별 cooling 분기는 검토했으나, 리스크 대비 이득이 작아 현재 설정(30~40초 통일)을 유지합니다. 상세: [RISK_ANALYSIS.md](RISK_ANALYSIS.md) 섹션 6.
+**참고:** 자막 다운로드는 yt-dlp를 사용하며, yt-dlp는 내부적으로 YouTube timedtext 엔드포인트를 호출합니다. timedtext는 rate limit이 엄격하므로 429 발생 시 IP 차단이 수 시간 지속될 수 있습니다. 자막 전용/음원 다운로드별 cooling 분기는 검토했으나, 리스크 대비 이득이 작아 현재 설정(30~40초 통일)을 유지합니다.
 
 ## 채널 기반 배치 프로세스 (구체화)
 

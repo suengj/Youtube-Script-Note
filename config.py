@@ -96,7 +96,7 @@ PREPROCESS_BACKEND = "cloud_api"  # cloud_api | on_device (stub)
 #      launchctl bootout gui/$(id -u)/com.user.p03-speech2text
 # cron:
 #   crontab -e  # 편집
-#   0 */3 * * * cd ~/Developer/PJT/p03_speech2text && /opt/homebrew/Caskroom/miniforge/base/envs/ai/bin/python main.py >> logs/cron.log 2>&1
+#   0 */3 * * * cd $PROJECT_ROOT && python main.py >> logs/cron.log 2>&1
 # 상세: docs/SCHEDULING.md 참고
 
 
@@ -205,7 +205,7 @@ def log_macos_deadlock_path_warnings(
         if path_likely_errno11_risk_macos(p):
             logger.warning(
                 "macOS Errno11 risk: %s may be on iCloud/sync storage (%s). "
-                "Prefer local disk (e.g. ~/YTT_AUDIO) for WORK_PATH, DATA_ROOT, TMPDIR, XDG_CACHE_HOME.",
+                "Prefer local disk (e.g. a non-synced work directory) for WORK_PATH, DATA_ROOT, TMPDIR, XDG_CACHE_HOME.",
                 label,
                 p,
             )

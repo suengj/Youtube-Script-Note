@@ -18,8 +18,8 @@ import stt_function_v3 as stt  # noqa: E402
 from main import INPUT_PROMPT, MAIN_LLM_TOKEN_RANGE, MainLlmConfig, initialize_clients, load_config  # noqa: E402
 
 CONCISE_CANDIDATES = [
-    PROJECT_ROOT / "experiments/llm_blind_test_20260616/00_preprocessed/rXcYPHfyyRQ_concise.txt",
-    PROJECT_ROOT / "experiments/llm_blind_test_20260616/sample_01_rXcYPHfyyRQ/source_concise.txt",
+    PROJECT_ROOT / "benchmarks/llm/fixtures/concise/bench_en_academic.txt",
+    PROJECT_ROOT / "benchmarks/llm/fixtures/concise/bench_en_economics.txt",
 ]
 
 
@@ -59,7 +59,7 @@ def main() -> int:
 
     concise_path = next((p for p in CONCISE_CANDIDATES if p.is_file()), None)
     if not concise_path:
-        print("FAIL: no cached concise text; run blind test first or provide a sample.")
+        print("FAIL: no benchmark concise fixture; check benchmarks/llm/fixtures/concise/.")
         return 1
 
     concise = concise_path.read_text(encoding="utf-8")

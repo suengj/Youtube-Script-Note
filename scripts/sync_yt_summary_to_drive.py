@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Sync finalized P03 Obsidian YouTube summaries to Google Drive Desktop YT_summary (SUE-401).
+Sync finalized Markdown summaries to Google Drive Desktop YT_summary folder.
 
 Filesystem transport: copies into the local Google Drive Desktop mount; cloud sync is automatic.
 
@@ -79,7 +79,7 @@ def main() -> int:
         return 2
 
     print("=" * 60)
-    print("P03 → Google Drive Desktop YT_summary sync (SUE-401)")
+    print("P03 → Google Drive Desktop YT_summary sync")
     print("=" * 60)
     print(f"md_root:              {config.md_root}")
     print(f"sync_root:            {config.sync_root}")

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Environment and path resolution for YT_summary filesystem sync (SUE-401)."""
+"""Environment and path resolution for YT_summary filesystem sync."""
 
 from __future__ import annotations
 

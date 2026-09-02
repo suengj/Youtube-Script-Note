@@ -1,6 +1,6 @@
 # P03 LLM Benchmark
 
-Reusable harness to compare preprocess and main LLM models on **real P03 transcript workloads**.
+Reusable harness to compare preprocess and main LLM models on **synthetic transcript workloads** shipped in `benchmarks/llm/fixtures/`.
 
 ## Prerequisites
 
