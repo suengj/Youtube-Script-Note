@@ -118,7 +118,7 @@ P03_INTELLIGENCE_ADAPTER=off python scripts/intelligence_source_adapter.py
 Bounding and idempotency:
 
 - exported records are ordered newest-first by `(processed_at, video_id)`; consumers may
-  stop after their requested limit or after the first row older than their window;
+  rely on that order only after validating the complete bounded handoff before slicing;
 - the window starts at the stored checkpoint minus a small recovery slack
   (`index/intelligence_adapter_state.json`), or at an explicit `--since-days` / `--since`;
 - the catalog is streamed once and filtered by `transcript_date`; the historical Markdown
