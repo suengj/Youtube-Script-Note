@@ -128,7 +128,10 @@ Bounding and idempotency:
   consumer pointed at a stable `--output` path never silently sees zero records; pass
   `--allow-empty-overwrite` to empty it deliberately;
 - duplicate rows for one video (different language or summariser suffix) collapse to a
-  single discovery record.
+  single discovery record;
+- `--limit` truncates the *oldest* eligible rows, so a truncated run deliberately does not
+  advance the checkpoint. The deferred rows are emitted by the next run instead of falling
+  outside its window; `deferred_to_next_run` and `checkpoint_held_by_limit` report this.
 
 `evidence_role` is fixed to `derived-summary`: a P03 summary is a discovery and clustering
 input, never primary evidence, unless the video itself is the event being analysed.

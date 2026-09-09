@@ -304,24 +304,30 @@ def run_adapter(
     rows = select_rows(iter_catalog_rows(catalog_file), window_start)
     emitted_ledger: Dict[str, str] = dict(state.get("emitted") or {})
 
-    fresh: List[Dict[str, Any]] = []
-    skipped_known = 0
-    for row in rows:
-        vid = row.get("vid") or ""
-        if not replay and vid in emitted_ledger:
-            skipped_known += 1
-            continue
-        fresh.append(row)
-        if limit is not None and len(fresh) >= limit:
-            break
+    eligible = [
+        row for row in rows if replay or (row.get("vid") or "") not in emitted_ledger
+    ]
+    skipped_known = len(rows) - len(eligible)
+
+    # Rows are newest-first, so a limit drops the *oldest* eligible rows. The
+    # checkpoint must not move past them or they would fall outside the next
+    # window and never be emitted at all.
+    truncated = limit is not None and len(eligible) > limit
+    fresh = eligible[:limit] if limit is not None else eligible
+    deferred = len(eligible) - len(fresh)
 
     records = [to_record(r, md_root, with_summary_hash) for r in fresh]
 
-    newest_in_window = max((entry_date(r) for r in rows), default=None)
-    newest_overall = max(
-        [d for d in (newest_in_window, state.get("last_transcript_date")) if d],
-        default=None,
-    )
+    previous_checkpoint = state.get("last_transcript_date")
+    if truncated:
+        # Leave the window open; the ledger already prevents re-emitting what
+        # this run sent, so the remainder arrives on the next run.
+        newest_overall = previous_checkpoint
+    else:
+        newest_in_window = max((entry_date(r) for r in rows), default=None)
+        newest_overall = max(
+            [d for d in (newest_in_window, previous_checkpoint) if d], default=None
+        )
 
     next_state = dict(state)
     if not replay:
@@ -344,7 +350,9 @@ def run_adapter(
             "catalog_rows_in_window": len(rows),
             "emitted": len(records),
             "skipped_already_emitted": skipped_known,
-            "previous_checkpoint": state.get("last_transcript_date"),
+            "deferred_to_next_run": deferred,
+            "checkpoint_held_by_limit": truncated,
+            "previous_checkpoint": previous_checkpoint,
             "next_checkpoint": next_state.get("last_transcript_date"),
             "ledger_size": len(next_state.get("emitted") or {}),
             "markdown_files_read": len(records) if with_summary_hash else 0,
@@ -425,6 +433,8 @@ def main() -> int:
     print(f"window:     {stats['window_start']} .. {stats['window_end']}")
     print(f"in window:  {stats['catalog_rows_in_window']} unique videos")
     print(f"emitted:    {stats['emitted']} (skipped already-emitted: {stats['skipped_already_emitted']})")
+    if stats["deferred_to_next_run"]:
+        print(f"deferred:   {stats['deferred_to_next_run']} row(s) held for the next run (--limit); checkpoint not advanced")
     print(f"checkpoint: {stats['previous_checkpoint']} -> {stats['next_checkpoint']}")
     print(f"ledger:     {stats['ledger_size']} ids")
     print(f"md reads:   {stats['markdown_files_read']}")

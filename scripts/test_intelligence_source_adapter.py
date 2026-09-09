@@ -277,6 +277,43 @@ def test_a_non_empty_rerun_replaces_the_export():
         assert [r["video_id"] for r in rows] == ["bbbbbbbbbbb"]
 
 
+# --------------------------------------------------------------------------
+# a truncated run must not orphan the rows it did not emit
+# (reviewer finding, 2026-09-09: --limit advanced the checkpoint past them)
+# --------------------------------------------------------------------------
+
+
+def test_limit_does_not_advance_the_checkpoint_past_unemitted_rows():
+    """Rows are newest-first, so a limit drops the oldest — they must survive."""
+    with tempfile.TemporaryDirectory() as tmp:
+        cat = _catalog(tmp, [_row("n" * 11, "2026-09-09"), _row("o" * 11, "2026-09-01")])
+        state_file = os.path.join(tmp, "state.json")
+
+        first = run_adapter(cat, state_file, since_days=30, limit=1, today=TODAY)
+        assert [r["video_id"] for r in first["records"]] == ["n" * 11]
+        assert first["stats"]["deferred_to_next_run"] == 1
+        assert first["stats"]["checkpoint_held_by_limit"] is True
+        assert first["stats"]["next_checkpoint"] == first["stats"]["previous_checkpoint"]
+        write_state(state_file, first["state"])
+
+        second = run_adapter(cat, state_file, since_days=30, today=TODAY)
+        assert [r["video_id"] for r in second["records"]] == ["o" * 11]
+        write_state(state_file, second["state"])
+
+        third = run_adapter(cat, state_file, since_days=30, today=TODAY)
+        assert third["records"] == []
+
+
+def test_an_untruncated_run_still_advances_the_checkpoint():
+    with tempfile.TemporaryDirectory() as tmp:
+        cat = _catalog(tmp, [_row("n" * 11, "2026-09-09"), _row("o" * 11, "2026-09-01")])
+        state_file = os.path.join(tmp, "state.json")
+        result = run_adapter(cat, state_file, since_days=30, limit=5, today=TODAY)
+        assert result["stats"]["deferred_to_next_run"] == 0
+        assert result["stats"]["checkpoint_held_by_limit"] is False
+        assert result["stats"]["next_checkpoint"] == "2026-09-09"
+
+
 if __name__ == "__main__":
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
     for fn in fns:
