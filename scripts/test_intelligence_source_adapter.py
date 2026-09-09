@@ -483,6 +483,25 @@ def test_a_claim_survives_a_window_that_did_not_reach_the_backlog():
         assert load_state(state_file)["pending_window_start"] is None
 
 
+def test_export_is_newest_first_by_processed_at_and_video_id():
+    with tempfile.TemporaryDirectory() as tmp:
+        cat = _catalog(
+            tmp,
+            [
+                _row("a" * 11, "2026-09-08"),
+                _row("b" * 11, "2026-09-09"),
+                _row("c" * 11, "2026-09-09"),
+            ],
+        )
+        result = run_adapter(cat, os.path.join(tmp, "state.json"), since_days=7, today=TODAY)
+        out = os.path.join(tmp, "handoff.jsonl")
+        write_records(result["records"], out)
+        with open(out, encoding="utf-8") as f:
+            exported = [json.loads(line) for line in f]
+        keys = [(record["processed_at"], record["video_id"]) for record in exported]
+        assert keys == sorted(keys, reverse=True)
+
+
 if __name__ == "__main__":
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
     for fn in fns:
