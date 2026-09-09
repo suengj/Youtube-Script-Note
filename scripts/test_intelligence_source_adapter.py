@@ -13,6 +13,7 @@ sys.path.insert(0, str(PROJECT_ROOT))
 
 from scripts.intelligence_source_adapter import (  # noqa: E402
     FORMAT_VERSION,
+    empty_state,
     adapter_enabled,
     load_state,
     prune_ledger,
@@ -312,6 +313,62 @@ def test_an_untruncated_run_still_advances_the_checkpoint():
         assert result["stats"]["deferred_to_next_run"] == 0
         assert result["stats"]["checkpoint_held_by_limit"] is False
         assert result["stats"]["next_checkpoint"] == "2026-09-09"
+
+
+def test_a_held_backlog_drains_instead_of_livelocking():
+    """Retention must not evict an id the same window can still re-read."""
+    with tempfile.TemporaryDirectory() as tmp:
+        cat = _catalog(tmp, [_row("a" * 11, "2026-04-02"), _row("b" * 11, "2026-04-01")])
+        state_file = os.path.join(tmp, "state.json")
+        seeded = empty_state()
+        seeded["last_transcript_date"] = "2026-06-01"  # far newer than the backlog
+        write_state(state_file, seeded)
+
+        emitted = []
+        for _ in range(6):
+            result = run_adapter(cat, state_file, since="2026-03-01", limit=1, today="2026-06-05")
+            write_state(state_file, result["state"])
+            emitted += [r["video_id"] for r in result["records"]]
+
+        assert sorted(emitted) == ["a" * 11, "b" * 11], "each row must be emitted exactly once"
+
+
+def test_a_deferred_backlog_is_reachable_without_repeating_the_window_flag():
+    """The widened window must persist, or the backlog falls out of range."""
+    with tempfile.TemporaryDirectory() as tmp:
+        cat = _catalog(tmp, [_row("n" * 11, "2026-09-09"), _row("o" * 11, "2026-08-15")])
+        state_file = os.path.join(tmp, "state.json")
+
+        first = run_adapter(cat, state_file, since_days=30, limit=1, today=TODAY)
+        assert first["stats"]["pending_window_start"] == "2026-08-15"
+        write_state(state_file, first["state"])
+
+        # No --since-days this time: the default window would be two days wide.
+        second = run_adapter(cat, state_file, today=TODAY)
+        assert second["stats"]["window_start"] == "2026-08-15"
+        assert [r["video_id"] for r in second["records"]] == ["o" * 11]
+        write_state(state_file, second["state"])
+
+        third = run_adapter(cat, state_file, today=TODAY)
+        assert third["records"] == []
+        assert third["stats"]["pending_window_start"] is None
+
+
+def test_retention_still_bounds_the_ledger_on_a_normal_window():
+    ledger = {"old": "2026-01-01", "mid": "2026-08-20", "new": "2026-09-09"}
+    pruned = prune_ledger(ledger, "2026-09-09", 30, keep_from="2026-09-07")
+    assert sorted(pruned) == ["mid", "new"]
+
+
+def test_a_non_positive_limit_is_rejected_rather_than_emitting_nothing_forever():
+    with tempfile.TemporaryDirectory() as tmp:
+        for bad in (0, -1):
+            try:
+                run_adapter(os.path.join(tmp, "c.jsonl"), os.path.join(tmp, "s.json"), limit=bad)
+            except ValueError as exc:
+                assert "at least 1" in str(exc)
+            else:
+                raise AssertionError(f"limit={bad} should have been rejected")
 
 
 if __name__ == "__main__":

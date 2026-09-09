@@ -132,6 +132,12 @@ Bounding and idempotency:
 - `--limit` truncates the *oldest* eligible rows, so a truncated run deliberately does not
   advance the checkpoint. The deferred rows are emitted by the next run instead of falling
   outside its window; `deferred_to_next_run` and `checkpoint_held_by_limit` report this.
+  The oldest deferred date is persisted as `pending_window_start`, so the next run widens
+  its window back to the backlog even when it is invoked with no arguments;
+- the emitted-id ledger is never pruned below the start of the window actually read. A
+  normal run reads a few days, so the 30-day retention dominates and the ledger stays
+  small; a deliberately wide `--since` widens retention to match, which prevents an id
+  being pruned and then re-emitted forever while a backlog drains behind it.
 
 `evidence_role` is fixed to `derived-summary`: a P03 summary is a discovery and clustering
 input, never primary evidence, unless the video itself is the event being analysed.

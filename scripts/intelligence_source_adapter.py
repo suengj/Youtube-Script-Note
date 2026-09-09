@@ -74,6 +74,7 @@ def empty_state() -> Dict[str, Any]:
         "format_version": FORMAT_VERSION,
         "last_run_at": None,
         "last_transcript_date": None,
+        "pending_window_start": None,  # oldest row a --limit run deferred
         "emitted": {},  # vid -> transcript_date
     }
 
@@ -90,16 +91,32 @@ def load_state(path: str) -> Dict[str, Any]:
         # Unknown/older ledger: start clean rather than silently mis-bounding.
         return empty_state()
     data.setdefault("emitted", {})
+    data.setdefault("pending_window_start", None)
     return data
 
 
 def prune_ledger(
-    emitted: Dict[str, str], newest_date: Optional[str], retention_days: int
+    emitted: Dict[str, str],
+    newest_date: Optional[str],
+    retention_days: int,
+    keep_from: Optional[str] = None,
 ) -> Dict[str, str]:
-    """Keep only ids inside the retention window so the state file stays bounded."""
+    """Keep only ids inside the retention window so the state file stays bounded.
+
+    `keep_from` is a hard floor: no id at or after it is ever pruned. Callers pass
+    the start of the window actually read, so an id cannot be evicted while it
+    remains reachable — otherwise a run that emitted it, then pruned it, would
+    emit it again on the next run, forever.
+
+    For a normal run the window is a few days wide and the retention window
+    dominates, so the ledger stays bounded. A deliberately wide `--since` widens
+    retention to match, which is the caller's own choice.
+    """
     if not newest_date:
         return dict(emitted)
     cutoff = shift_date(newest_date, -retention_days)
+    if keep_from and keep_from < cutoff:
+        cutoff = keep_from
     return {vid: d for vid, d in emitted.items() if d and d >= cutoff}
 
 
@@ -135,13 +152,20 @@ def resolve_window_start(
 ) -> str:
     """Lower bound of the bounded read. Explicit args win over the checkpoint."""
     if since:
-        return since[:10]
-    if since_days is not None:
-        return shift_date(today, -since_days)
-    last = state.get("last_transcript_date")
-    if last:
-        return shift_date(last, -lookback_days)
-    return shift_date(today, -DEFAULT_LOOKBACK_DAYS)
+        start = since[:10]
+    elif since_days is not None:
+        start = shift_date(today, -since_days)
+    else:
+        last = state.get("last_transcript_date")
+        start = shift_date(last, -lookback_days) if last else shift_date(today, -DEFAULT_LOOKBACK_DAYS)
+
+    # A previous run deferred rows because of --limit. That backlog is older
+    # than the checkpoint, so the default window would step over it: widen back
+    # to where the backlog starts until it has drained.
+    pending = state.get("pending_window_start")
+    if pending and pending < start:
+        return pending
+    return start
 
 
 # --------------------------------------------------------------------------
@@ -298,6 +322,9 @@ def run_adapter(
     today = today or datetime.now().strftime("%Y-%m-%d")
     now = now or datetime.now(timezone.utc).isoformat(timespec="seconds")
 
+    if limit is not None and limit < 1:
+        raise ValueError(f"--limit must be at least 1, got {limit}")
+
     state = load_state(state_file)
     window_start = resolve_window_start(state, since_days, since, lookback_days, today)
 
@@ -319,6 +346,17 @@ def run_adapter(
     records = [to_record(r, md_root, with_summary_hash) for r in fresh]
 
     previous_checkpoint = state.get("last_transcript_date")
+    # Oldest row still owed to a consumer: the deferred backlog if this run was
+    # truncated, otherwise whatever a previous truncated run left pending.
+    pending_start = (
+        min(entry_date(r) for r in eligible[len(fresh) :])
+        if truncated
+        else (None if replay else state.get("pending_window_start"))
+    )
+    if not truncated and not replay and pending_start:
+        # Everything from the pending window was emitted this run.
+        pending_start = None
+
     if truncated:
         # Leave the window open; the ledger already prevents re-emitting what
         # this run sent, so the remainder arrives on the next run.
@@ -337,7 +375,12 @@ def run_adapter(
             "format_version": FORMAT_VERSION,
             "last_run_at": now,
             "last_transcript_date": newest_overall,
-            "emitted": prune_ledger(emitted_ledger, newest_overall, ledger_retention_days),
+            "pending_window_start": pending_start,
+            # Never evict an id this run could still re-read: the floor is the
+            # window actually read, which also covers any deferred backlog.
+            "emitted": prune_ledger(
+                emitted_ledger, newest_overall, ledger_retention_days, keep_from=window_start
+            ),
         }
 
     return {
@@ -352,6 +395,7 @@ def run_adapter(
             "skipped_already_emitted": skipped_known,
             "deferred_to_next_run": deferred,
             "checkpoint_held_by_limit": truncated,
+            "pending_window_start": pending_start,
             "previous_checkpoint": previous_checkpoint,
             "next_checkpoint": next_state.get("last_transcript_date"),
             "ledger_size": len(next_state.get("emitted") or {}),
