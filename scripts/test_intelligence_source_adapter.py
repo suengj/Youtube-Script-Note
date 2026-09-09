@@ -456,6 +456,33 @@ def test_a_genuine_full_read_clears_the_claim():
         assert result["stats"]["pending_window_start"] is None
 
 
+def test_a_claim_survives_a_window_that_did_not_reach_the_backlog():
+    """Rows read, but none from the backlog region: the row is absent, not drained."""
+    with tempfile.TemporaryDirectory() as tmp:
+        state_file = os.path.join(tmp, "state.json")
+        seeded = empty_state()
+        seeded["last_transcript_date"] = "2026-09-09"
+        seeded["pending_window_start"] = "2026-08-15"
+        seeded["emitted"] = {"n" * 11: "2026-09-09"}
+        write_state(state_file, seeded)
+
+        # Only an already-emitted recent row; the deferred 2026-08-15 row is missing.
+        cat = _catalog(tmp, [_row("n" * 11, "2026-09-09")])
+        held = run_adapter(cat, state_file, today=TODAY)
+        assert held["stats"]["catalog_rows_in_window"] == 1
+        assert held["stats"]["emitted"] == 0
+        assert held["stats"]["pending_window_start"] == "2026-08-15"
+        write_state(state_file, held["state"])
+
+        # The deferred row comes back and is still reachable.
+        cat = _catalog(tmp, [_row("n" * 11, "2026-09-09"), _row("o" * 11, "2026-08-15")])
+        recovered = run_adapter(cat, state_file, today=TODAY)
+        assert recovered["stats"]["window_start"] == "2026-08-15"
+        assert [r["video_id"] for r in recovered["records"]] == ["o" * 11]
+        write_state(state_file, recovered["state"])
+        assert load_state(state_file)["pending_window_start"] is None
+
+
 if __name__ == "__main__":
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
     for fn in fns:

@@ -143,7 +143,14 @@ Bounding and idempotency:
   File presence is not read success — the claim clears only after a read that actually
   returned rows and emitted them;
 - a backlog claim only ever moves older. A newly deferred row never overwrites an older
-  claim that is still owed.
+  claim that is still owed, and the claim is not cleared by a read that returned rows but
+  none from the backlog region — that means the deferred row is temporarily absent from
+  the catalog, not drained.
+
+If a deferred row is deleted from the catalog outright, the claim persists and every
+subsequent read stays widened to it. That is a bounded cost — a wider indexed read, never
+a Markdown scan — and is deliberately preferred to silently losing a record. Clear it by
+deleting `index/intelligence_adapter_state.json` and re-running with an explicit window.
 
 `evidence_role` is fixed to `derived-summary`: a P03 summary is a discovery and clustering
 input, never primary evidence, unless the video itself is the event being analysed.

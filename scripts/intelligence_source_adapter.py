@@ -361,8 +361,14 @@ def run_adapter(
         # Nothing drained. The catalog was absent, empty or unreadable — file
         # presence alone is not read success — so an existing claim stands.
         pending_start = carried_pending
+    elif carried_pending and not any(entry_date(r) <= carried_pending for r in rows):
+        # Rows were read, but none from the backlog region: the deferred row is
+        # temporarily absent from the catalog rather than drained. Clearing here
+        # would narrow the next window past it and lose it for good.
+        pending_start = carried_pending
     else:
-        # The window was genuinely read and fully emitted.
+        # The backlog region was genuinely covered and everything eligible in it
+        # has been emitted.
         pending_start = None
 
     if truncated:
