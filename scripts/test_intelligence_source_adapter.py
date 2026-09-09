@@ -1,0 +1,509 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""Tests for the bounded P03 -> Learning Intelligence source adapter (SUE-733)."""
+
+import json
+import os
+import sys
+import tempfile
+from pathlib import Path
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(PROJECT_ROOT))
+
+from scripts.intelligence_source_adapter import (  # noqa: E402
+    FORMAT_VERSION,
+    empty_state,
+    adapter_enabled,
+    load_state,
+    prune_ledger,
+    resolve_window_start,
+    run_adapter,
+    select_rows,
+    to_record,
+    write_records,
+    write_state,
+)
+
+TODAY = "2026-09-09"
+
+
+def _row(vid, date, **kw):
+    row = {
+        "schema_version": 1,
+        "vid": vid,
+        "transcript_date": date,
+        "upload_date": kw.get("upload_date", date),
+        "channel": kw.get("channel", "채널"),
+        "title": kw.get("title", f"title-{vid}"),
+        "tldr": kw.get("tldr", f"tldr for {vid}"),
+        "tags": kw.get("tags", ["ai"]),
+        "source_url": kw.get("source_url", f"https://www.youtube.com/watch?v={vid}"),
+        "md_path_rel": kw.get("md_path_rel", f"{date.replace('-', '_')}/{vid}.md"),
+        "lang": kw.get("lang", "ko"),
+        "suffix": kw.get("suffix", "5-mini"),
+        "source": kw.get("source", "live_pipeline"),
+    }
+    row.update({k: v for k, v in kw.items() if k not in row})
+    return row
+
+
+def _catalog(tmp, rows):
+    path = os.path.join(tmp, "note_catalog.jsonl")
+    with open(path, "w", encoding="utf-8") as f:
+        for r in rows:
+            f.write(json.dumps(r, ensure_ascii=False) + "\n")
+    return path
+
+
+# --------------------------------------------------------------------------
+# bounded read
+# --------------------------------------------------------------------------
+
+
+def test_window_excludes_older_rows():
+    rows = [_row("aaaaaaaaaaa", "2026-09-09"), _row("bbbbbbbbbbb", "2026-01-02")]
+    selected = select_rows(rows, window_start="2026-09-07")
+    assert [r["vid"] for r in selected] == ["aaaaaaaaaaa"]
+
+
+def test_rows_without_durable_identity_or_url_are_dropped():
+    rows = [
+        _row("aaaaaaaaaaa", TODAY),
+        _row("", TODAY),
+        _row("ccccccccccc", TODAY, source_url=""),
+    ]
+    assert [r["vid"] for r in select_rows(rows, "2026-09-01")] == ["aaaaaaaaaaa"]
+
+
+def test_duplicate_video_id_collapses_to_one_record():
+    """Same video, two language/summariser rows -> one discovery record."""
+    rows = [
+        _row("aaaaaaaaaaa", "2026-09-08", lang="ko", tldr=""),
+        _row("aaaaaaaaaaa", "2026-09-09", lang="en-orig", tldr="real summary"),
+    ]
+    selected = select_rows(rows, "2026-09-01")
+    assert len(selected) == 1
+    assert selected[0]["lang"] == "en-orig"
+
+
+def test_window_start_prefers_checkpoint_with_recovery_slack():
+    state = {"last_transcript_date": "2026-09-08"}
+    assert resolve_window_start(state, None, None, 2, TODAY) == "2026-09-06"
+
+
+def test_explicit_since_days_overrides_checkpoint():
+    state = {"last_transcript_date": "2026-09-08"}
+    assert resolve_window_start(state, 3, None, 2, TODAY) == "2026-09-06"
+    assert resolve_window_start(state, 30, None, 2, TODAY) == "2026-08-10"
+
+
+# --------------------------------------------------------------------------
+# contract / provenance
+# --------------------------------------------------------------------------
+
+
+def test_record_carries_required_contract_fields():
+    rec = to_record(_row("aaaaaaaaaaa", TODAY))
+    for field in (
+        "format_version",
+        "source_type",
+        "video_id",
+        "source_url",
+        "channel",
+        "title",
+        "upload_date",
+        "processed_at",
+        "summary_ref",
+        "tldr",
+        "tags",
+    ):
+        assert field in rec, field
+    assert rec["source_type"] == "youtube"
+    assert rec["format_version"] == FORMAT_VERSION
+    assert rec["source_url"].endswith("aaaaaaaaaaa")
+
+
+def test_record_marks_summary_as_derived_not_primary_evidence():
+    rec = to_record(_row("aaaaaaaaaaa", TODAY))
+    assert rec["evidence_role"] == "derived-summary"
+
+
+def test_provenance_traces_back_to_catalog_row():
+    rec = to_record(_row("aaaaaaaaaaa", TODAY, source="live_pipeline"))
+    prov = rec["provenance"]
+    assert prov["system"] == "p03"
+    assert prov["catalog"] == "index/note_catalog.jsonl"
+    assert prov["catalog_source"] == "live_pipeline"
+    assert rec["summary_ref"].endswith(".md")
+
+
+def test_summary_hash_is_opt_in():
+    assert "summary_hash" not in to_record(_row("aaaaaaaaaaa", TODAY))
+    assert "summary_hash" in to_record(_row("aaaaaaaaaaa", TODAY), with_summary_hash=True)
+
+
+# --------------------------------------------------------------------------
+# idempotency
+# --------------------------------------------------------------------------
+
+
+def test_second_run_over_unchanged_catalog_emits_nothing():
+    with tempfile.TemporaryDirectory() as tmp:
+        cat = _catalog(tmp, [_row("aaaaaaaaaaa", TODAY), _row("bbbbbbbbbbb", TODAY)])
+        state_file = os.path.join(tmp, "state.json")
+
+        first = run_adapter(cat, state_file, since_days=7, today=TODAY)
+        assert first["stats"]["emitted"] == 2
+        write_state(state_file, first["state"])
+
+        second = run_adapter(cat, state_file, since_days=7, today=TODAY)
+        assert second["stats"]["emitted"] == 0
+        assert second["stats"]["skipped_already_emitted"] == 2
+        assert second["stats"]["next_checkpoint"] == first["stats"]["next_checkpoint"]
+
+
+def test_only_new_material_is_emitted_on_the_next_run():
+    with tempfile.TemporaryDirectory() as tmp:
+        cat = _catalog(tmp, [_row("aaaaaaaaaaa", "2026-09-08")])
+        state_file = os.path.join(tmp, "state.json")
+        first = run_adapter(cat, state_file, since_days=7, today=TODAY)
+        write_state(state_file, first["state"])
+
+        cat = _catalog(tmp, [_row("aaaaaaaaaaa", "2026-09-08"), _row("bbbbbbbbbbb", TODAY)])
+        second = run_adapter(cat, state_file, today=TODAY)
+        assert [r["video_id"] for r in second["records"]] == ["bbbbbbbbbbb"]
+
+
+def test_replay_re_emits_without_advancing_the_checkpoint():
+    with tempfile.TemporaryDirectory() as tmp:
+        cat = _catalog(tmp, [_row("aaaaaaaaaaa", TODAY)])
+        state_file = os.path.join(tmp, "state.json")
+        first = run_adapter(cat, state_file, since_days=7, today=TODAY)
+        write_state(state_file, first["state"])
+
+        replay = run_adapter(cat, state_file, since_days=7, replay=True, today=TODAY)
+        assert replay["stats"]["emitted"] == 1
+        assert replay["state_changed"] is False
+        assert load_state(state_file)["last_transcript_date"] == first["state"]["last_transcript_date"]
+
+
+def test_ledger_stays_bounded():
+    emitted = {"old": "2026-01-01", "new": "2026-09-09"}
+    pruned = prune_ledger(emitted, "2026-09-09", retention_days=30)
+    assert pruned == {"new": "2026-09-09"}
+
+
+def test_missing_catalog_is_fail_soft():
+    with tempfile.TemporaryDirectory() as tmp:
+        result = run_adapter(
+            os.path.join(tmp, "absent.jsonl"), os.path.join(tmp, "state.json"), today=TODAY
+        )
+        assert result["records"] == []
+        assert result["stats"]["catalog_rows_in_window"] == 0
+
+
+def test_corrupt_state_file_restarts_clean_instead_of_unbounding():
+    with tempfile.TemporaryDirectory() as tmp:
+        state_file = os.path.join(tmp, "state.json")
+        with open(state_file, "w", encoding="utf-8") as f:
+            f.write("{not json")
+        assert load_state(state_file)["last_transcript_date"] is None
+
+
+# --------------------------------------------------------------------------
+# disable switch
+# --------------------------------------------------------------------------
+
+
+def test_adapter_can_be_disabled_without_touching_the_p03_runtime():
+    assert adapter_enabled({}) is True
+    assert adapter_enabled({"P03_INTELLIGENCE_ADAPTER": "on"}) is True
+    for off in ("off", "0", "false", "disabled", "no"):
+        assert adapter_enabled({"P03_INTELLIGENCE_ADAPTER": off}) is False, off
+
+
+def test_adapter_module_is_not_imported_by_the_canonical_pipeline():
+    """The handoff is an optional script, never a pipeline dependency."""
+    for entry in ("main.py", "stt_function_v3.py", "pipeline_context.py"):
+        text = (PROJECT_ROOT / entry).read_text(encoding="utf-8")
+        assert "intelligence_source_adapter" not in text, entry
+
+
+# --------------------------------------------------------------------------
+# the handoff export survives an idempotent rerun
+# (reviewer finding, 2026-09-09: an empty rerun destroyed the previous export)
+# --------------------------------------------------------------------------
+
+
+def test_an_empty_rerun_does_not_destroy_the_previous_export():
+    """A rerun emitting nothing must not blank the export a consumer reads."""
+    with tempfile.TemporaryDirectory() as tmp:
+        out = os.path.join(tmp, "handoff.jsonl")
+        records = [to_record(_row("aaaaaaaaaaa", TODAY))]
+
+        first = write_records(records, out)
+        assert first["status"] == "written"
+        size = os.path.getsize(out)
+        assert size > 0
+
+        second = write_records([], out)
+        assert second["written"] is False
+        assert second["status"] == "kept-existing"
+        assert os.path.getsize(out) == size
+
+
+def test_an_empty_first_run_still_creates_the_export():
+    with tempfile.TemporaryDirectory() as tmp:
+        out = os.path.join(tmp, "handoff.jsonl")
+        assert write_records([], out)["status"] == "written"
+        assert os.path.isfile(out)
+
+
+def test_emptying_the_export_requires_an_explicit_opt_in():
+    with tempfile.TemporaryDirectory() as tmp:
+        out = os.path.join(tmp, "handoff.jsonl")
+        write_records([to_record(_row("aaaaaaaaaaa", TODAY))], out)
+        assert write_records([], out, allow_empty_overwrite=True)["written"] is True
+        assert os.path.getsize(out) == 0
+
+
+def test_a_non_empty_rerun_replaces_the_export():
+    with tempfile.TemporaryDirectory() as tmp:
+        out = os.path.join(tmp, "handoff.jsonl")
+        write_records([to_record(_row("aaaaaaaaaaa", TODAY))], out)
+        write_records([to_record(_row("bbbbbbbbbbb", TODAY))], out)
+        with open(out, encoding="utf-8") as f:
+            rows = [json.loads(line) for line in f if line.strip()]
+        assert [r["video_id"] for r in rows] == ["bbbbbbbbbbb"]
+
+
+# --------------------------------------------------------------------------
+# a truncated run must not orphan the rows it did not emit
+# (reviewer finding, 2026-09-09: --limit advanced the checkpoint past them)
+# --------------------------------------------------------------------------
+
+
+def test_limit_does_not_advance_the_checkpoint_past_unemitted_rows():
+    """Rows are newest-first, so a limit drops the oldest — they must survive."""
+    with tempfile.TemporaryDirectory() as tmp:
+        cat = _catalog(tmp, [_row("n" * 11, "2026-09-09"), _row("o" * 11, "2026-09-01")])
+        state_file = os.path.join(tmp, "state.json")
+
+        first = run_adapter(cat, state_file, since_days=30, limit=1, today=TODAY)
+        assert [r["video_id"] for r in first["records"]] == ["n" * 11]
+        assert first["stats"]["deferred_to_next_run"] == 1
+        assert first["stats"]["checkpoint_held_by_limit"] is True
+        assert first["stats"]["next_checkpoint"] == first["stats"]["previous_checkpoint"]
+        write_state(state_file, first["state"])
+
+        second = run_adapter(cat, state_file, since_days=30, today=TODAY)
+        assert [r["video_id"] for r in second["records"]] == ["o" * 11]
+        write_state(state_file, second["state"])
+
+        third = run_adapter(cat, state_file, since_days=30, today=TODAY)
+        assert third["records"] == []
+
+
+def test_an_untruncated_run_still_advances_the_checkpoint():
+    with tempfile.TemporaryDirectory() as tmp:
+        cat = _catalog(tmp, [_row("n" * 11, "2026-09-09"), _row("o" * 11, "2026-09-01")])
+        state_file = os.path.join(tmp, "state.json")
+        result = run_adapter(cat, state_file, since_days=30, limit=5, today=TODAY)
+        assert result["stats"]["deferred_to_next_run"] == 0
+        assert result["stats"]["checkpoint_held_by_limit"] is False
+        assert result["stats"]["next_checkpoint"] == "2026-09-09"
+
+
+def test_a_held_backlog_drains_instead_of_livelocking():
+    """Retention must not evict an id the same window can still re-read."""
+    with tempfile.TemporaryDirectory() as tmp:
+        cat = _catalog(tmp, [_row("a" * 11, "2026-04-02"), _row("b" * 11, "2026-04-01")])
+        state_file = os.path.join(tmp, "state.json")
+        seeded = empty_state()
+        seeded["last_transcript_date"] = "2026-06-01"  # far newer than the backlog
+        write_state(state_file, seeded)
+
+        emitted = []
+        for _ in range(6):
+            result = run_adapter(cat, state_file, since="2026-03-01", limit=1, today="2026-06-05")
+            write_state(state_file, result["state"])
+            emitted += [r["video_id"] for r in result["records"]]
+
+        assert sorted(emitted) == ["a" * 11, "b" * 11], "each row must be emitted exactly once"
+
+
+def test_a_deferred_backlog_is_reachable_without_repeating_the_window_flag():
+    """The widened window must persist, or the backlog falls out of range."""
+    with tempfile.TemporaryDirectory() as tmp:
+        cat = _catalog(tmp, [_row("n" * 11, "2026-09-09"), _row("o" * 11, "2026-08-15")])
+        state_file = os.path.join(tmp, "state.json")
+
+        first = run_adapter(cat, state_file, since_days=30, limit=1, today=TODAY)
+        assert first["stats"]["pending_window_start"] == "2026-08-15"
+        write_state(state_file, first["state"])
+
+        # No --since-days this time: the default window would be two days wide.
+        second = run_adapter(cat, state_file, today=TODAY)
+        assert second["stats"]["window_start"] == "2026-08-15"
+        assert [r["video_id"] for r in second["records"]] == ["o" * 11]
+        write_state(state_file, second["state"])
+
+        third = run_adapter(cat, state_file, today=TODAY)
+        assert third["records"] == []
+        assert third["stats"]["pending_window_start"] is None
+
+
+def test_retention_still_bounds_the_ledger_on_a_normal_window():
+    ledger = {"old": "2026-01-01", "mid": "2026-08-20", "new": "2026-09-09"}
+    pruned = prune_ledger(ledger, "2026-09-09", 30, keep_from="2026-09-07")
+    assert sorted(pruned) == ["mid", "new"]
+
+
+def test_a_non_positive_limit_is_rejected_rather_than_emitting_nothing_forever():
+    with tempfile.TemporaryDirectory() as tmp:
+        for bad in (0, -1):
+            try:
+                run_adapter(os.path.join(tmp, "c.jsonl"), os.path.join(tmp, "s.json"), limit=bad)
+            except ValueError as exc:
+                assert "at least 1" in str(exc)
+            else:
+                raise AssertionError(f"limit={bad} should have been rejected")
+
+
+def test_a_missing_catalog_does_not_erase_a_pending_backlog():
+    """Fail-soft must change nothing — including not looking like a drain."""
+    with tempfile.TemporaryDirectory() as tmp:
+        state_file = os.path.join(tmp, "state.json")
+        cat = os.path.join(tmp, "absent.jsonl")
+        seeded = empty_state()
+        seeded["last_transcript_date"] = "2026-09-09"
+        seeded["pending_window_start"] = "2026-08-15"
+        write_state(state_file, seeded)
+
+        missing = run_adapter(cat, state_file, today=TODAY)
+        assert missing["stats"]["catalog_present"] is False
+        assert missing["stats"]["pending_window_start"] == "2026-08-15"
+        write_state(state_file, missing["state"])
+
+        # The catalog comes back carrying the deferred row.
+        _catalog(tmp, [_row("o" * 11, "2026-08-15")])
+        os.replace(os.path.join(tmp, "note_catalog.jsonl"), cat)
+        recovered = run_adapter(cat, state_file, today=TODAY)
+        assert recovered["stats"]["window_start"] == "2026-08-15"
+        assert [r["video_id"] for r in recovered["records"]] == ["o" * 11]
+
+
+def test_replay_reports_and_preserves_the_persisted_backlog():
+    with tempfile.TemporaryDirectory() as tmp:
+        cat = _catalog(tmp, [_row("n" * 11, "2026-09-09")])
+        state_file = os.path.join(tmp, "state.json")
+        seeded = empty_state()
+        seeded["last_transcript_date"] = "2026-09-09"
+        seeded["pending_window_start"] = "2026-08-15"
+        write_state(state_file, seeded)
+
+        replay = run_adapter(cat, state_file, since_days=30, replay=True, today=TODAY)
+        assert replay["state_changed"] is False
+        assert replay["stats"]["pending_window_start"] == "2026-08-15"
+        assert load_state(state_file)["pending_window_start"] == "2026-08-15"
+
+
+def _seeded_state(tmp, pending="2026-08-15", checkpoint="2026-09-09"):
+    state_file = os.path.join(tmp, "state.json")
+    seeded = empty_state()
+    seeded["last_transcript_date"] = checkpoint
+    seeded["pending_window_start"] = pending
+    write_state(state_file, seeded)
+    return state_file
+
+
+def test_an_empty_but_present_catalog_is_not_a_drain():
+    """File presence is not read success — an empty read drains nothing."""
+    with tempfile.TemporaryDirectory() as tmp:
+        state_file = _seeded_state(tmp)
+        cat = os.path.join(tmp, "empty.jsonl")
+        open(cat, "w").close()
+        result = run_adapter(cat, state_file, since="2026-08-01", today=TODAY)
+        assert result["stats"]["pending_window_start"] == "2026-08-15"
+
+
+def test_a_corrupt_catalog_is_not_a_drain():
+    with tempfile.TemporaryDirectory() as tmp:
+        state_file = _seeded_state(tmp)
+        cat = os.path.join(tmp, "corrupt.jsonl")
+        with open(cat, "w", encoding="utf-8") as f:
+            f.write("{not json\nalso not json\n")
+        result = run_adapter(cat, state_file, since="2026-08-01", today=TODAY)
+        assert result["stats"]["pending_window_start"] == "2026-08-15"
+
+
+def test_a_backlog_claim_never_moves_forward():
+    """A newly deferred row must not overwrite an older claim still owed."""
+    with tempfile.TemporaryDirectory() as tmp:
+        state_file = _seeded_state(tmp)
+        cat = _catalog(tmp, [_row("n" * 11, "2026-09-09"), _row("m" * 11, "2026-09-08")])
+        result = run_adapter(cat, state_file, since="2026-08-01", limit=1, today=TODAY)
+        assert result["stats"]["checkpoint_held_by_limit"] is True
+        assert result["stats"]["pending_window_start"] == "2026-08-15"
+
+
+def test_a_genuine_full_read_clears_the_claim():
+    with tempfile.TemporaryDirectory() as tmp:
+        state_file = _seeded_state(tmp, pending=None)
+        cat = _catalog(tmp, [_row("n" * 11, "2026-09-09")])
+        result = run_adapter(cat, state_file, since="2026-08-01", today=TODAY)
+        assert result["stats"]["pending_window_start"] is None
+
+
+def test_a_claim_survives_a_window_that_did_not_reach_the_backlog():
+    """Rows read, but none from the backlog region: the row is absent, not drained."""
+    with tempfile.TemporaryDirectory() as tmp:
+        state_file = os.path.join(tmp, "state.json")
+        seeded = empty_state()
+        seeded["last_transcript_date"] = "2026-09-09"
+        seeded["pending_window_start"] = "2026-08-15"
+        seeded["emitted"] = {"n" * 11: "2026-09-09"}
+        write_state(state_file, seeded)
+
+        # Only an already-emitted recent row; the deferred 2026-08-15 row is missing.
+        cat = _catalog(tmp, [_row("n" * 11, "2026-09-09")])
+        held = run_adapter(cat, state_file, today=TODAY)
+        assert held["stats"]["catalog_rows_in_window"] == 1
+        assert held["stats"]["emitted"] == 0
+        assert held["stats"]["pending_window_start"] == "2026-08-15"
+        write_state(state_file, held["state"])
+
+        # The deferred row comes back and is still reachable.
+        cat = _catalog(tmp, [_row("n" * 11, "2026-09-09"), _row("o" * 11, "2026-08-15")])
+        recovered = run_adapter(cat, state_file, today=TODAY)
+        assert recovered["stats"]["window_start"] == "2026-08-15"
+        assert [r["video_id"] for r in recovered["records"]] == ["o" * 11]
+        write_state(state_file, recovered["state"])
+        assert load_state(state_file)["pending_window_start"] is None
+
+
+def test_export_is_newest_first_by_processed_at_and_video_id():
+    with tempfile.TemporaryDirectory() as tmp:
+        cat = _catalog(
+            tmp,
+            [
+                _row("a" * 11, "2026-09-08"),
+                _row("b" * 11, "2026-09-09"),
+                _row("c" * 11, "2026-09-09"),
+            ],
+        )
+        result = run_adapter(cat, os.path.join(tmp, "state.json"), since_days=7, today=TODAY)
+        out = os.path.join(tmp, "handoff.jsonl")
+        write_records(result["records"], out)
+        with open(out, encoding="utf-8") as f:
+            exported = [json.loads(line) for line in f]
+        keys = [(record["processed_at"], record["video_id"]) for record in exported]
+        assert keys == sorted(keys, reverse=True)
+
+
+if __name__ == "__main__":
+    fns = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
+    for fn in fns:
+        fn()
+    print(f"ok ({len(fns)} tests)")

@@ -1,6 +1,7 @@
 # P03 as a Learning Intelligence Source Adapter
 
-Status: **planned integration contract; existing P03 runtime remains authoritative until implemented/certified**  
+Status: **implemented and certified (SUE-733)**  
+Implementation: `scripts/intelligence_source_adapter.py` · Tests: `scripts/test_intelligence_source_adapter.py`  
 Related systems: `suengj/reference-library`, `suengj/ai-editorial-system`
 
 ## Decision
@@ -91,6 +92,70 @@ Those belong to the higher-level Intelligence / Editorial workflow.
 Before adding a new exporter, inspect whether the existing note catalog / digest / Drive sync already provides the required fields and bounded incremental read. Prefer a compatibility adapter over a second parallel catalog.
 
 Any new runtime code must remain optional and fail without disrupting the canonical YouTube transcription pipeline.
+
+## Implementation
+
+`scripts/intelligence_source_adapter.py` is a compatibility view over the existing
+`index/note_catalog.jsonl` surface. It creates no second catalog: contract fields are
+remapped from catalog fields (`vid`, `source_url`, `channel`, `title`, `upload_date`,
+`transcript_date`, `tldr`, `tags`, `md_path_rel`), and each record keeps a `provenance`
+block naming the originating catalog and row source.
+
+```bash
+# bounded preview
+python scripts/intelligence_source_adapter.py --since-days 3 --dry-run
+
+# emit records and advance the checkpoint
+python scripts/intelligence_source_adapter.py --output /path/p03_intel.jsonl
+
+# re-emit a window for recovery without moving the checkpoint
+python scripts/intelligence_source_adapter.py --replay --since-days 7
+
+# disable the handoff; the canonical P03 runtime is unaffected
+P03_INTELLIGENCE_ADAPTER=off python scripts/intelligence_source_adapter.py
+```
+
+Bounding and idempotency:
+
+- exported records are ordered newest-first by `(processed_at, video_id)`; consumers may
+  rely on that order only after validating the complete bounded handoff before slicing;
+- the window starts at the stored checkpoint minus a small recovery slack
+  (`index/intelligence_adapter_state.json`), or at an explicit `--since-days` / `--since`;
+- the catalog is streamed once and filtered by `transcript_date`; the historical Markdown
+  corpus is never walked, and Markdown files are opened only for the opt-in
+  `--with-summary-hash` pass;
+- emitted video ids are recorded in a ledger pruned to a 30-day retention window, so a
+  rerun over an unchanged catalog emits nothing;
+- a rerun that emits nothing **keeps the existing export** rather than truncating it, so a
+  consumer pointed at a stable `--output` path never silently sees zero records; pass
+  `--allow-empty-overwrite` to empty it deliberately;
+- duplicate rows for one video (different language or summariser suffix) collapse to a
+  single discovery record;
+- `--limit` truncates the *oldest* eligible rows, so a truncated run deliberately does not
+  advance the checkpoint. The deferred rows are emitted by the next run instead of falling
+  outside its window; `deferred_to_next_run` and `checkpoint_held_by_limit` report this.
+  The oldest deferred date is persisted as `pending_window_start`, so the next run widens
+  its window back to the backlog even when it is invoked with no arguments;
+- the emitted-id ledger is never pruned below the start of the window actually read. A
+  normal run reads a few days, so the 30-day retention dominates and the ledger stays
+  small; a deliberately wide `--since` widens retention to match, which prevents an id
+  being pruned and then re-emitted forever while a backlog drains behind it;
+- a catalog that is missing, empty or unreadable changes nothing: the checkpoint stays put
+  and a pending backlog is preserved rather than being mistaken for a completed drain.
+  File presence is not read success — the claim clears only after a read that actually
+  returned rows and emitted them;
+- a backlog claim only ever moves older. A newly deferred row never overwrites an older
+  claim that is still owed, and the claim is not cleared by a read that returned rows but
+  none from the backlog region — that means the deferred row is temporarily absent from
+  the catalog, not drained.
+
+If a deferred row is deleted from the catalog outright, the claim persists and every
+subsequent read stays widened to it. That is a bounded cost — a wider indexed read, never
+a Markdown scan — and is deliberately preferred to silently losing a record. Clear it by
+deleting `index/intelligence_adapter_state.json` and re-running with an explicit window.
+
+`evidence_role` is fixed to `derived-summary`: a P03 summary is a discovery and clustering
+input, never primary evidence, unless the video itself is the event being analysed.
 
 ## Acceptance direction
 
