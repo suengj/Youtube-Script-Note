@@ -352,13 +352,26 @@ def run_adapter(
     }
 
 
-def write_records(records: List[Dict[str, Any]], out_path: str) -> None:
+def write_records(
+    records: List[Dict[str, Any]], out_path: str, allow_empty_overwrite: bool = False
+) -> Dict[str, Any]:
+    """Write the handoff export.
+
+    An empty result is the normal outcome of an idempotent rerun, so it must not
+    destroy the export the previous run produced: a consumer pointed at a stable
+    path would otherwise silently see zero P03 records. Nothing is written in
+    that case unless the caller explicitly asks for it.
+    """
+    if not records and not allow_empty_overwrite and os.path.exists(out_path):
+        return {"path": out_path, "written": False, "status": "kept-existing"}
+
     os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
     tmp = f"{out_path}.tmp"
     with open(tmp, "w", encoding="utf-8") as f:
         for rec in records:
             f.write(json.dumps(rec, ensure_ascii=False) + "\n")
     os.replace(tmp, out_path)
+    return {"path": out_path, "written": True, "status": "written"}
 
 
 def main() -> int:
@@ -372,6 +385,11 @@ def main() -> int:
     parser.add_argument("--output", type=str, default=None)
     parser.add_argument("--with-summary-hash", action="store_true")
     parser.add_argument("--replay", action="store_true", help="Re-emit window without advancing state")
+    parser.add_argument(
+        "--allow-empty-overwrite",
+        action="store_true",
+        help="Let an empty result replace an existing export (default: keep the previous one)",
+    )
     parser.add_argument("--dry-run", action="store_true", help="Do not write records or state")
     parser.add_argument("--base-path", type=str, default=None)
     parser.add_argument("--work-path", type=str, default=None)
@@ -422,8 +440,11 @@ def main() -> int:
     out_path = args.output or os.path.join(
         index_dir(work, data_root), f"intelligence_source_{datetime.now():%Y%m%d}.jsonl"
     )
-    write_records(result["records"], out_path)
-    print(f"records:    {out_path}")
+    written = write_records(result["records"], out_path, args.allow_empty_overwrite)
+    if written["status"] == "kept-existing":
+        print(f"records:    {out_path} (unchanged — no new records, previous export kept)")
+    else:
+        print(f"records:    {out_path}")
 
     if result["state_changed"]:
         write_state(state_file, result["state"])

@@ -20,6 +20,7 @@ from scripts.intelligence_source_adapter import (  # noqa: E402
     run_adapter,
     select_rows,
     to_record,
+    write_records,
     write_state,
 )
 
@@ -226,6 +227,54 @@ def test_adapter_module_is_not_imported_by_the_canonical_pipeline():
     for entry in ("main.py", "stt_function_v3.py", "pipeline_context.py"):
         text = (PROJECT_ROOT / entry).read_text(encoding="utf-8")
         assert "intelligence_source_adapter" not in text, entry
+
+
+# --------------------------------------------------------------------------
+# the handoff export survives an idempotent rerun
+# (reviewer finding, 2026-09-09: an empty rerun destroyed the previous export)
+# --------------------------------------------------------------------------
+
+
+def test_an_empty_rerun_does_not_destroy_the_previous_export():
+    """A rerun emitting nothing must not blank the export a consumer reads."""
+    with tempfile.TemporaryDirectory() as tmp:
+        out = os.path.join(tmp, "handoff.jsonl")
+        records = [to_record(_row("aaaaaaaaaaa", TODAY))]
+
+        first = write_records(records, out)
+        assert first["status"] == "written"
+        size = os.path.getsize(out)
+        assert size > 0
+
+        second = write_records([], out)
+        assert second["written"] is False
+        assert second["status"] == "kept-existing"
+        assert os.path.getsize(out) == size
+
+
+def test_an_empty_first_run_still_creates_the_export():
+    with tempfile.TemporaryDirectory() as tmp:
+        out = os.path.join(tmp, "handoff.jsonl")
+        assert write_records([], out)["status"] == "written"
+        assert os.path.isfile(out)
+
+
+def test_emptying_the_export_requires_an_explicit_opt_in():
+    with tempfile.TemporaryDirectory() as tmp:
+        out = os.path.join(tmp, "handoff.jsonl")
+        write_records([to_record(_row("aaaaaaaaaaa", TODAY))], out)
+        assert write_records([], out, allow_empty_overwrite=True)["written"] is True
+        assert os.path.getsize(out) == 0
+
+
+def test_a_non_empty_rerun_replaces_the_export():
+    with tempfile.TemporaryDirectory() as tmp:
+        out = os.path.join(tmp, "handoff.jsonl")
+        write_records([to_record(_row("aaaaaaaaaaa", TODAY))], out)
+        write_records([to_record(_row("bbbbbbbbbbb", TODAY))], out)
+        with open(out, encoding="utf-8") as f:
+            rows = [json.loads(line) for line in f if line.strip()]
+        assert [r["video_id"] for r in rows] == ["bbbbbbbbbbb"]
 
 
 if __name__ == "__main__":

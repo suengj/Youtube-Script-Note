@@ -124,6 +124,9 @@ Bounding and idempotency:
   `--with-summary-hash` pass;
 - emitted video ids are recorded in a ledger pruned to a 30-day retention window, so a
   rerun over an unchanged catalog emits nothing;
+- a rerun that emits nothing **keeps the existing export** rather than truncating it, so a
+  consumer pointed at a stable `--output` path never silently sees zero records; pass
+  `--allow-empty-overwrite` to empty it deliberately;
 - duplicate rows for one video (different language or summariser suffix) collapse to a
   single discovery record.
 
