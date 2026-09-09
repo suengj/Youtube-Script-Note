@@ -371,6 +371,44 @@ def test_a_non_positive_limit_is_rejected_rather_than_emitting_nothing_forever()
                 raise AssertionError(f"limit={bad} should have been rejected")
 
 
+def test_a_missing_catalog_does_not_erase_a_pending_backlog():
+    """Fail-soft must change nothing — including not looking like a drain."""
+    with tempfile.TemporaryDirectory() as tmp:
+        state_file = os.path.join(tmp, "state.json")
+        cat = os.path.join(tmp, "absent.jsonl")
+        seeded = empty_state()
+        seeded["last_transcript_date"] = "2026-09-09"
+        seeded["pending_window_start"] = "2026-08-15"
+        write_state(state_file, seeded)
+
+        missing = run_adapter(cat, state_file, today=TODAY)
+        assert missing["stats"]["catalog_present"] is False
+        assert missing["stats"]["pending_window_start"] == "2026-08-15"
+        write_state(state_file, missing["state"])
+
+        # The catalog comes back carrying the deferred row.
+        _catalog(tmp, [_row("o" * 11, "2026-08-15")])
+        os.replace(os.path.join(tmp, "note_catalog.jsonl"), cat)
+        recovered = run_adapter(cat, state_file, today=TODAY)
+        assert recovered["stats"]["window_start"] == "2026-08-15"
+        assert [r["video_id"] for r in recovered["records"]] == ["o" * 11]
+
+
+def test_replay_reports_and_preserves_the_persisted_backlog():
+    with tempfile.TemporaryDirectory() as tmp:
+        cat = _catalog(tmp, [_row("n" * 11, "2026-09-09")])
+        state_file = os.path.join(tmp, "state.json")
+        seeded = empty_state()
+        seeded["last_transcript_date"] = "2026-09-09"
+        seeded["pending_window_start"] = "2026-08-15"
+        write_state(state_file, seeded)
+
+        replay = run_adapter(cat, state_file, since_days=30, replay=True, today=TODAY)
+        assert replay["state_changed"] is False
+        assert replay["stats"]["pending_window_start"] == "2026-08-15"
+        assert load_state(state_file)["pending_window_start"] == "2026-08-15"
+
+
 if __name__ == "__main__":
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
     for fn in fns:

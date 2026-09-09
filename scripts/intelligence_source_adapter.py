@@ -328,6 +328,9 @@ def run_adapter(
     state = load_state(state_file)
     window_start = resolve_window_start(state, since_days, since, lookback_days, today)
 
+    # A missing or unreadable catalog is fail-soft: it must change nothing. In
+    # particular it must not look like "the backlog drained".
+    catalog_present = os.path.isfile(catalog_file)
     rows = select_rows(iter_catalog_rows(catalog_file), window_start)
     emitted_ledger: Dict[str, str] = dict(state.get("emitted") or {})
 
@@ -348,13 +351,16 @@ def run_adapter(
     previous_checkpoint = state.get("last_transcript_date")
     # Oldest row still owed to a consumer: the deferred backlog if this run was
     # truncated, otherwise whatever a previous truncated run left pending.
-    pending_start = (
-        min(entry_date(r) for r in eligible[len(fresh) :])
-        if truncated
-        else (None if replay else state.get("pending_window_start"))
-    )
-    if not truncated and not replay and pending_start:
-        # Everything from the pending window was emitted this run.
+    carried_pending = state.get("pending_window_start")
+    if truncated:
+        pending_start = min(entry_date(r) for r in eligible[len(fresh) :])
+    elif not catalog_present:
+        # Nothing was read, so nothing drained. Keep the backlog claim.
+        pending_start = carried_pending
+    elif replay:
+        pending_start = carried_pending
+    else:
+        # The window was read in full, so any pending backlog is now emitted.
         pending_start = None
 
     if truncated:
@@ -395,6 +401,7 @@ def run_adapter(
             "skipped_already_emitted": skipped_known,
             "deferred_to_next_run": deferred,
             "checkpoint_held_by_limit": truncated,
+            "catalog_present": catalog_present,
             "pending_window_start": pending_start,
             "previous_checkpoint": previous_checkpoint,
             "next_checkpoint": next_state.get("last_transcript_date"),
