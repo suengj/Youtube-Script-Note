@@ -1,6 +1,7 @@
 # P03 as a Learning Intelligence Source Adapter
 
-Status: **planned integration contract; existing P03 runtime remains authoritative until implemented/certified**  
+Status: **implemented and certified (SUE-733)**  
+Implementation: `scripts/intelligence_source_adapter.py` · Tests: `scripts/test_intelligence_source_adapter.py`  
 Related systems: `suengj/reference-library`, `suengj/ai-editorial-system`
 
 ## Decision
@@ -91,6 +92,43 @@ Those belong to the higher-level Intelligence / Editorial workflow.
 Before adding a new exporter, inspect whether the existing note catalog / digest / Drive sync already provides the required fields and bounded incremental read. Prefer a compatibility adapter over a second parallel catalog.
 
 Any new runtime code must remain optional and fail without disrupting the canonical YouTube transcription pipeline.
+
+## Implementation
+
+`scripts/intelligence_source_adapter.py` is a compatibility view over the existing
+`index/note_catalog.jsonl` surface. It creates no second catalog: contract fields are
+remapped from catalog fields (`vid`, `source_url`, `channel`, `title`, `upload_date`,
+`transcript_date`, `tldr`, `tags`, `md_path_rel`), and each record keeps a `provenance`
+block naming the originating catalog and row source.
+
+```bash
+# bounded preview
+python scripts/intelligence_source_adapter.py --since-days 3 --dry-run
+
+# emit records and advance the checkpoint
+python scripts/intelligence_source_adapter.py --output /path/p03_intel.jsonl
+
+# re-emit a window for recovery without moving the checkpoint
+python scripts/intelligence_source_adapter.py --replay --since-days 7
+
+# disable the handoff; the canonical P03 runtime is unaffected
+P03_INTELLIGENCE_ADAPTER=off python scripts/intelligence_source_adapter.py
+```
+
+Bounding and idempotency:
+
+- the window starts at the stored checkpoint minus a small recovery slack
+  (`index/intelligence_adapter_state.json`), or at an explicit `--since-days` / `--since`;
+- the catalog is streamed once and filtered by `transcript_date`; the historical Markdown
+  corpus is never walked, and Markdown files are opened only for the opt-in
+  `--with-summary-hash` pass;
+- emitted video ids are recorded in a ledger pruned to a 30-day retention window, so a
+  rerun over an unchanged catalog emits nothing;
+- duplicate rows for one video (different language or summariser suffix) collapse to a
+  single discovery record.
+
+`evidence_role` is fixed to `derived-summary`: a P03 summary is a discovery and clustering
+input, never primary evidence, unless the video itself is the event being analysed.
 
 ## Acceptance direction
 
