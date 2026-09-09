@@ -409,6 +409,53 @@ def test_replay_reports_and_preserves_the_persisted_backlog():
         assert load_state(state_file)["pending_window_start"] == "2026-08-15"
 
 
+def _seeded_state(tmp, pending="2026-08-15", checkpoint="2026-09-09"):
+    state_file = os.path.join(tmp, "state.json")
+    seeded = empty_state()
+    seeded["last_transcript_date"] = checkpoint
+    seeded["pending_window_start"] = pending
+    write_state(state_file, seeded)
+    return state_file
+
+
+def test_an_empty_but_present_catalog_is_not_a_drain():
+    """File presence is not read success — an empty read drains nothing."""
+    with tempfile.TemporaryDirectory() as tmp:
+        state_file = _seeded_state(tmp)
+        cat = os.path.join(tmp, "empty.jsonl")
+        open(cat, "w").close()
+        result = run_adapter(cat, state_file, since="2026-08-01", today=TODAY)
+        assert result["stats"]["pending_window_start"] == "2026-08-15"
+
+
+def test_a_corrupt_catalog_is_not_a_drain():
+    with tempfile.TemporaryDirectory() as tmp:
+        state_file = _seeded_state(tmp)
+        cat = os.path.join(tmp, "corrupt.jsonl")
+        with open(cat, "w", encoding="utf-8") as f:
+            f.write("{not json\nalso not json\n")
+        result = run_adapter(cat, state_file, since="2026-08-01", today=TODAY)
+        assert result["stats"]["pending_window_start"] == "2026-08-15"
+
+
+def test_a_backlog_claim_never_moves_forward():
+    """A newly deferred row must not overwrite an older claim still owed."""
+    with tempfile.TemporaryDirectory() as tmp:
+        state_file = _seeded_state(tmp)
+        cat = _catalog(tmp, [_row("n" * 11, "2026-09-09"), _row("m" * 11, "2026-09-08")])
+        result = run_adapter(cat, state_file, since="2026-08-01", limit=1, today=TODAY)
+        assert result["stats"]["checkpoint_held_by_limit"] is True
+        assert result["stats"]["pending_window_start"] == "2026-08-15"
+
+
+def test_a_genuine_full_read_clears_the_claim():
+    with tempfile.TemporaryDirectory() as tmp:
+        state_file = _seeded_state(tmp, pending=None)
+        cat = _catalog(tmp, [_row("n" * 11, "2026-09-09")])
+        result = run_adapter(cat, state_file, since="2026-08-01", today=TODAY)
+        assert result["stats"]["pending_window_start"] is None
+
+
 if __name__ == "__main__":
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
     for fn in fns:

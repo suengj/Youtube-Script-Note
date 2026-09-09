@@ -138,8 +138,12 @@ Bounding and idempotency:
   normal run reads a few days, so the 30-day retention dominates and the ledger stays
   small; a deliberately wide `--since` widens retention to match, which prevents an id
   being pruned and then re-emitted forever while a backlog drains behind it;
-- a missing or unreadable catalog changes nothing: the checkpoint stays put and a pending
-  backlog is preserved rather than being mistaken for a completed drain.
+- a catalog that is missing, empty or unreadable changes nothing: the checkpoint stays put
+  and a pending backlog is preserved rather than being mistaken for a completed drain.
+  File presence is not read success — the claim clears only after a read that actually
+  returned rows and emitted them;
+- a backlog claim only ever moves older. A newly deferred row never overwrites an older
+  claim that is still owed.
 
 `evidence_role` is fixed to `derived-summary`: a P03 summary is a discovery and clustering
 input, never primary evidence, unless the video itself is the event being analysed.

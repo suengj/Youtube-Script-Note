@@ -353,14 +353,16 @@ def run_adapter(
     # truncated, otherwise whatever a previous truncated run left pending.
     carried_pending = state.get("pending_window_start")
     if truncated:
-        pending_start = min(entry_date(r) for r in eligible[len(fresh) :])
-    elif not catalog_present:
-        # Nothing was read, so nothing drained. Keep the backlog claim.
-        pending_start = carried_pending
-    elif replay:
+        # A backlog claim only ever moves *older*: a newly deferred row must not
+        # overwrite an older claim that is still owed.
+        deferred_start = min(entry_date(r) for r in eligible[len(fresh) :])
+        pending_start = min([d for d in (carried_pending, deferred_start) if d])
+    elif replay or not rows:
+        # Nothing drained. The catalog was absent, empty or unreadable — file
+        # presence alone is not read success — so an existing claim stands.
         pending_start = carried_pending
     else:
-        # The window was read in full, so any pending backlog is now emitted.
+        # The window was genuinely read and fully emitted.
         pending_start = None
 
     if truncated:
