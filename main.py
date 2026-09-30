@@ -403,14 +403,22 @@ def load_config() -> dict:
             config.get('MAIN_LLM_FALLBACK_MODEL'),
             config.get('MAIN_LLM_FALLBACK_PROVIDER'),
         )
-    logger.info(
-        "LLM config: preprocess=%s main=%s (%s)%s output_suffix=_%s",
-        config.get('PREPROCESS_LLM_MODEL'),
-        config.get('MAIN_LLM_MODEL'),
-        config.get('MAIN_LLM_PROVIDER'),
-        fallback_bits,
-        config.get('MAIN_LLM_OUTPUT_SUFFIX'),
-    )
+    if config.get('LLM_PIPELINE_MODE') == 'direct_luna':
+        logger.info(
+            "LLM config: mode=direct_luna model=%s effort=%s (openai responses, single call) output_suffix=_%s",
+            config.get('DIRECT_LLM_MODEL'),
+            config.get('DIRECT_LLM_REASONING_EFFORT'),
+            config.get('MAIN_LLM_OUTPUT_SUFFIX'),
+        )
+    else:
+        logger.info(
+            "LLM config: mode=legacy_two_stage preprocess=%s main=%s (%s)%s output_suffix=_%s",
+            config.get('PREPROCESS_LLM_MODEL'),
+            config.get('MAIN_LLM_MODEL'),
+            config.get('MAIN_LLM_PROVIDER'),
+            fallback_bits,
+            config.get('MAIN_LLM_OUTPUT_SUFFIX'),
+        )
     
     # Validate paths
     paths_to_check = {
@@ -1534,7 +1542,8 @@ def process_single_video(
         })
         
         logger.info(f"[SUCCESS] All processes completed for video: {video_id}")
-        logger.info(f"  Summary: Downloaded → Transcribed → Minimized → Summarized → Saved")
+        logger.info("  Summary: Downloaded → Transcribed → %s → Saved",
+                    "Summarized (Luna single-pass)" if direct_mode else "Minimized → Summarized")
         pipeline_success = True
         ts = "whisper" if not subs_path else (subs_source or "subs")
         return _vr(

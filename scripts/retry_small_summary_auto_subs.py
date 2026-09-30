@@ -173,44 +173,58 @@ def process_one_vid(
         logger.error("Empty or too short transcription for %s", vid)
         return False
 
-    a_min, a_max = int((config.get("NANO_RETENTION_AUTO_SUBS") or (60, 80))[0]), int((config.get("NANO_RETENTION_AUTO_SUBS") or (60, 80))[1])
-    token_query = build_token_query(a_min, a_max, auto_subs=True)
-    skip_merge = bool(config.get("SKIP_MERGE_REMINIMIZE", True))
-    concise_transcription = stt.token_minimizer_chunked(
-        TOKEN_INPUT_ROLE, token_query, transcription, openai_client,
-        model=config.get('PREPROCESS_LLM_MODEL', 'gpt-5-nano-2025-08-07'),
-        skip_merge_reminimize=skip_merge,
-    )
-
-    # 5. Save concise to summary (overwrite existing small file)
-    if summary_target_path:
-        concise_path = summary_target_path
-    else:
-        max_len = config.get("FILENAME_MAX_LENGTH", 50) or 0
-        base_name = stt.sanitize_filename(title, max_length=max_len if max_len > 0 else 99999)
-        if not base_name:
-            base_name = vid
-        elif vid not in base_name:
-            base_name = f"{base_name}_{vid}"
-        lang_suffix = f"_{subs_lang}" if subs_lang else ""
-        txt_file_name = f"{base_name}{lang_suffix}_auto_subs.txt"
-        output_file = stt.change_filename(txt_file_name, f"_{config.get('MAIN_LLM_OUTPUT_SUFFIX', '5-mini')}")
-        concise_path = os.path.join(output_smm_path, output_file)
-    os.makedirs(os.path.dirname(concise_path), exist_ok=True)
-    with open(concise_path, "w", encoding="utf-8-sig") as f:
-        f.write(concise_transcription)
-    logger.info("Saved summary (overwrite): %s", concise_path)
-
-    # 6. Summarize (chunked)
     audio_nm = (info.get("title") or f"video_{vid}")[:80]
-    response = main_llm.summarize(
-        transcription=concise_transcription,
-        filename=audio_nm,
-        prompt=INPUT_PROMPT,
-        token_range=list(MAIN_LLM_TOKEN_RANGE),
-        language="Korean",
-        style="Markdown",
-    )
+    if config.get("LLM_PIPELINE_MODE") == "direct_luna":
+        # v5 production path: one Responses call on the raw transcript (no Nano, no chunking).
+        from main import _append_llm_usage, run_direct_summary
+        from llm_responses import ResponsesCallError
+        try:
+            response, usage = run_direct_summary(openai_client, transcription, audio_nm, vid, config)
+        except ResponsesCallError as exc:
+            if exc.usage is not None:
+                _append_llm_usage(config.get("DATA_ROOT") or base_path, exc.usage.to_dict(), vid)
+            logger.error("Direct Luna summary failed for %s: %s: %s", vid, exc.category, exc)
+            return False
+        _append_llm_usage(config.get("DATA_ROOT") or base_path, usage.to_dict(), vid)
+    else:
+        a_min, a_max = int((config.get("NANO_RETENTION_AUTO_SUBS") or (60, 80))[0]), int((config.get("NANO_RETENTION_AUTO_SUBS") or (60, 80))[1])
+        token_query = build_token_query(a_min, a_max, auto_subs=True)
+        skip_merge = bool(config.get("SKIP_MERGE_REMINIMIZE", True))
+        concise_transcription = stt.token_minimizer_chunked(
+            TOKEN_INPUT_ROLE, token_query, transcription, openai_client,
+            model=config.get('PREPROCESS_LLM_MODEL', 'gpt-5-nano-2025-08-07'),
+            skip_merge_reminimize=skip_merge,
+        )
+
+        # 5. Save concise to summary (overwrite existing small file)
+        if summary_target_path:
+            concise_path = summary_target_path
+        else:
+            max_len = config.get("FILENAME_MAX_LENGTH", 50) or 0
+            base_name = stt.sanitize_filename(title, max_length=max_len if max_len > 0 else 99999)
+            if not base_name:
+                base_name = vid
+            elif vid not in base_name:
+                base_name = f"{base_name}_{vid}"
+            lang_suffix = f"_{subs_lang}" if subs_lang else ""
+            txt_file_name = f"{base_name}{lang_suffix}_auto_subs.txt"
+            output_file = stt.change_filename(txt_file_name, f"_{config.get('MAIN_LLM_OUTPUT_SUFFIX', '5-mini')}")
+            concise_path = os.path.join(output_smm_path, output_file)
+        os.makedirs(os.path.dirname(concise_path), exist_ok=True)
+        with open(concise_path, "w", encoding="utf-8-sig") as f:
+            f.write(concise_transcription)
+        logger.info("Saved summary (overwrite): %s", concise_path)
+
+        # 6. Summarize (chunked)
+        audio_nm = (info.get("title") or f"video_{vid}")[:80]
+        response = main_llm.summarize(
+            transcription=concise_transcription,
+            filename=audio_nm,
+            prompt=INPUT_PROMPT,
+            token_range=list(MAIN_LLM_TOKEN_RANGE),
+            language="Korean",
+            style="Markdown",
+        )
 
     # 7. Save MD (overwrite existing or create new)
     from datetime import datetime

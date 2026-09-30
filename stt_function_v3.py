@@ -623,11 +623,30 @@ def _resolve_primary_lang(info, prefer_lang, subs_langs):
         base = lang.split("-")[0]
         return ac_key == lang or ac_key == base or ac_key.startswith(base + "-")
 
+    def _pick(lang):
+        # Prefer the original ASR track ("ko-orig") over machine-translated variants.
+        base = lang.split("-")[0]
+        for k in (f"{lang}-orig", f"{base}-orig"):
+            if k in ac:
+                return k
+        for k in ac_keys:
+            if _match(k, lang):
+                return k
+        return None
+
     # 1) prefer_lang이 있고 ac에 존재
     if prefer_lang and str(prefer_lang).strip():
-        for k in ac_keys:
-            if _match(k, prefer_lang):
-                return k
+        k = _pick(str(prefer_lang).strip())
+        if k:
+            return k
+
+    # 1b) yt-dlp가 감지한 원본 언어(info.language). 없으면 subs_langs 순서로 넘어감
+    #     (예: 한국어 영상에서 'en' 번역 자막이 선택되는 문제 방지)
+    detected = (info or {}).get("language")
+    if detected and str(detected).strip():
+        k = _pick(str(detected).strip())
+        if k:
+            return k
 
     # 2) subs_langs 순서대로 ac에 존재하는 첫 언어
     for lang in (subs_langs or []):
