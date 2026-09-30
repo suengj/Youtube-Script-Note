@@ -12,6 +12,7 @@ import subprocess
 import time
 import random
 import logging
+import json
 from datetime import datetime
 from pathlib import Path
 from dataclasses import dataclass
@@ -69,6 +70,7 @@ from claim_manager import ClaimManager
 from shared_state_writer import SharedStateWriter
 from admission_limiter import DownloadAdmissionLimiter, ProviderCooldown
 from preprocess_backend import create_transcript_preprocessor, TranscriptPreprocessor
+from llm_responses import call_responses, ResponsesCallError
 from runtime_resources import device_compute_route, get_device_semaphore
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -253,6 +255,49 @@ def failure_needs_long_cooldown(status: str, error_msg: Optional[str]) -> bool:
 LOCAL_BASE_PATH_DEFAULT = str(_PROJECT_ROOT)
 
 
+def _append_llm_usage(data_root: str, record: dict, video_id: str) -> None:
+    """Append token metadata only; transcript and model reasoning are never persisted."""
+    os.makedirs(os.path.join(data_root, "logs"), exist_ok=True)
+    row = dict(record)
+    row["video_id"] = video_id
+    with open(os.path.join(data_root, "logs", "llm_usage.jsonl"), "a", encoding="utf-8") as handle:
+        handle.write(json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n")
+
+
+def run_direct_summary(client, transcription: str, filename: str, video_id: str, config: dict):
+    """Fail closed above the configured raw-input ceiling, then make one Responses call."""
+    try:
+        raw_tokens = len(stt.tiktoken.get_encoding("cl100k_base").encode(transcription))
+    except Exception as exc:
+        raise ResponsesCallError("token_count_unavailable", f"cannot count raw input tokens: {type(exc).__name__}", None) from exc
+    limit = int(config.get("DIRECT_MAX_INPUT_TOKENS", 200000))
+    if raw_tokens > limit:
+        raise ResponsesCallError("input_too_long", f"{raw_tokens} raw tokens exceeds limit {limit}; manual review required", None)
+    return call_responses(
+        client,
+        model=config.get("DIRECT_LLM_MODEL", "gpt-6-luna"),
+        instructions=DIRECT_LUNA_PROMPT,
+        input_text=f"# {filename}\n\n{transcription}",
+        source_text=transcription,
+        effort=config.get("DIRECT_LLM_REASONING_EFFORT", "medium"),
+        max_output_tokens=int(config.get("DIRECT_MAX_OUTPUT_TOKENS", 32000)),
+        sample_video_id=video_id,
+    )
+
+
+def summarize_with_pipeline(mode: str, *, direct_client, main_llm, direct_transcription: str,
+                            legacy_transcription: str, filename: str, video_id: str,
+                            config: dict, prompt: str):
+    """Keep the legacy route isolated while selecting one direct Responses call when enabled."""
+    if mode == "direct_luna":
+        return run_direct_summary(direct_client, direct_transcription, filename, video_id, config)
+    text = main_llm.summarize(
+        transcription=legacy_transcription, filename=filename, prompt=prompt,
+        token_range=list(MAIN_LLM_TOKEN_RANGE), language="Korean", style="Markdown",
+    )
+    return text, None
+
+
 def load_config() -> dict:
     """Load configuration from .env (secrets/paths) and config.py (threshold, rate limiting, channel crawl)."""
     config = {
@@ -266,6 +311,11 @@ def load_config() -> dict:
         'OPENROUTER_API_KEY': os.getenv('OPENROUTER_API_KEY', '').strip(),
         'MAIN_LLM_PROVIDER': os.getenv('MAIN_LLM_PROVIDER', 'openai').strip().lower(),
         'MAIN_LLM_MODEL': os.getenv('MAIN_LLM_MODEL', 'gpt-5-mini-2025-08-07').strip(),
+        'DIRECT_LLM_MODEL': os.getenv('DIRECT_LLM_MODEL', 'gpt-6-luna').strip(),
+        'LLM_PIPELINE_MODE': os.getenv('LLM_PIPELINE_MODE', 'legacy_two_stage').strip().lower(),
+        'DIRECT_LLM_REASONING_EFFORT': os.getenv('DIRECT_LLM_REASONING_EFFORT', 'medium').strip().lower(),
+        'DIRECT_MAX_INPUT_TOKENS': int(os.getenv('DIRECT_MAX_INPUT_TOKENS', '200000')),
+        'DIRECT_MAX_OUTPUT_TOKENS': int(os.getenv('DIRECT_MAX_OUTPUT_TOKENS', '32000')),
         'MAIN_LLM_FALLBACK_PROVIDER': os.getenv('MAIN_LLM_FALLBACK_PROVIDER', '').strip().lower(),
         'MAIN_LLM_FALLBACK_MODEL': os.getenv('MAIN_LLM_FALLBACK_MODEL', '').strip(),
         'MAIN_LLM_OUTPUT_SUFFIX': os.getenv('MAIN_LLM_OUTPUT_SUFFIX', '5-mini').strip(),  # 5-mini=gpt-5-mini, dS4f=deepseek
@@ -303,6 +353,12 @@ def load_config() -> dict:
     _langs = os.getenv('YOUTUBE_SUBS_LANGS', '').strip()
     if _langs:
         config['YOUTUBE_SUBS_LANGS'] = _langs
+    if config['LLM_PIPELINE_MODE'] not in {'direct_luna', 'legacy_two_stage'}:
+        raise ValueError('LLM_PIPELINE_MODE must be direct_luna or legacy_two_stage')
+    if config['DIRECT_LLM_REASONING_EFFORT'] not in {'low', 'medium', 'high'}:
+        raise ValueError('DIRECT_LLM_REASONING_EFFORT must be low, medium, or high')
+    if os.getenv('MAIN_LLM_OUTPUT_SUFFIX') is None and config['LLM_PIPELINE_MODE'] == 'direct_luna':
+        config['MAIN_LLM_OUTPUT_SUFFIX'] = 'luna-' + config['DIRECT_LLM_REASONING_EFFORT']
     _save_full = os.getenv('SAVE_FULL_WHEN_AUTO_SUBS', '').strip().lower()
     if _save_full:
         config['SAVE_FULL_WHEN_AUTO_SUBS'] = _save_full in ('true', '1', 'yes')
@@ -713,6 +769,8 @@ INPUT_PROMPT = f"""
 
 {TONE_QUERY}
 """
+
+DIRECT_LUNA_PROMPT = (_PROJECT_ROOT / "prompt" / "direct_luna_v5.md").read_text(encoding="utf-8")
 
 # Legacy alias for prompt_log compatibility
 INPUT_QUERY = INPUT_PROMPT
@@ -1159,118 +1217,124 @@ def process_single_video(
                 logger.error(f"  Stack trace:", exc_info=True)
                 return _vr("mlx_error", video_id, error_msg, stage="transcribe")
         
-        # Step 4: Token minimization (Option B: chunked when input exceeds limit)
-        logger.info(f"[STEP 4/5] Starting token minimization with %s", config.get("PREPROCESS_LLM_MODEL"))
-        logger.info(f"  Input length: {transcription_length} characters")
-        n_tokens = stt.count_tokens(transcription)
-        if n_tokens > stt.INPUT_TOKEN_LIMIT:
-            logger.info(f"  Input tokens ({n_tokens}) exceed limit; using 2-step chunked minimization")
-        try:
-            default_ret = config.get("NANO_RETENTION_DEFAULT") or (80, 95)
-            auto_ret = config.get("NANO_RETENTION_AUTO_SUBS") or (60, 80)
-            if isinstance(default_ret, (list, tuple)) and len(default_ret) >= 2:
-                d_min, d_max = int(default_ret[0]), int(default_ret[1])
-            else:
-                d_min, d_max = 80, 95
-            if isinstance(auto_ret, (list, tuple)) and len(auto_ret) >= 2:
-                a_min, a_max = int(auto_ret[0]), int(auto_ret[1])
-            else:
-                a_min, a_max = 60, 80
-            is_auto_subs = subs_source == "auto"
-            r_min, r_max = (a_min, a_max) if is_auto_subs else (d_min, d_max)
-            token_query = build_token_query(r_min, r_max, auto_subs=is_auto_subs)
-            skip_merge = bool(config.get("SKIP_MERGE_REMINIMIZE", True))
-            if is_auto_subs:
-                logger.info("  Nano retention: %d~%d%% (auto_subs)", r_min, r_max)
-            pre = preprocessor or create_transcript_preprocessor(
-                config.get("PREPROCESS_BACKEND", "cloud_api"),
-                openai_client,
-            )
-            set_pipeline_context(stage="preprocess", backend=config.get("PREPROCESS_BACKEND", "cloud_api"))
-            concise_transcription = pre.minimize(
-                TOKEN_INPUT_ROLE,
-                token_query,
-                transcription,
-                model=config.get('PREPROCESS_LLM_MODEL', 'gpt-5-nano-2025-08-07'),
-                skip_merge_reminimize=skip_merge,
-            )
+        direct_mode = config.get("LLM_PIPELINE_MODE", "legacy_two_stage") == "direct_luna"
+        if direct_mode:
+            concise_transcription = transcription
             concise_length = len(concise_transcription)
-            reduction_rate = (1 - concise_length / transcription_length) * 100 if transcription_length > 0 else 0
-            logger.info(f"[STEP 4/5] ✓ Token minimization completed")
-            logger.info(f"  Output length: {concise_length} characters")
-            logger.info(f"  Reduction rate: {reduction_rate:.1f}%")
-            
-        except Exception as e:
-            error_category = "TOKEN_MINIMIZATION_ERROR"
-            error_type = type(e).__name__
-            error_msg = f"{error_type}: {str(e)}"
-            logger.error(f"[ERROR] {error_category} - Video ID: {video_id}")
-            logger.error(f"  Exception Type: {error_type}")
-            logger.error(f"  Error Message: {str(e)}")
-            
-            # Check for API-specific errors
-            if "APIError" in error_type or "RateLimitError" in error_type:
-                logger.error(f"  Cause: OpenAI API error - check API key and rate limits")
-            elif "AuthenticationError" in error_type:
-                logger.error(f"  Cause: Invalid API key")
-            elif "Timeout" in error_type:
-                logger.error(f"  Cause: Request timeout - network issue")
-            
-            logger.error(f"  Stack trace:", exc_info=True)
-            return _vr("api_error", video_id, error_msg, stage="preprocess")
-        
-        # Step 5: Save concise transcription
-        logger.info(f"[STEP 5/5] Saving concise transcription")
-        try:
-            output_file = stt.change_filename(txt_file_name, f"_{config.get('MAIN_LLM_OUTPUT_SUFFIX', '5-mini')}")
-            concise_file_path = os.path.join(output_smm_path, output_file)
-            
-            with open(concise_file_path, 'w', encoding='utf-8-sig') as f:
-                f.write(concise_transcription)
-            
-            file_size = os.path.getsize(concise_file_path)
-            logger.info(f"[STEP 5/5] ✓ Concise transcription saved")
-            logger.info(f"  File: {output_file}")
-            logger.info(f"  File size: {file_size} bytes")
-            
-        except PermissionError as e:
-            error_category = "FILE_PERMISSION_ERROR"
-            error_msg = f"PermissionError: {str(e)}"
-            logger.error(f"[ERROR] {error_category} - Video ID: {video_id}")
-            logger.error(f"  File path: {concise_file_path}")
-            logger.error(f"  Cause: Insufficient permissions to write file")
-            logger.error(f"  Solution: Check directory permissions")
-            return _vr("file_error", video_id, error_msg, stage="save")
-        except OSError as e:
-            error_category = "FILE_SYSTEM_ERROR"
-            error_msg = f"OSError: {str(e)}"
-            logger.error(f"[ERROR] {error_category} - Video ID: {video_id}")
-            logger.error(f"  File path: {concise_file_path}")
-            logger.error(f"  Cause: File system error (disk full, path too long, etc.)")
-            return _vr("file_error", video_id, error_msg, stage="save")
-        except Exception as e:
-            error_category = "FILE_SAVE_ERROR"
-            error_type = type(e).__name__
-            error_msg = f"{error_type}: {str(e)}"
-            logger.error(f"[ERROR] {error_category} - Video ID: {video_id}")
-            logger.error(f"  Exception Type: {error_type}")
-            logger.error(f"  File path: {concise_file_path}")
-            logger.error(f"  Stack trace:", exc_info=True)
-            return _vr("file_error", video_id, error_msg, stage="save")
-        
+        else:
+            # Step 4: Token minimization (Option B: chunked when input exceeds limit)
+            logger.info(f"[STEP 4/5] Starting token minimization with %s", config.get("PREPROCESS_LLM_MODEL"))
+            logger.info(f"  Input length: {transcription_length} characters")
+            n_tokens = stt.count_tokens(transcription)
+            if n_tokens > stt.INPUT_TOKEN_LIMIT:
+                logger.info(f"  Input tokens ({n_tokens}) exceed limit; using 2-step chunked minimization")
+            try:
+                default_ret = config.get("NANO_RETENTION_DEFAULT") or (80, 95)
+                auto_ret = config.get("NANO_RETENTION_AUTO_SUBS") or (60, 80)
+                if isinstance(default_ret, (list, tuple)) and len(default_ret) >= 2:
+                    d_min, d_max = int(default_ret[0]), int(default_ret[1])
+                else:
+                    d_min, d_max = 80, 95
+                if isinstance(auto_ret, (list, tuple)) and len(auto_ret) >= 2:
+                    a_min, a_max = int(auto_ret[0]), int(auto_ret[1])
+                else:
+                    a_min, a_max = 60, 80
+                is_auto_subs = subs_source == "auto"
+                r_min, r_max = (a_min, a_max) if is_auto_subs else (d_min, d_max)
+                token_query = build_token_query(r_min, r_max, auto_subs=is_auto_subs)
+                skip_merge = bool(config.get("SKIP_MERGE_REMINIMIZE", True))
+                if is_auto_subs:
+                    logger.info("  Nano retention: %d~%d%% (auto_subs)", r_min, r_max)
+                pre = preprocessor or create_transcript_preprocessor(
+                    config.get("PREPROCESS_BACKEND", "cloud_api"),
+                    openai_client,
+                )
+                set_pipeline_context(stage="preprocess", backend=config.get("PREPROCESS_BACKEND", "cloud_api"))
+                concise_transcription = pre.minimize(
+                    TOKEN_INPUT_ROLE,
+                    token_query,
+                    transcription,
+                    model=config.get('PREPROCESS_LLM_MODEL', 'gpt-5-nano-2025-08-07'),
+                    skip_merge_reminimize=skip_merge,
+                )
+                concise_length = len(concise_transcription)
+                reduction_rate = (1 - concise_length / transcription_length) * 100 if transcription_length > 0 else 0
+                logger.info(f"[STEP 4/5] ✓ Token minimization completed")
+                logger.info(f"  Output length: {concise_length} characters")
+                logger.info(f"  Reduction rate: {reduction_rate:.1f}%")
+
+            except Exception as e:
+                error_category = "TOKEN_MINIMIZATION_ERROR"
+                error_type = type(e).__name__
+                error_msg = f"{error_type}: {str(e)}"
+                logger.error(f"[ERROR] {error_category} - Video ID: {video_id}")
+                logger.error(f"  Exception Type: {error_type}")
+                logger.error(f"  Error Message: {str(e)}")
+
+                # Check for API-specific errors
+                if "APIError" in error_type or "RateLimitError" in error_type:
+                    logger.error(f"  Cause: OpenAI API error - check API key and rate limits")
+                elif "AuthenticationError" in error_type:
+                    logger.error(f"  Cause: Invalid API key")
+                elif "Timeout" in error_type:
+                    logger.error(f"  Cause: Request timeout - network issue")
+
+                logger.error(f"  Stack trace:", exc_info=True)
+                return _vr("api_error", video_id, error_msg, stage="preprocess")
+
+            # Step 5: Save concise transcription
+            logger.info(f"[STEP 5/5] Saving concise transcription")
+            try:
+                output_file = stt.change_filename(txt_file_name, f"_{config.get('MAIN_LLM_OUTPUT_SUFFIX', '5-mini')}")
+                concise_file_path = os.path.join(output_smm_path, output_file)
+
+                with open(concise_file_path, 'w', encoding='utf-8-sig') as f:
+                    f.write(concise_transcription)
+
+                file_size = os.path.getsize(concise_file_path)
+                logger.info(f"[STEP 5/5] ✓ Concise transcription saved")
+                logger.info(f"  File: {output_file}")
+                logger.info(f"  File size: {file_size} bytes")
+
+            except PermissionError as e:
+                error_category = "FILE_PERMISSION_ERROR"
+                error_msg = f"PermissionError: {str(e)}"
+                logger.error(f"[ERROR] {error_category} - Video ID: {video_id}")
+                logger.error(f"  File path: {concise_file_path}")
+                logger.error(f"  Cause: Insufficient permissions to write file")
+                logger.error(f"  Solution: Check directory permissions")
+                return _vr("file_error", video_id, error_msg, stage="save")
+            except OSError as e:
+                error_category = "FILE_SYSTEM_ERROR"
+                error_msg = f"OSError: {str(e)}"
+                logger.error(f"[ERROR] {error_category} - Video ID: {video_id}")
+                logger.error(f"  File path: {concise_file_path}")
+                logger.error(f"  Cause: File system error (disk full, path too long, etc.)")
+                return _vr("file_error", video_id, error_msg, stage="save")
+            except Exception as e:
+                error_category = "FILE_SAVE_ERROR"
+                error_type = type(e).__name__
+                error_msg = f"{error_type}: {str(e)}"
+                logger.error(f"[ERROR] {error_category} - Video ID: {video_id}")
+                logger.error(f"  Exception Type: {error_type}")
+                logger.error(f"  File path: {concise_file_path}")
+                logger.error(f"  Stack trace:", exc_info=True)
+                return _vr("file_error", video_id, error_msg, stage="save")
+
         # Step 6: defer prompt log to single writer
-        pending_prompt_entries.append({
-            "prompt": f'{TOKEN_QUERY}_{output_file}',
-            "task": PRE_TASK_TYPE,
-        })
+        if not direct_mode:
+            pending_prompt_entries.append({
+                "prompt": f'{TOKEN_QUERY}_{output_file}',
+                "task": PRE_TASK_TYPE,
+            })
         
         # Step 7: Generate full summary (Option B: chunked when concise exceeds limit)
         logger.info(
             "[STEP 6/7] Generating full summary with %s (%s)",
-            main_llm.primary_model,
-            main_llm.primary_provider,
+            config.get("DIRECT_LLM_MODEL", "gpt-6-luna") if direct_mode else main_llm.primary_model,
+            "openai_responses" if direct_mode else main_llm.primary_provider,
         )
-        if main_llm.has_fallback:
+        if not direct_mode and main_llm.has_fallback:
             logger.info(
                 "  Fallback configured: %s (%s)",
                 main_llm.fallback_model,
@@ -1280,18 +1344,29 @@ def process_single_video(
         concise_tokens = stt.count_tokens(concise_transcription)
         if concise_tokens > stt.INPUT_TOKEN_LIMIT:
             logger.info(f"  Concise tokens ({concise_tokens}) exceed limit; using 2-step chunked summarization")
-        set_pipeline_context(stage="summarize", backend=main_llm.primary_provider)
+        set_pipeline_context(stage="summarize", backend="openai_responses" if direct_mode else main_llm.primary_provider)
         if provider_cooldown:
             provider_cooldown.wait_if_needed()
         try:
-            response = main_llm.summarize(
-                transcription=concise_transcription,
-                filename=audio_nm,
-                prompt=INPUT_PROMPT,
-                token_range=list(MAIN_LLM_TOKEN_RANGE),
-                language="Korean",
-                style="Markdown",
-            )
+            if direct_mode:
+                try:
+                    response, usage = summarize_with_pipeline(
+                        "direct_luna", direct_client=openai_client, main_llm=main_llm,
+                        direct_transcription=transcription, legacy_transcription=concise_transcription,
+                        filename=audio_nm, video_id=video_id, config=config, prompt=INPUT_PROMPT,
+                    )
+                except ResponsesCallError as exc:
+                    if exc.usage is None:
+                        return _vr("manual_review", video_id, f"{exc.category}: {exc}", stage="summarize")
+                    _append_llm_usage(config.get("DATA_ROOT", base_path), exc.usage.to_dict(), video_id)
+                    raise
+                _append_llm_usage(config.get("DATA_ROOT", base_path), usage.to_dict(), video_id)
+            else:
+                response, _unused_usage = summarize_with_pipeline(
+                    "legacy_two_stage", direct_client=openai_client, main_llm=main_llm,
+                    direct_transcription=transcription, legacy_transcription=concise_transcription,
+                    filename=audio_nm, video_id=video_id, config=config, prompt=INPUT_PROMPT,
+                )
             response_length = len(response)
             logger.info(f"[STEP 6/7] ✓ Full summary generated")
             logger.info(f"  Response length: {response_length} characters")
@@ -1299,7 +1374,7 @@ def process_single_video(
         except Exception as e:
             error_category = "SUMMARY_GENERATION_ERROR"
             error_type = type(e).__name__
-            error_msg = f"{error_type}: {str(e)}"
+            error_msg = f"{getattr(e, 'category', error_type)}: {str(e)}"
             if provider_cooldown and ("429" in str(e) or "RateLimit" in error_type):
                 provider_cooldown.note_rate_limit()
             logger.error(f"[ERROR] {error_category} - Video ID: {video_id}")
@@ -1317,7 +1392,7 @@ def process_single_video(
                 logger.error(f"  Solution: Check network connection")
             
             logger.error(f"  Stack trace:", exc_info=True)
-            return _vr("api_error", video_id, error_msg, stage="preprocess")
+            return _vr("api_error", video_id, error_msg, stage="summarize" if direct_mode else "preprocess")
         
         # Step 8: Save markdown (YYYY_MM_DD/채널명_파일명.md, usage_channel from channel_df)
         logger.info(f"[STEP 7/7] Saving markdown file")

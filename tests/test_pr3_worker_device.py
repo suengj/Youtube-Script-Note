@@ -20,8 +20,8 @@ from runtime_resources import device_compute_route, get_device_semaphore, reset_
 
 
 class TestVersionAndConfig:
-    def test_app_version_420(self):
-        assert APP_VERSION == "4.2.0"
+    def test_app_version_500(self):
+        assert APP_VERSION == "5.0.0"
 
     def test_video_workers_default(self):
         cfg = get_config_dict()

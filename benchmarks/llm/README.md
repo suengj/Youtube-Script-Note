@@ -2,6 +2,17 @@
 
 Reusable harness to compare preprocess and main LLM models on **synthetic transcript workloads** shipped in `benchmarks/llm/fixtures/`.
 
+## v5 single-pass benchmark (SUE-1263)
+
+The runner compares arm A (production Nano preprocessing + Mini summarization) with arms B/C/D (GPT-6 Luna Responses at low/medium/high effort, identical prompt). Each run freezes exactly three source files and writes per-request usage, outputs, a provenance manifest, and a category-by-arm comparison.
+
+```bash
+python -m benchmarks.llm.v5_single_pass --manifest <json> --out artifacts/llm_benchmark/v5_single_pass/<RUN_ID> --dry-run
+python -m benchmarks.llm.v5_single_pass --manifest <json> --out artifacts/llm_benchmark/v5_single_pass/<RUN_ID> --arms A,B,C,D
+```
+
+`--dry-run` uses a fake client and makes no network calls. Completed arm outputs are skipped on rerun. The manifest must contain exactly three sources with `category`, `video_id`, `title`, `source_path`, `language`, and `source_type`. Live mode incurs API usage; use only approved benchmark material.
+
 ## Prerequisites
 
 - `.env` with `OPENAI_API_KEY` (required)

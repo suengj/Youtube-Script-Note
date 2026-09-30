@@ -10,9 +10,23 @@ import logging
 import os
 from typing import Optional
 
-# Application semver (v4.2: 2-worker concurrency, job workspace, single writer)
-APP_VERSION = "4.2.0"
+# Application semver (v5.0: selectable single-pass Responses pipeline)
+APP_VERSION = "5.0.0"
 NOTE_CATALOG_SCHEMA_VERSION = 1
+
+# v5 intends direct_luna as the eventual default. Keep rollback mode active until
+# the owner approves the cutover.
+LLM_PIPELINE_MODE = os.getenv("LLM_PIPELINE_MODE", "legacy_two_stage").strip().lower()
+if LLM_PIPELINE_MODE not in {"direct_luna", "legacy_two_stage"}:
+    raise ValueError("LLM_PIPELINE_MODE must be direct_luna or legacy_two_stage")
+MAIN_LLM_MODEL = os.getenv("DIRECT_LLM_MODEL", "gpt-6-luna").strip()
+DIRECT_LLM_REASONING_EFFORT = os.getenv("DIRECT_LLM_REASONING_EFFORT", "medium").strip().lower()
+if DIRECT_LLM_REASONING_EFFORT not in {"low", "medium", "high"}:
+    raise ValueError("DIRECT_LLM_REASONING_EFFORT must be low, medium, or high")
+DIRECT_MAX_INPUT_TOKENS = int(os.getenv("DIRECT_MAX_INPUT_TOKENS", "200000"))
+DIRECT_MAX_OUTPUT_TOKENS = int(os.getenv("DIRECT_MAX_OUTPUT_TOKENS", "32000"))  # Includes reasoning tokens.
+if DIRECT_MAX_INPUT_TOKENS < 1 or DIRECT_MAX_OUTPUT_TOKENS < 1:
+    raise ValueError("DIRECT_MAX_INPUT_TOKENS and DIRECT_MAX_OUTPUT_TOKENS must be positive")
 
 # MB 단위. output.wav(변환 후) 용량이 이 값 이상이면 Whisper 전사 생략 (OOM 방지).
 # 16GB 맥북: 600~800 권장.
@@ -235,6 +249,11 @@ def get_config_dict():
         "SAVE_FULL_WHEN_AUTO_SUBS": SAVE_FULL_WHEN_AUTO_SUBS,
         "FILENAME_MAX_LENGTH": FILENAME_MAX_LENGTH,
         "APP_VERSION": APP_VERSION,
+        "LLM_PIPELINE_MODE": LLM_PIPELINE_MODE,
+        "DIRECT_LLM_MODEL": MAIN_LLM_MODEL,
+        "DIRECT_LLM_REASONING_EFFORT": DIRECT_LLM_REASONING_EFFORT,
+        "DIRECT_MAX_INPUT_TOKENS": DIRECT_MAX_INPUT_TOKENS,
+        "DIRECT_MAX_OUTPUT_TOKENS": DIRECT_MAX_OUTPUT_TOKENS,
         "NANO_RETENTION_DEFAULT": NANO_RETENTION_DEFAULT,
         "NANO_RETENTION_AUTO_SUBS": NANO_RETENTION_AUTO_SUBS,
         "SKIP_MERGE_REMINIMIZE": SKIP_MERGE_REMINIMIZE,

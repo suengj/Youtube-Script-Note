@@ -5,11 +5,20 @@ from datetime import datetime
 import pandas as pd
 from tqdm import tqdm
 from openai import OpenAI
-try:
-    import mlx_whisper
-except ImportError:
-    print("Warning: mlx_whisper 모듈이 설치되지 않았습니다. 'pip install mlx-whisper' 명령으로 설치해주세요.")
-    mlx_whisper = None
+# MLX initializes native runtime state and can abort on unsupported hosts. Load it
+# only when transcription is actually requested so API-only tools/tests can import STT.
+mlx_whisper = None
+
+
+def _load_mlx_whisper():
+    global mlx_whisper
+    if mlx_whisper is None:
+        try:
+            import mlx_whisper as _mlx_whisper
+            mlx_whisper = _mlx_whisper
+        except ImportError:
+            print("Warning: mlx_whisper 모듈이 설치되지 않았습니다. 'pip install mlx-whisper' 명령으로 설치해주세요.")
+    return mlx_whisper
 import subprocess
 import tiktoken
 from urllib.parse import urlparse, parse_qs
@@ -1372,7 +1381,7 @@ def load_mlx_model(hf_path, mlx_model="turbo"):
     """
     logger = logging.getLogger(__name__)
     
-    if mlx_whisper is None:
+    if _load_mlx_whisper() is None:
         logger.error("mlx_whisper 모듈이 설치되지 않았습니다.")
         return None
     
@@ -1465,6 +1474,7 @@ def transcribe_by_mlx(full_load_path, filename, save_path, hf_path, base_path, v
     Returns:
         Tuple of (transcription, save_file_name), or (None, "size_threshold") when WAV size exceeds threshold, or None if error occurs
     """
+    _load_mlx_whisper()
     logger = logging.getLogger(__name__)
 
     if mlx_whisper is None:
