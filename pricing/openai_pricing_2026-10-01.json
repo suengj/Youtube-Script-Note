@@ -1,0 +1,22 @@
+{
+  "version": "2026-10-01",
+  "source": "OpenAI pricing page, to be verified at run time",
+  "long_context_boundary_tokens": 272000,
+  "models": {
+    "gpt-6-luna": {
+      "short_context": {"input": 0.10, "cached_input": 0.01, "cache_write": 0.125, "output": 0.50},
+      "long_context": {"input": 0.10, "cached_input": 0.01, "cache_write": 0.125, "output": 0.50}
+    },
+    "gpt-5-nano-2025-08-07": {
+      "source": "OpenAI pricing page, to be verified at run time",
+      "short_context": {"input": 0.05, "cached_input": 0.005, "output": 0.40},
+      "long_context": {"input": 0.05, "cached_input": 0.005, "output": 0.40}
+    },
+    "gpt-5-mini-2025-08-07": {
+      "source": "OpenAI pricing page, to be verified at run time",
+      "short_context": {"input": 0.25, "cached_input": 0.025, "output": 2.00},
+      "long_context": {"input": 0.25, "cached_input": 0.025, "output": 2.00}
+    }
+  },
+  "gpt_6_luna_long_context_multiplier": {"input": 2.0, "cached_input": 2.0, "output": 1.5}
+}

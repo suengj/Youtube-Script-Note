@@ -12,7 +12,11 @@ P03 is a macOS / Apple Silicon pipeline that:
 2. Downloads subtitles or audio (yt-dlp)
 3. Falls back to on-device Whisper MLX when subtitles are unavailable
 4. Preprocesses transcripts with a lightweight LLM (GPT-5-nano)
-5. Summarizes into mobile-friendly Markdown (GPT-5-mini, INPUT_PROMPT v3)
+5. Summarizes into mobile-friendly Markdown (v5.0 adds an opt-in single-pass GPT-6 Luna Responses path; legacy Nano + Mini remains the code default for rollback)
+
+## Version 5.0
+
+`LLM_PIPELINE_MODE=direct_luna` sends the raw transcript to one GPT-6 Luna Responses request. The default remains `legacy_two_stage` until owner approval. See [v5 migration notes](docs/MIGRATION_v5.md).
 6. Optionally syncs finalized Markdown to a Google Drive Desktop folder (`YT_summary`)
 
 ## Architecture

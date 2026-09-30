@@ -34,7 +34,9 @@ __pycache__/
 video_metadata_*.jsonl
 
 # Prompt logs, scratch, archives
-/prompt/
+!/prompt/
+/prompt/*
+!/prompt/direct_luna_v5.md
 /url_history/
 /_pywork/
 .taskmaster/
