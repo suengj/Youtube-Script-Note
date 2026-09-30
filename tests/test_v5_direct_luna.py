@@ -171,3 +171,23 @@ def test_cache_write_tokens_not_double_billed():
     total, parts, _ = _price("gpt-6-luna", 1_000_000, 0, 1_000_000, 0)
     assert parts["input_usd"] == 0
     assert abs(total - 0.125) < 1e-9
+
+
+def test_primary_lang_uses_detected_original_language():
+    import stt_function_v3 as stt_mod
+    ac = {k: [] for k in ("ab", "en", "en-orig", "ko", "ko-orig", "ja")}
+    langs = ["en", "ko", "ja"]
+    # Korean video without defaultAudioLanguage: must not fall back to translated 'en'
+    assert stt_mod._resolve_primary_lang({"automatic_captions": ac, "language": "ko"}, None, langs) == "ko-orig"
+    # English video reported as en-US picks the original English track
+    assert stt_mod._resolve_primary_lang({"automatic_captions": ac, "language": "en-US"}, None, langs) == "en-orig"
+    # explicit prefer_lang still wins
+    assert stt_mod._resolve_primary_lang({"automatic_captions": ac, "language": "ko"}, "ja", langs) == "ja"
+    # no detected language: legacy subs_langs order unchanged
+    assert stt_mod._resolve_primary_lang({"automatic_captions": ac}, None, langs) == "en"
+
+
+def test_retry_script_has_direct_luna_single_call_branch():
+    src = Path("scripts/retry_small_summary_auto_subs.py").read_text()
+    assert 'config.get("LLM_PIPELINE_MODE") == "direct_luna"' in src
+    assert "run_direct_summary(openai_client, transcription" in src
