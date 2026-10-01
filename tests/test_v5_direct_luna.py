@@ -45,7 +45,7 @@ def test_direct_pipeline_makes_one_responses_request_and_passes_effort(monkeypat
     assert len(api.calls) == 1
     assert api.calls[0]["reasoning"] == {"effort": "high"}
     assert api.calls[0]["input"].endswith("English source transcript")
-    assert "faithfully translate" in api.calls[0]["instructions"]
+    assert "Translate English or mixed-language" in api.calls[0]["instructions"]
     assert text.startswith("## 한눈에")
     assert usage.sample_video_id == "vid1"
 
@@ -191,3 +191,17 @@ def test_retry_script_has_direct_luna_single_call_branch():
     src = Path("scripts/retry_small_summary_auto_subs.py").read_text()
     assert 'config.get("LLM_PIPELINE_MODE") == "direct_luna"' in src
     assert "run_direct_summary(openai_client, transcription" in src
+
+
+def test_direct_prompt_v2_is_default_cacheable_and_parser_compatible():
+    import tiktoken
+    import main as main_mod
+    text = Path("prompt/direct_luna_v5_p2.md").read_text(encoding="utf-8")
+    n = len(tiktoken.get_encoding("o200k_base").encode(text))
+    assert 1100 <= n <= 1500  # >1,024-token static prefix so it is prompt-cached
+    assert main_mod.DIRECT_PROMPT_FILE == "direct_luna_v5_p2.md"
+    assert main_mod.DIRECT_LUNA_PROMPT == text
+    for marker in ("## 한눈에 보기", "> [!note]- Insights", "> [!note]- Key Takeaways", "## Tags", "one `- tag` per line"):
+        assert marker in text
+    assert "{" not in text.replace("{video title}", "")  # no per-video dynamic content
+    assert Path("prompt/direct_luna_v5.md").exists()  # V1 kept for rollback
