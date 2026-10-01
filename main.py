@@ -783,8 +783,8 @@ INPUT_PROMPT = f"""
 {TONE_QUERY}
 """
 
-# Versioned direct prompt (SUE-1265). Rollback = DIRECT_PROMPT_FILE=direct_luna_v5.md
-DIRECT_PROMPT_FILE = os.getenv("DIRECT_PROMPT_FILE", "direct_luna_v5_p2.md").strip()
+# Versioned direct prompt (SUE-1265): p3 = V3.1 (tech-tuned). Rollback = DIRECT_PROMPT_FILE=direct_luna_v5_p2.md (V3) or direct_luna_v5.md (V1)
+DIRECT_PROMPT_FILE = os.getenv("DIRECT_PROMPT_FILE", "direct_luna_v5_p3.md").strip()
 DIRECT_LUNA_PROMPT = (_PROJECT_ROOT / "prompt" / DIRECT_PROMPT_FILE).read_text(encoding="utf-8")
 DIRECT_PROMPT_SHA256 = hashlib.sha256(DIRECT_LUNA_PROMPT.encode("utf-8")).hexdigest()
 

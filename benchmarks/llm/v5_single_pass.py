@@ -22,7 +22,7 @@ from llm_responses import call_responses
 from scripts.md_mobile_utils import assemble_mobile_md, build_save_entry, prepare_mobile_body
 
 PRICING = ROOT / "pricing" / "openai_pricing_2026-10-01.json"
-PROMPT_PATH = ROOT / "prompt" / os.getenv("DIRECT_PROMPT_FILE", "direct_luna_v5_p2.md")
+PROMPT_PATH = ROOT / "prompt" / os.getenv("DIRECT_PROMPT_FILE", "direct_luna_v5_p3.md")
 MODELS = {"A": "gpt-5-nano-2025-08-07 + gpt-5-mini-2025-08-07",
           "B": "gpt-6-luna (low)", "C": "gpt-6-luna (medium)", "D": "gpt-6-luna (high)"}
 
