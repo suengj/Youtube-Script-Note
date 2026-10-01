@@ -38,6 +38,7 @@ video_metadata_*.jsonl
 /prompt/*
 !/prompt/direct_luna_v5.md
 !/prompt/direct_luna_v5_p2.md
+!/prompt/direct_luna_v5_p3.md
 /url_history/
 /_pywork/
 .taskmaster/
