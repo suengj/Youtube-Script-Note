@@ -13,6 +13,7 @@ import time
 import random
 import logging
 import json
+import hashlib
 from datetime import datetime
 from pathlib import Path
 from dataclasses import dataclass
@@ -260,6 +261,8 @@ def _append_llm_usage(data_root: str, record: dict, video_id: str) -> None:
     os.makedirs(os.path.join(data_root, "logs"), exist_ok=True)
     row = dict(record)
     row["video_id"] = video_id
+    row.setdefault("prompt_file", DIRECT_PROMPT_FILE)
+    row.setdefault("prompt_sha256", DIRECT_PROMPT_SHA256)
     with open(os.path.join(data_root, "logs", "llm_usage.jsonl"), "a", encoding="utf-8") as handle:
         handle.write(json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n")
 
@@ -405,9 +408,11 @@ def load_config() -> dict:
         )
     if config.get('LLM_PIPELINE_MODE') == 'direct_luna':
         logger.info(
-            "LLM config: mode=direct_luna model=%s effort=%s (openai responses, single call) output_suffix=_%s",
+            "LLM config: mode=direct_luna model=%s effort=%s prompt=%s (%s) (openai responses, single call) output_suffix=_%s",
             config.get('DIRECT_LLM_MODEL'),
             config.get('DIRECT_LLM_REASONING_EFFORT'),
+            DIRECT_PROMPT_FILE,
+            DIRECT_PROMPT_SHA256[:12],
             config.get('MAIN_LLM_OUTPUT_SUFFIX'),
         )
     else:
@@ -778,7 +783,10 @@ INPUT_PROMPT = f"""
 {TONE_QUERY}
 """
 
-DIRECT_LUNA_PROMPT = (_PROJECT_ROOT / "prompt" / "direct_luna_v5.md").read_text(encoding="utf-8")
+# Versioned direct prompt (SUE-1265). Rollback = DIRECT_PROMPT_FILE=direct_luna_v5.md
+DIRECT_PROMPT_FILE = os.getenv("DIRECT_PROMPT_FILE", "direct_luna_v5_p2.md").strip()
+DIRECT_LUNA_PROMPT = (_PROJECT_ROOT / "prompt" / DIRECT_PROMPT_FILE).read_text(encoding="utf-8")
+DIRECT_PROMPT_SHA256 = hashlib.sha256(DIRECT_LUNA_PROMPT.encode("utf-8")).hexdigest()
 
 # Legacy alias for prompt_log compatibility
 INPUT_QUERY = INPUT_PROMPT
