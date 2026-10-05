@@ -48,7 +48,10 @@ CHANNEL_DF_COLUMNS = [
     "last_processed_published_at",
     "last_discovered_published_at",
     "auto_sub_only",
+    "obsidian",             # 사용자 마커: 문자 그대로 "recording" (strip+lower) 일 때만 ON
 ]
+OBSIDIAN_COLUMN = "obsidian"
+OBSIDIAN_ON_MARKER = "recording"
 CRAWL_QUEUE_COLUMNS = [
     "video_id",
     "url",
@@ -67,6 +70,7 @@ CRAWL_QUEUE_COLUMNS = [
     "duration_iso",
     "default_audio_lang",
     "auto_sub_only",
+    "obsidian",
 ]
 DONE_STATUSES = {"success", "already_existed", "oversized_file"}
 SKIPPED_AUTO_SUBS_ONLY_STATUS = "skipped_auto_subs_only"
@@ -188,74 +192,149 @@ def _is_valid_uploads_playlist_id(s: str) -> bool:
     return bool(s and len(s) == 24 and s.startswith("UU") and s[2:].replace("-", "").replace("_", "").isalnum())
 
 
+class ChannelDfSchemaError(ValueError):
+    """channel_df.csv header/value conflict that must be fixed by the owner."""
+
+
+def _norm_marker(value: Any) -> str:
+    """strip+lower for marker comparison; NaN/None -> ''."""
+    if value is None or (isinstance(value, float) and value != value):
+        return ""
+    return str(value).strip().lower()
+
+
+def is_obsidian_on(value: Any) -> bool:
+    """Approved marker policy: only the literal ``recording`` (strip+lower) is ON; blank/other is OFF."""
+    return _norm_marker(value) == OBSIDIAN_ON_MARKER
+
+
+def read_channel_df_raw(path: str) -> Tuple[List[str], List[Dict[str, str]]]:
+    """
+    Read channel_df.csv without dropping rows or columns.
+    Returns (header, rows) where header has ``Obsidian`` (any case) folded into the canonical
+    ``obsidian`` column. Differing non-blank values for the same row -> ChannelDfSchemaError.
+    Any other duplicated header name -> ChannelDfSchemaError. Never yields two obsidian columns.
+    """
+    with open(path, "r", encoding="utf-8-sig", newline="") as f:
+        reader = csv.reader(f)
+        raw_header = next(reader, None)
+        if raw_header is None:
+            return [], []
+        canon = [OBSIDIAN_COLUMN if h.strip().lower() == OBSIDIAN_COLUMN else h for h in raw_header]
+        seen = set()
+        for h, c in zip(raw_header, canon):
+            if c != OBSIDIAN_COLUMN and c in seen:
+                raise ChannelDfSchemaError(f"channel_df: duplicate column header {h!r}")
+            seen.add(c)
+        header: List[str] = []
+        for c in canon:
+            if c not in header:
+                header.append(c)
+        rows: List[Dict[str, str]] = []
+        for lineno, rec in enumerate(reader, start=2):
+            if not any(cell.strip() for cell in rec):
+                continue
+            row: Dict[str, str] = {h: "" for h in header}
+            for c, cell in zip(canon, rec):
+                if c == OBSIDIAN_COLUMN:
+                    prev = row[c]
+                    if prev.strip() and cell.strip() and _norm_marker(prev) != _norm_marker(cell):
+                        raise ChannelDfSchemaError(
+                            f"channel_df: conflicting obsidian values on line {lineno} "
+                            f"({prev.strip()!r} vs {cell.strip()!r}); resolve manually"
+                        )
+                    row[c] = prev if prev.strip() else cell.strip()
+                else:
+                    row[c] = cell
+            rows.append(row)
+    return header, rows
+
+
+def write_channel_df_atomic(path: str, header: List[str], rows: List[Dict[str, Any]]) -> None:
+    """Whole-file replace via temp file in the same directory (+ os.replace)."""
+    tmp_path = path + ".tmp"
+    with open(tmp_path, "w", encoding="utf-8-sig", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=header, extrasaction="ignore")
+        w.writeheader()
+        w.writerows(rows)
+    os.replace(tmp_path, path)
+
+
 def load_channel_df(base_path: str) -> List[Dict[str, Any]]:
     """
     Load channel_df.csv. Returns list of dicts with channel_url, channel_name, channel_id, uploads_playlist_id, etc.
     Uses cached channel_id/uploads_playlist_id from CSV when valid; otherwise resolves from URL/API.
     Rows whose channel_url does not yield a channel_id are skipped.
+    Unknown columns (and ``obsidian``, if present) are carried through on each row so save_channel_df
+    can write them back unchanged.
     """
     path = os.path.join(base_path, CHANNEL_DF_FILENAME)
     if not os.path.exists(path):
         logger.warning(f"channel_df.csv not found: {path}")
         return []
     rows = []
-    with open(path, "r", encoding="utf-8-sig") as f:
-        reader = csv.DictReader(f)
-        all_rows = list(reader)
-        total_rows = len(all_rows)
-        logger.info("channel_crawl: loading %d rows from channel_df.csv", total_rows)
-        for idx, row in enumerate(all_rows, start=1):
-            url_s = (row.get("channel_url") or "").strip()
-            if not url_s:
-                continue
-            logger.info("channel_crawl: parsing channel row [%d/%d] url=%s", idx, total_rows, url_s[:80])
-            cid_cached = (row.get("channel_id") or "").strip()
-            if _is_valid_channel_id(cid_cached):
-                cid = cid_cached
-            else:
-                cid = extract_channel_id_from_url(url_s)
-            if not cid:
-                try:
-                    safe_url = url_s[:60].encode('utf-8', errors='replace').decode('utf-8', errors='replace')
-                    logger.warning("channel_df: skipping row (could not extract channel_id from URL): %s...", safe_url)
-                except Exception:
-                    logger.warning("channel_df: skipping row (could not extract channel_id from URL): [URL encoding error]")
-                continue
-            uploads_cached = (row.get("uploads_playlist_id") or "").strip()
-            uploads_id = uploads_cached if _is_valid_uploads_playlist_id(uploads_cached) else ""
-            rows.append({
-                "channel_url": url_s,
-                "channel_name": (row.get("channel_name") or "").strip(),
-                "usage_channel": (row.get("usage_channel") or "").strip(),
-                "channel_id": cid,
-                "uploads_playlist_id": uploads_id,
-                "last_processed_published_at": (row.get("last_processed_published_at") or "").strip(),
-                "last_discovered_published_at": (row.get("last_discovered_published_at") or "").strip(),
-                "auto_sub_only": (row.get("auto_sub_only") or "").strip(),
-            })
+    _header, all_rows = read_channel_df_raw(path)
+    total_rows = len(all_rows)
+    logger.info("channel_crawl: loading %d rows from channel_df.csv", total_rows)
+    for idx, row in enumerate(all_rows, start=1):
+        url_s = (row.get("channel_url") or "").strip()
+        if not url_s:
+            continue
+        logger.info("channel_crawl: parsing channel row [%d/%d] url=%s", idx, total_rows, url_s[:80])
+        cid_cached = (row.get("channel_id") or "").strip()
+        if _is_valid_channel_id(cid_cached):
+            cid = cid_cached
+        else:
+            cid = extract_channel_id_from_url(url_s)
+        if not cid:
+            try:
+                safe_url = url_s[:60].encode('utf-8', errors='replace').decode('utf-8', errors='replace')
+                logger.warning("channel_df: skipping row (could not extract channel_id from URL): %s...", safe_url)
+            except Exception:
+                logger.warning("channel_df: skipping row (could not extract channel_id from URL): [URL encoding error]")
+            continue
+        uploads_cached = (row.get("uploads_playlist_id") or "").strip()
+        uploads_id = uploads_cached if _is_valid_uploads_playlist_id(uploads_cached) else ""
+        out = dict(row)  # keeps unknown columns + obsidian untouched
+        out.update({
+            "channel_url": url_s,
+            "channel_name": (row.get("channel_name") or "").strip(),
+            "usage_channel": (row.get("usage_channel") or "").strip(),
+            "channel_id": cid,
+            "uploads_playlist_id": uploads_id,
+            "last_processed_published_at": (row.get("last_processed_published_at") or "").strip(),
+            "last_discovered_published_at": (row.get("last_discovered_published_at") or "").strip(),
+            "auto_sub_only": (row.get("auto_sub_only") or "").strip(),
+        })
+        rows.append(out)
     return rows
 
 
 def save_channel_df(base_path: str, rows: List[Dict[str, Any]]) -> None:
-    """Save channel_df.csv with dual cursors (processed/discovered) and cached channel_id/uploads_playlist_id."""
+    """
+    Save channel_df.csv (atomic replace) with dual cursors and cached channel_id/uploads_playlist_id.
+    Header = existing file header (order kept, incl. unknown columns) + any legacy canonical column
+    that is missing + any extra key present on rows. ``obsidian`` is only added if the file already
+    has it or a row carries a value (the migration CLI is what adds it).
+    """
     path = os.path.join(base_path, CHANNEL_DF_FILENAME)
-    out_rows = [
-        {
-            "channel_url": r.get("channel_url", ""),
-            "channel_name": r.get("channel_name", ""),
-            "usage_channel": r.get("usage_channel", ""),
-            "channel_id": r.get("channel_id", ""),
-            "uploads_playlist_id": r.get("uploads_playlist_id", ""),
-            "last_processed_published_at": r.get("last_processed_published_at", ""),
-            "last_discovered_published_at": r.get("last_discovered_published_at", ""),
-            "auto_sub_only": r.get("auto_sub_only", ""),
-        }
-        for r in rows
-    ]
-    with open(path, "w", encoding="utf-8-sig", newline="") as f:
-        w = csv.DictWriter(f, fieldnames=CHANNEL_DF_COLUMNS)
-        w.writeheader()
-        w.writerows(out_rows)
+    header: List[str] = []
+    if os.path.exists(path):
+        try:
+            header, _ = read_channel_df_raw(path)
+        except ChannelDfSchemaError:
+            raise
+    for c in CHANNEL_DF_COLUMNS:
+        if c == OBSIDIAN_COLUMN:
+            continue
+        if c not in header:
+            header.append(c)
+    for r in rows:
+        for k in r:
+            if k not in header and (k != OBSIDIAN_COLUMN or str(r.get(k) or "").strip()):
+                header.append(k)
+    out_rows = [{h: ("" if r.get(h) is None else r.get(h, "")) for h in header} for r in rows]
+    write_channel_df_atomic(path, header, out_rows)
 
 
 def _api_request(api_key: str, path: str, params: Dict[str, str]) -> Optional[Dict[str, Any]]:
@@ -899,6 +978,7 @@ def build_queue_and_get_candidates(
                 "duration_iso": duration_iso,
                 "default_audio_lang": default_audio_lang,
                 "auto_sub_only": (ch.get("auto_sub_only") or "").strip(),
+                "obsidian": (ch.get("obsidian") or "").strip(),
             })
             queue_video_ids.add(vid)
             accepted += 1
@@ -937,6 +1017,16 @@ def build_queue_and_get_candidates(
                 u = cid_to_usage.get(cid, "")
                 if u:
                     queue_df.at[idx, "usage_channel"] = u
+
+        # Latest channel policy wins, keyed by stable channel_id only (never title/alias).
+        cid_to_obsidian = {
+            str(ch.get("channel_id") or "").strip(): str(ch.get("obsidian") or "").strip()
+            for ch in channels
+            if str(ch.get("channel_id") or "").strip()
+        }
+        q_cids = queue_df["channel_id"].astype(str).str.strip()
+        known = q_cids.isin(cid_to_obsidian.keys())
+        queue_df["obsidian"] = queue_df["obsidian"].where(~known, q_cids.map(cid_to_obsidian)).fillna("")
 
     save_crawl_queue_df(base_path, queue_df)
 

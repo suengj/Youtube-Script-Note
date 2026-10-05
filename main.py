@@ -1682,6 +1682,7 @@ def process_videos(config: dict):
                         "video_id": str(r.get("video_id", "")),
                         "default_audio_lang": str(r.get("default_audio_lang", "")),
                         "auto_subs_only": bool((str(r.get("auto_sub_only", "")).strip())),
+                        "obsidian_mirror": channel_crawl.is_obsidian_on(r.get("obsidian")),
                     })
                 # Merge input_df URLs (not yet in output_df) so both channel crawl and manual input are processed
                 input_urls = get_input_urls_for_channel_crawl(data_root, output_df)
@@ -1744,7 +1745,13 @@ def process_videos(config: dict):
     url_to_default_audio_lang = {}
     url_to_auto_subs_only = {}
     url_to_usage_channel = {}
+    url_to_obsidian_mirror = {}
     if config.get('CHANNEL_CRAWL') and meta_for_channel_crawl:
+        url_to_obsidian_mirror = {
+            str(m.get("url", "")): bool(m.get("obsidian_mirror", False))
+            for m in meta_for_channel_crawl
+            if str(m.get("url", "")).strip()
+        }
         queue_url_to_video_id = {
             str(m.get("url", "")): str(m.get("video_id", ""))
             for m in meta_for_channel_crawl
@@ -1832,6 +1839,8 @@ def process_videos(config: dict):
 
     def _video_config_for_url(v_url: str) -> dict:
         video_config = {**config}
+        # Direct URL / unknown channel: mirror explicitly NOT selected (never rejected).
+        video_config["obsidian_mirror"] = bool(url_to_obsidian_mirror.get(v_url, False))
         if url_to_default_audio_lang and v_url in url_to_default_audio_lang:
             video_config["default_audio_lang"] = url_to_default_audio_lang[v_url]
         if url_to_auto_subs_only and v_url in url_to_auto_subs_only:
