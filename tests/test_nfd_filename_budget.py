@@ -1,0 +1,261 @@
+"""SUE-1298 follow-up: iCloud/Obsidian measure the 255-byte cap on the NFD form.
+
+The two real names from the 2026-10-07 03:00 run are 134 / 160 UTF-8 bytes in NFC but
+263 / 289 in NFD, so the NFC-only budget of PR #9 left them untouched and storage cut
+them to 255 bytes (losing the ``luna-low`` suffix, and for one the video ID).
+"""
+
+from __future__ import annotations
+
+import hashlib
+import sys
+import unicodedata as ud
+from pathlib import Path
+
+import pytest
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(PROJECT_ROOT))
+
+from filename_utils import MAX_FILENAME_BYTES, fit_filename  # noqa: E402
+from scripts.drive_yt_summary.sync import find_canonical_for_truncated, run_sync  # noqa: E402
+from scripts.drive_yt_summary.state import SyncState, SyncStateEntry, save_state  # noqa: E402
+
+JYY = "교양의 시대_작은 섬나라 영국은 어떻게 불패의 함대를 만들어냈을까_JyyAGZ1-r94_ko-orig_auto_subs_luna-low.md"
+BE5B = (
+    "실밸개발자_코드 리뷰가 병목이 되는 이유 _ 메타 시니어 엔지니어가 "
+    "AI 코드 리뷰 하는법_Be5b6D1IoLI_ko-orig_auto_subs_luna-low.md"
+)
+CASES = [
+    (JYY, "JyyAGZ1-r94", "_JyyAGZ1-r94_ko-orig_auto_subs_luna-low.md", "교양의 시대_"),
+    (BE5B, "Be5b6D1IoLI", "_Be5b6D1IoLI_ko-orig_auto_subs_luna-low.md", "실밸개발자_"),
+]
+
+
+def _b(s: str, form: str) -> int:
+    return len(ud.normalize(form, s).encode("utf-8"))
+
+
+def test_fixture_names_match_the_run() -> None:
+    assert (_b(JYY, "NFC"), _b(JYY, "NFD")) == (134, 263)
+    assert (_b(BE5B, "NFC"), _b(BE5B, "NFD")) == (160, 289)
+
+
+@pytest.mark.parametrize("name,vid,tail,prefix", CASES)
+def test_nfd_over_budget_is_shortened_and_keeps_id_and_suffix(name, vid, tail, prefix) -> None:
+    out = fit_filename(name, vid, protect_prefix=prefix)
+    assert out != name
+    assert _b(out, "NFD") <= MAX_FILENAME_BYTES
+    assert _b(out, "NFC") <= MAX_FILENAME_BYTES
+    assert out.endswith(tail)
+    assert out.startswith(prefix)
+    assert out == ud.normalize("NFC", out)  # written normalization stays NFC
+
+
+@pytest.mark.parametrize("name,vid,tail,prefix", CASES)
+def test_idempotent(name, vid, tail, prefix) -> None:
+    once = fit_filename(name, vid, protect_prefix=prefix)
+    assert fit_filename(once, vid, protect_prefix=prefix) == once
+
+
+def test_short_nfd_name_is_unchanged() -> None:
+    name = "채널_짧은 제목_dQw4w9WgXcQ_ko_subs_luna-low.md"
+    assert fit_filename(name, "dQw4w9WgXcQ") == name
+
+
+# --- sync: a vault copy truncated by storage must not become a second Drive file ---
+
+
+def _truncate_nfd(name: str, limit: int = 255) -> str:
+    """Storage-style cut: shrink the stem so the NFD name is <= limit, keep ``.md``."""
+    stem = ud.normalize("NFD", name)[:-3]
+    out = ""
+    for ch in stem:
+        if len((out + ch + ".md").encode("utf-8")) > limit:
+            break
+        out += ch
+    return out + ".md"
+
+
+def _md() -> str:
+    return "---\nformat_version: 4.1\ntitle: T\n---\n\nBody\n"
+
+
+def _setup(tmp_path: Path, name: str):
+    vault = tmp_path / "vault"
+    day = vault / "2026_10_07"
+    day.mkdir(parents=True)
+    drive = tmp_path / "YT_summary"
+    (drive / "source").mkdir(parents=True)
+    (drive / "legacy").mkdir()
+    base, work = tmp_path / "base", tmp_path / "work"
+    base.mkdir()
+    work.mkdir()
+    trunc = _truncate_nfd(name)
+    assert trunc != ud.normalize("NFD", name) and _b(trunc, "NFD") >= 250
+    (day / trunc).write_text(_md(), encoding="utf-8")
+    return vault, drive, base, work, trunc
+
+
+def _sync(vault, drive, base, work):
+    return run_sync(
+        dry_run=False,
+        migrate_legacy=False,
+        md_path=str(vault),
+        sync_root=str(drive),
+        base_path=str(base),
+        work_path=str(work),
+    )
+
+
+@pytest.mark.parametrize("name", [JYY, BE5B])
+def test_sync_skips_truncated_copy_of_known_canonical(tmp_path: Path, name: str) -> None:
+    vault, drive, base, work, _ = _setup(tmp_path, name)
+    rel = f"2026_10_07/{name}"
+    from scripts.drive_yt_summary.config import load_config
+
+    cfg = load_config(str(base), str(work), str(vault), sync_root=str(drive))
+    save_state(
+        cfg.state_path,
+        SyncState(
+            files={
+                rel: SyncStateEntry(
+                    relative_path=rel,
+                    content_hash=H,
+                    dest_path=str(drive / "source" / name),
+                    drive_name=name,
+                    updated_at="2026-10-07T00:00:00+00:00",
+                )
+            }
+        ),
+    )
+    result = _sync(vault, drive, base, work)
+    assert result.created == 0 and result.errors == 0
+    assert list((drive / "source").iterdir()) == []  # nothing minted from the truncated name
+
+
+def test_sync_still_creates_unrelated_note(tmp_path: Path) -> None:
+    vault, drive, base, work, _ = _setup(tmp_path, JYY)
+    _seed_state(vault, drive, base, work, [f"2026_10_07/{JYY}"])
+    other = vault / "2026_10_07" / "다른채널_다른 제목_AAAAAAAAAAA_ko_subs_luna-low.md"
+    other.write_text(_md(), encoding="utf-8")
+    result = _sync(vault, drive, base, work)
+    assert result.created == 1
+    assert (drive / "source" / other.name).is_file()
+
+
+H = hashlib.sha256(_md().encode("utf-8")).hexdigest()
+
+
+def _entries(rels, h=H, dest_dir=None):
+    return {
+        r: SyncStateEntry(
+            relative_path=r,
+            content_hash=h,
+            dest_path=str((dest_dir or Path("/nonexistent")) / r.rpartition("/")[2]),
+            drive_name=r.rpartition("/")[2],
+            updated_at="2026-10-07T00:00:00+00:00",
+        )
+        for r in rels
+    }
+
+
+def _seed_state(vault, drive, base, work, rels, h=H):
+    from scripts.drive_yt_summary.config import load_config
+
+    cfg = load_config(str(base), str(work), str(vault), sync_root=str(drive))
+    save_state(
+        cfg.state_path,
+        SyncState(
+            files={
+                r: SyncStateEntry(
+                    relative_path=r,
+                    content_hash=h,
+                    dest_path=str(drive / "source" / r.rpartition("/")[2]),
+                    drive_name=r.rpartition("/")[2],
+                    updated_at="2026-10-07T00:00:00+00:00",
+                )
+                for r in rels
+            }
+        ),
+    )
+
+
+def test_prefix_of_longer_name_below_cap_window_is_created(tmp_path: Path) -> None:
+    """A*240 + .md is a prefix of A*240 + _X.md but is a genuine note, not a truncation."""
+    vault, drive, base, work, trunc = _setup(tmp_path, JYY)
+    (vault / "2026_10_07" / trunc).unlink()
+    short = "A" * 240 + ".md"
+    longer = "A" * 240 + "_" + "X" * 30 + ".md"
+    (vault / "2026_10_07" / short).write_text(_md(), encoding="utf-8")
+    _seed_state(vault, drive, base, work, [f"2026_10_07/{longer}"])
+    result = _sync(vault, drive, base, work)
+    assert result.created == 1
+    assert (drive / "source" / short).is_file()
+
+
+def test_truncated_candidate_with_canonical_under_cap_is_created(tmp_path: Path) -> None:
+    vault, drive, base, work, trunc = _setup(tmp_path, JYY)
+    cand = _truncate_nfd(JYY, 253)
+    assert _b(cand, "NFD") == 253
+    canonical = cand[:-3] + "zz.md"  # 2 bytes longer: 255, within the cap -> not a truncation
+    assert _b(canonical, "NFD") == 255
+    assert find_canonical_for_truncated(f"2026_10_07/{cand}", H, _entries([f"2026_10_07/{canonical}"])) is None
+    (vault / "2026_10_07" / trunc).unlink()
+    (vault / "2026_10_07" / cand).write_text(_md(), encoding="utf-8")
+    _seed_state(vault, drive, base, work, [f"2026_10_07/{canonical}"])
+    assert _sync(vault, drive, base, work).created == 1
+
+
+def test_cross_folder_canonical_is_not_a_match(tmp_path: Path) -> None:
+    vault, drive, base, work, trunc = _setup(tmp_path, JYY)
+    _seed_state(vault, drive, base, work, [f"2026_10_06/{JYY}"])
+    result = _sync(vault, drive, base, work)
+    assert result.created == 1
+    assert find_canonical_for_truncated(f"2026_10_07/{trunc}", H, _entries([f"2026_10_06/{JYY}"])) is None
+
+
+def test_source_listing_without_folder_is_not_enough(tmp_path: Path) -> None:
+    vault, drive, base, work, trunc = _setup(tmp_path, JYY)
+    (drive / "source" / JYY).write_text(_md(), encoding="utf-8")
+    result = _sync(vault, drive, base, work)
+    assert result.created == 1  # folder unknown -> do not skip
+
+
+@pytest.mark.parametrize("name", [JYY, BE5B])
+def test_find_canonical_matches_real_names(name: str) -> None:
+    trunc = _truncate_nfd(name)
+    assert 253 <= _b(trunc, "NFD") <= 255
+    assert find_canonical_for_truncated(f"d/{trunc}", H, _entries([f"d/{name}"])) == f"d/{name}"
+    assert find_canonical_for_truncated(f"d/{trunc}", H, _entries([f"d/{trunc}"])) is None  # not strict
+
+
+def test_same_names_but_different_content_is_created(tmp_path: Path) -> None:
+    """A genuine A*252 note next to a state entry A*252_B*12 must not be skipped."""
+    vault, drive, base, work, trunc = _setup(tmp_path, JYY)
+    (vault / "2026_10_07" / trunc).unlink()
+    cand = "A" * 252 + ".md"
+    canon = "A" * 252 + "_" + "B" * 12 + ".md"
+    assert _b(cand, "NFD") == 255 and _b(canon, "NFD") > 255
+    (vault / "2026_10_07" / cand).write_text(_md(), encoding="utf-8")
+    # canonical has DIFFERENT recorded content
+    _seed_state(vault, drive, base, work, [f"2026_10_07/{canon}"], h="0" * 64)
+    assert find_canonical_for_truncated(
+        f"2026_10_07/{cand}", H, _entries([f"2026_10_07/{canon}"], h="0" * 64)
+    ) is None
+    assert _sync(vault, drive, base, work).created == 1
+    assert (drive / "source" / cand).is_file()
+
+
+def test_unknown_hash_reads_drive_file_or_does_not_skip(tmp_path: Path) -> None:
+    rel = f"2026_10_07/{JYY}"
+    trunc = f"2026_10_07/{_truncate_nfd(JYY)}"
+    f = tmp_path / JYY
+    # no recorded hash and unreadable file -> no skip
+    assert find_canonical_for_truncated(trunc, H, _entries([rel], h="", dest_dir=tmp_path)) is None
+    # no recorded hash, readable file with equal content -> skip
+    f.write_text(_md(), encoding="utf-8")
+    assert find_canonical_for_truncated(trunc, H, _entries([rel], h="", dest_dir=tmp_path)) == rel
+    # readable but different content -> no skip
+    f.write_text(_md() + "x", encoding="utf-8")
+    assert find_canonical_for_truncated(trunc, H, _entries([rel], h="", dest_dir=tmp_path)) is None

@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import unicodedata
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, List, Optional
@@ -45,6 +46,69 @@ class SyncResult:
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+
+
+# Storage cuts an over-long NFD name to 255 bytes; a cut that lands mid-jamo can leave 253-254.
+_TRUNC_MIN_BYTES = 253
+_TRUNC_MAX_BYTES = 255
+
+
+def _nfd_bytes(text: str) -> bytes:
+    return unicodedata.normalize("NFD", text).encode("utf-8")
+
+
+def _same_content(entry: SyncStateEntry, content_hash: str) -> bool:
+    recorded = (entry.content_hash or "").strip()
+    if not recorded:
+        try:
+            recorded = _file_hash(Path(entry.dest_path))
+        except (OSError, ValueError):
+            return False
+    return bool(recorded) and recorded == content_hash
+
+
+def _file_hash(path: Path) -> str:
+    import hashlib
+
+    return hashlib.sha256(path.read_text(encoding="utf-8-sig").encode("utf-8")).hexdigest()
+
+
+def find_canonical_for_truncated(
+    rel: str, content_hash: str, state_files: Dict[str, SyncStateEntry]
+) -> Optional[str]:
+    """Return the canonical state key when ``rel`` is a storage-truncated copy of it.
+
+    iCloud/Obsidian cut over-long decomposed names to 255 bytes, so the vault can hold
+    ``..._JyyAGZ1-r94_ko-orig_auto_subs_.md`` while the pipeline already published
+    ``..._luna-low.md`` to Drive. A vault scan must not mint a second Drive file for it.
+    Skip only when ALL five hold:
+      (a) the candidate's NFD name is 253..255 bytes;
+      (b) the canonical's NFD name is > 255 bytes (it can only exist on the vault as a
+          truncation);
+      (c) the candidate's NFD stem (without ``.md``) is a strict byte prefix of the
+          canonical's NFD stem;
+      (d) the canonical is a sync-state entry in the same date folder. Entries whose
+          folder cannot be established (e.g. loose ``source/`` files) never match;
+      (e) the contents are equal: the canonical's recorded content hash equals
+          ``content_hash`` or, when no hash is recorded, its Drive file hashes equal.
+          Unknown hash or unreadable file means no skip.
+    """
+    folder, sep, name = rel.rpartition("/")
+    if not sep or not name.endswith(".md"):
+        return None
+    cand = _nfd_bytes(name)
+    if not (_TRUNC_MIN_BYTES <= len(cand) <= _TRUNC_MAX_BYTES):
+        return None
+    stem = cand[:-3]
+    for other, entry in state_files.items():
+        o_folder, o_sep, o_name = other.rpartition("/")
+        if not o_sep or o_folder != folder or not o_name.endswith(".md"):
+            continue
+        canon = _nfd_bytes(o_name)
+        if len(canon) > _TRUNC_MAX_BYTES and len(canon[:-3]) > len(stem) and canon.startswith(stem):
+            if _same_content(entry, content_hash):
+                return other
+    return None
 
 
 def _classify(dest: Path, sync_root: Path) -> None:
@@ -99,7 +163,10 @@ def run_sync(
         for rel, item in sorted(local_map.items()):
             dest = config.source_dir / item.drive_name
             prev = state.files.get(rel)
-            if prev is None:
+            if prev is None and find_canonical_for_truncated(rel, item.content_hash, state.files):
+                result.skipped += 1
+                result.actions.append(f"skip: {rel} (truncated copy of an existing canonical note)")
+            elif prev is None:
                 result.created += 1
                 result.actions.append(f"create: {rel} → {dest}")
             elif prev.content_hash == item.content_hash:
@@ -134,7 +201,10 @@ def run_sync(
         dest = config.source_dir / item.drive_name
         prev = state.files.get(rel)
         try:
-            if prev is None:
+            if prev is None and find_canonical_for_truncated(rel, item.content_hash, state.files):
+                result.skipped += 1
+                result.actions.append(f"skipped: {rel} (truncated copy of an existing canonical note)")
+            elif prev is None:
                 copy_or_update_file(Path(item.absolute_path), dest, item.content)
                 new_files[rel] = SyncStateEntry(
                     relative_path=rel,

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import sys
+import unicodedata
 from pathlib import Path
 
 import pytest
@@ -24,7 +25,11 @@ PREFIX = "채널_"
 
 
 def _blen(s):
-    return len(s.encode("utf-8"))
+    """max(NFC, NFD) UTF-8 bytes: iCloud/Obsidian measure the decomposed form."""
+    return max(
+        len(unicodedata.normalize("NFC", s).encode("utf-8")),
+        len(unicodedata.normalize("NFD", s).encode("utf-8")),
+    )
 
 
 def _check(out, tail=TAIL):
@@ -55,7 +60,7 @@ def test_long_titles_fit_and_keep_id(kind):
 def test_exactly_255_bytes_unchanged():
     base = f"{PREFIX}{{t}}{TAIL}"
     room = MAX_FILENAME_BYTES - _blen(base.format(t=""))
-    title = "가" * (room // 3) + "a" * (room % 3)
+    title = "a" * room  # ASCII: identical in NFC and NFD
     name = base.format(t=title)
     assert _blen(name) == MAX_FILENAME_BYTES
     assert fit_filename(name, VID, protect_prefix=PREFIX) == name
@@ -114,7 +119,7 @@ def test_ellipsis_dropped_when_it_does_not_fit():
 
 def test_tmp_name_short_for_255_byte_name(tmp_path):
     name = "가" * 84 + "abc"  # 255 bytes
-    assert _blen(name) == 255
+    assert len(name.encode("utf-8")) == 255
     tmp = short_tmp_path(tmp_path / name)
     assert _blen(tmp.name) < 64
     assert tmp.parent == tmp_path
