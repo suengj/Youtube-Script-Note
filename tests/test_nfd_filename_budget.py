@@ -7,6 +7,7 @@ them to 255 bytes (losing the ``luna-low`` suffix, and for one the video ID).
 
 from __future__ import annotations
 
+import hashlib
 import sys
 import unicodedata as ud
 from pathlib import Path
@@ -120,7 +121,7 @@ def test_sync_skips_truncated_copy_of_known_canonical(tmp_path: Path, name: str)
             files={
                 rel: SyncStateEntry(
                     relative_path=rel,
-                    content_hash="x",
+                    content_hash=H,
                     dest_path=str(drive / "source" / name),
                     drive_name=name,
                     updated_at="2026-10-07T00:00:00+00:00",
@@ -143,7 +144,23 @@ def test_sync_still_creates_unrelated_note(tmp_path: Path) -> None:
     assert (drive / "source" / other.name).is_file()
 
 
-def _seed_state(vault, drive, base, work, rels):
+H = hashlib.sha256(_md().encode("utf-8")).hexdigest()
+
+
+def _entries(rels, h=H, dest_dir=None):
+    return {
+        r: SyncStateEntry(
+            relative_path=r,
+            content_hash=h,
+            dest_path=str((dest_dir or Path("/nonexistent")) / r.rpartition("/")[2]),
+            drive_name=r.rpartition("/")[2],
+            updated_at="2026-10-07T00:00:00+00:00",
+        )
+        for r in rels
+    }
+
+
+def _seed_state(vault, drive, base, work, rels, h=H):
     from scripts.drive_yt_summary.config import load_config
 
     cfg = load_config(str(base), str(work), str(vault), sync_root=str(drive))
@@ -153,7 +170,7 @@ def _seed_state(vault, drive, base, work, rels):
             files={
                 r: SyncStateEntry(
                     relative_path=r,
-                    content_hash="x",
+                    content_hash=h,
                     dest_path=str(drive / "source" / r.rpartition("/")[2]),
                     drive_name=r.rpartition("/")[2],
                     updated_at="2026-10-07T00:00:00+00:00",
@@ -183,7 +200,7 @@ def test_truncated_candidate_with_canonical_under_cap_is_created(tmp_path: Path)
     assert _b(cand, "NFD") == 253
     canonical = cand[:-3] + "zz.md"  # 2 bytes longer: 255, within the cap -> not a truncation
     assert _b(canonical, "NFD") == 255
-    assert find_canonical_for_truncated(f"2026_10_07/{cand}", [f"2026_10_07/{canonical}"]) is None
+    assert find_canonical_for_truncated(f"2026_10_07/{cand}", H, _entries([f"2026_10_07/{canonical}"])) is None
     (vault / "2026_10_07" / trunc).unlink()
     (vault / "2026_10_07" / cand).write_text(_md(), encoding="utf-8")
     _seed_state(vault, drive, base, work, [f"2026_10_07/{canonical}"])
@@ -195,7 +212,7 @@ def test_cross_folder_canonical_is_not_a_match(tmp_path: Path) -> None:
     _seed_state(vault, drive, base, work, [f"2026_10_06/{JYY}"])
     result = _sync(vault, drive, base, work)
     assert result.created == 1
-    assert find_canonical_for_truncated(f"2026_10_07/{trunc}", [f"2026_10_06/{JYY}"]) is None
+    assert find_canonical_for_truncated(f"2026_10_07/{trunc}", H, _entries([f"2026_10_06/{JYY}"])) is None
 
 
 def test_source_listing_without_folder_is_not_enough(tmp_path: Path) -> None:
@@ -209,5 +226,36 @@ def test_source_listing_without_folder_is_not_enough(tmp_path: Path) -> None:
 def test_find_canonical_matches_real_names(name: str) -> None:
     trunc = _truncate_nfd(name)
     assert 253 <= _b(trunc, "NFD") <= 255
-    assert find_canonical_for_truncated(f"d/{trunc}", [f"d/{name}"]) == f"d/{name}"
-    assert find_canonical_for_truncated(f"d/{trunc}", [f"d/{trunc}"]) is None  # not strict
+    assert find_canonical_for_truncated(f"d/{trunc}", H, _entries([f"d/{name}"])) == f"d/{name}"
+    assert find_canonical_for_truncated(f"d/{trunc}", H, _entries([f"d/{trunc}"])) is None  # not strict
+
+
+def test_same_names_but_different_content_is_created(tmp_path: Path) -> None:
+    """A genuine A*252 note next to a state entry A*252_B*12 must not be skipped."""
+    vault, drive, base, work, trunc = _setup(tmp_path, JYY)
+    (vault / "2026_10_07" / trunc).unlink()
+    cand = "A" * 252 + ".md"
+    canon = "A" * 252 + "_" + "B" * 12 + ".md"
+    assert _b(cand, "NFD") == 255 and _b(canon, "NFD") > 255
+    (vault / "2026_10_07" / cand).write_text(_md(), encoding="utf-8")
+    # canonical has DIFFERENT recorded content
+    _seed_state(vault, drive, base, work, [f"2026_10_07/{canon}"], h="0" * 64)
+    assert find_canonical_for_truncated(
+        f"2026_10_07/{cand}", H, _entries([f"2026_10_07/{canon}"], h="0" * 64)
+    ) is None
+    assert _sync(vault, drive, base, work).created == 1
+    assert (drive / "source" / cand).is_file()
+
+
+def test_unknown_hash_reads_drive_file_or_does_not_skip(tmp_path: Path) -> None:
+    rel = f"2026_10_07/{JYY}"
+    trunc = f"2026_10_07/{_truncate_nfd(JYY)}"
+    f = tmp_path / JYY
+    # no recorded hash and unreadable file -> no skip
+    assert find_canonical_for_truncated(trunc, H, _entries([rel], h="", dest_dir=tmp_path)) is None
+    # no recorded hash, readable file with equal content -> skip
+    f.write_text(_md(), encoding="utf-8")
+    assert find_canonical_for_truncated(trunc, H, _entries([rel], h="", dest_dir=tmp_path)) == rel
+    # readable but different content -> no skip
+    f.write_text(_md() + "x", encoding="utf-8")
+    assert find_canonical_for_truncated(trunc, H, _entries([rel], h="", dest_dir=tmp_path)) is None

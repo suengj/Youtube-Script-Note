@@ -57,20 +57,41 @@ def _nfd_bytes(text: str) -> bytes:
     return unicodedata.normalize("NFD", text).encode("utf-8")
 
 
-def find_canonical_for_truncated(rel: str, state_rels: List[str]) -> Optional[str]:
+def _same_content(entry: SyncStateEntry, content_hash: str) -> bool:
+    recorded = (entry.content_hash or "").strip()
+    if not recorded:
+        try:
+            recorded = _file_hash(Path(entry.dest_path))
+        except (OSError, ValueError):
+            return False
+    return bool(recorded) and recorded == content_hash
+
+
+def _file_hash(path: Path) -> str:
+    import hashlib
+
+    return hashlib.sha256(path.read_text(encoding="utf-8-sig").encode("utf-8")).hexdigest()
+
+
+def find_canonical_for_truncated(
+    rel: str, content_hash: str, state_files: Dict[str, SyncStateEntry]
+) -> Optional[str]:
     """Return the canonical state key when ``rel`` is a storage-truncated copy of it.
 
     iCloud/Obsidian cut over-long decomposed names to 255 bytes, so the vault can hold
     ``..._JyyAGZ1-r94_ko-orig_auto_subs_.md`` while the pipeline already published
     ``..._luna-low.md`` to Drive. A vault scan must not mint a second Drive file for it.
-    Skip only when ALL hold:
+    Skip only when ALL five hold:
       (a) the candidate's NFD name is 253..255 bytes;
       (b) the canonical's NFD name is > 255 bytes (it can only exist on the vault as a
           truncation);
       (c) the candidate's NFD stem (without ``.md``) is a strict byte prefix of the
           canonical's NFD stem;
       (d) the canonical is a sync-state entry in the same date folder. Entries whose
-          folder cannot be established (e.g. loose ``source/`` files) never match.
+          folder cannot be established (e.g. loose ``source/`` files) never match;
+      (e) the contents are equal: the canonical's recorded content hash equals
+          ``content_hash`` or, when no hash is recorded, its Drive file hashes equal.
+          Unknown hash or unreadable file means no skip.
     """
     folder, sep, name = rel.rpartition("/")
     if not sep or not name.endswith(".md"):
@@ -79,13 +100,14 @@ def find_canonical_for_truncated(rel: str, state_rels: List[str]) -> Optional[st
     if not (_TRUNC_MIN_BYTES <= len(cand) <= _TRUNC_MAX_BYTES):
         return None
     stem = cand[:-3]
-    for other in state_rels:
+    for other, entry in state_files.items():
         o_folder, o_sep, o_name = other.rpartition("/")
         if not o_sep or o_folder != folder or not o_name.endswith(".md"):
             continue
         canon = _nfd_bytes(o_name)
         if len(canon) > _TRUNC_MAX_BYTES and len(canon[:-3]) > len(stem) and canon.startswith(stem):
-            return other
+            if _same_content(entry, content_hash):
+                return other
     return None
 
 
@@ -133,7 +155,6 @@ def run_sync(
     titles_by_rel = {rel: item.title for rel, item in local_map.items()}
 
     state = load_state(config.state_path)
-    state_rels = list(state.files.keys())
 
     if dry_run:
         if migrate_legacy:
@@ -142,7 +163,7 @@ def run_sync(
         for rel, item in sorted(local_map.items()):
             dest = config.source_dir / item.drive_name
             prev = state.files.get(rel)
-            if prev is None and find_canonical_for_truncated(rel, state_rels):
+            if prev is None and find_canonical_for_truncated(rel, item.content_hash, state.files):
                 result.skipped += 1
                 result.actions.append(f"skip: {rel} (truncated copy of an existing canonical note)")
             elif prev is None:
@@ -180,7 +201,7 @@ def run_sync(
         dest = config.source_dir / item.drive_name
         prev = state.files.get(rel)
         try:
-            if prev is None and find_canonical_for_truncated(rel, state_rels):
+            if prev is None and find_canonical_for_truncated(rel, item.content_hash, state.files):
                 result.skipped += 1
                 result.actions.append(f"skipped: {rel} (truncated copy of an existing canonical note)")
             elif prev is None:
