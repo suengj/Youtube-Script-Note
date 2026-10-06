@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import unicodedata
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, List, Optional
@@ -45,6 +46,46 @@ class SyncResult:
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+
+
+# A vault name this close to the 255-byte NFD cap may have been cut by iCloud/Obsidian.
+_TRUNCATION_SUSPECT_BYTES = 240
+
+
+def _nfd(text: str) -> str:
+    return unicodedata.normalize("NFD", text)
+
+
+def find_canonical_for_truncated(
+    rel: str,
+    state_rels: List[str],
+    source_names: List[str],
+) -> Optional[str]:
+    """Return the canonical (longer) name when ``rel`` is a storage-truncated copy of it.
+
+    iCloud/Obsidian cut over-long decomposed names to 255 bytes, so the vault can hold
+    ``..._JyyAGZ1-r94_ko-orig_auto_subs_.md`` while the pipeline already published
+    ``..._luna-low.md`` to Drive. A scan of the vault must not mint a second Drive file
+    for it. Match: same date folder, near the byte cap, and the NFD stem is a strict
+    prefix of a known canonical name (state entry or file already in ``source/``).
+    """
+    folder, _, name = rel.rpartition("/")
+    if not name.endswith(".md"):
+        return None
+    name_nfd = _nfd(name)
+    if len(name_nfd.encode("utf-8")) < _TRUNCATION_SUSPECT_BYTES:
+        return None
+    stem = name_nfd[:-3]
+    for other in state_rels:
+        o_folder, _, o_name = other.rpartition("/")
+        o_nfd = _nfd(o_name)
+        if o_folder == folder and len(o_nfd) > len(name_nfd) and o_nfd.startswith(stem):
+            return other
+    for o_name in source_names:
+        o_nfd = _nfd(o_name)
+        if o_name.endswith(".md") and len(o_nfd) > len(name_nfd) and o_nfd.startswith(stem):
+            return o_name
+    return None
 
 
 def _classify(dest: Path, sync_root: Path) -> None:
@@ -91,6 +132,11 @@ def run_sync(
     titles_by_rel = {rel: item.title for rel, item in local_map.items()}
 
     state = load_state(config.state_path)
+    try:
+        source_names = [p.name for p in config.source_dir.iterdir() if p.is_file()]
+    except OSError:
+        source_names = []
+    state_rels = list(state.files.keys())
 
     if dry_run:
         if migrate_legacy:
@@ -99,7 +145,10 @@ def run_sync(
         for rel, item in sorted(local_map.items()):
             dest = config.source_dir / item.drive_name
             prev = state.files.get(rel)
-            if prev is None:
+            if prev is None and find_canonical_for_truncated(rel, state_rels, source_names):
+                result.skipped += 1
+                result.actions.append(f"skip: {rel} (truncated copy of an existing canonical note)")
+            elif prev is None:
                 result.created += 1
                 result.actions.append(f"create: {rel} → {dest}")
             elif prev.content_hash == item.content_hash:
@@ -134,7 +183,10 @@ def run_sync(
         dest = config.source_dir / item.drive_name
         prev = state.files.get(rel)
         try:
-            if prev is None:
+            if prev is None and find_canonical_for_truncated(rel, state_rels, source_names):
+                result.skipped += 1
+                result.actions.append(f"skipped: {rel} (truncated copy of an existing canonical note)")
+            elif prev is None:
                 copy_or_update_file(Path(item.absolute_path), dest, item.content)
                 new_files[rel] = SyncStateEntry(
                     relative_path=rel,

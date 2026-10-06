@@ -1,7 +1,8 @@
 """Byte-bounded note filenames that never lose the video ID.
 
 Most filesystems (APFS, ext4, Drive Desktop sync) cap a single name at 255 *bytes*
-of UTF-8, not 255 characters. A long Korean or emoji title therefore overflows
+of UTF-8, not 255 characters; iCloud/Obsidian measures the decomposed NFD form, so the
+budget here is max(NFC bytes, NFD bytes). A long Korean or emoji title therefore overflows
 well before it looks long, and a blind slice drops the trailing video ID (and can
 cut a multibyte character in half).
 
@@ -18,7 +19,17 @@ ELLIPSIS = "…"
 
 
 def _blen(s: str) -> int:
-    return len(s.encode("utf-8"))
+    """Byte length that is safe on every storage layer: max(NFC, NFD) UTF-8 bytes.
+
+    The note is written in its current (NFC) form, but iCloud/Obsidian storage applies the
+    255-byte limit to the decomposed (NFD) form, where each Hangul syllable costs 6-8
+    bytes instead of 3 (SUE-1298 follow-up). Budgeting on the larger of the two keeps the
+    name valid whichever form the filesystem measures.
+    """
+    return max(
+        len(unicodedata.normalize("NFC", s).encode("utf-8")),
+        len(unicodedata.normalize("NFD", s).encode("utf-8")),
+    )
 
 
 def truncate_to_bytes(text: str, max_bytes: int, ellipsis: str = ELLIPSIS) -> str:
@@ -37,13 +48,10 @@ def truncate_to_bytes(text: str, max_bytes: int, ellipsis: str = ELLIPSIS) -> st
     if not use_ellipsis:
         budget = max_bytes
     out = []
-    used = 0
     for ch in text:
-        n = _blen(ch)
-        if used + n > budget:
+        if _blen("".join(out) + ch) > budget:
             break
         out.append(ch)
-        used += n
     # Do not end on a joiner / dangling modifier from a cut grapheme cluster.
     while out and (out[-1] in ("‍", "️") or unicodedata.combining(out[-1])):
         out.pop()
