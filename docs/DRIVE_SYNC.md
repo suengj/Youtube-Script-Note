@@ -24,6 +24,11 @@ Drive and mirror failures are isolated. `P03_DRIVE_SYNC_ENABLED=0` keeps the leg
 | `P03_DRIVE_SYNC_ROOT` | Local `YT_summary` folder (auto-discovered if unset) |
 | `P03_SELECTIVE_MIRROR` | `1` mirrors only obsidian-marked channels to the vault (default off: mirror all) |
 | `P03_DRIVE_SYNC_ENABLED` | `0` disables sync (pipeline output unaffected) |
+| `P03_JEV_CLASSIFY_ENABLED` | `1` runs JEV classify-if-needed after each verified Drive write (default off) |
+
+## Classification index
+
+P03 owns `YT_summary/classification-index.json` and is its only writer. See `docs/JEV_CLASSIFICATION.md`.
 
 ## CLI
 

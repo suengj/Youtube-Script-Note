@@ -1,0 +1,81 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/suengj/Youtube-Script-Note/schemas/classification-index.schema.json",
+  "title": "YouTube Source Classification Index",
+  "description": "Canonical contract (owner and only writer: suengj/Youtube-Script-Note, SUE-1327). Derived JEV topic-relevance index for P03 YouTube summaries in Drive YT_summary/. Keyed by YouTube video_id; Drive file IDs are lineage only. Taxonomy IDs and version mirror AES content-hub.schema.json. schema_version 2 supersedes intelligence-library schema_version 1 (src-gdrive-* keys).",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "owner", "taxonomy_version", "entries"],
+  "properties": {
+    "schema_version": { "const": 2 },
+    "owner": { "const": "suengj/Youtube-Script-Note" },
+    "taxonomy_version": { "type": "string", "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$" },
+    "classifier_config": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["classifier", "model", "prompt_version"],
+      "properties": {
+        "classifier": { "type": "string", "minLength": 1 },
+        "model": { "type": "string", "minLength": 1 },
+        "prompt_version": { "type": "string", "minLength": 1 }
+      }
+    },
+    "entries": {
+      "type": "object",
+      "propertyNames": { "pattern": "^[A-Za-z0-9_-]{11}$" },
+      "additionalProperties": { "$ref": "#/$defs/entry" }
+    }
+  },
+  "$defs": {
+    "score": { "type": "integer", "minimum": 0, "maximum": 100 },
+    "entry": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["video_id", "source_url", "content_hash", "category_scores", "reason", "score_semantics", "taxonomy_version", "classifier", "model", "prompt_version", "classified_at", "stale", "error", "cache_key", "lineage"],
+      "properties": {
+        "video_id": { "type": "string", "pattern": "^[A-Za-z0-9_-]{11}$" },
+        "source_url": { "type": "string", "pattern": "^https://www\\.youtube\\.com/watch\\?v=[A-Za-z0-9_-]{11}$" },
+        "content_hash": { "type": ["string", "null"], "pattern": "^[0-9a-f]{64}$", "description": "sha256 of the Drive Markdown bytes the scores were computed from" },
+        "category_scores": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["ai_tech", "science_technology", "investment_real_estate", "education", "humanities_society_philosophy", "other_unknown"],
+          "properties": {
+            "ai_tech": { "$ref": "#/$defs/score" },
+            "science_technology": { "$ref": "#/$defs/score" },
+            "investment_real_estate": { "$ref": "#/$defs/score" },
+            "education": { "$ref": "#/$defs/score" },
+            "humanities_society_philosophy": { "$ref": "#/$defs/score" },
+            "other_unknown": { "$ref": "#/$defs/score" }
+          }
+        },
+        "reason": { "type": "string", "maxLength": 240 },
+        "score_semantics": { "type": "string", "minLength": 1 },
+        "taxonomy_version": { "type": "string", "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$" },
+        "classifier": { "type": "string", "minLength": 1 },
+        "model": { "type": "string", "minLength": 1 },
+        "prompt_version": { "type": "string", "minLength": 1 },
+        "classified_at": { "type": "string", "format": "date-time" },
+        "stale": { "type": "boolean" },
+        "error": { "type": ["string", "null"], "description": "non-null = last attempt failed; retried on the next run" },
+        "cache_key": { "type": ["string", "null"], "pattern": "^[0-9a-f]{64}$", "description": "sha256 of [content_hash, taxonomy_version, classifier, model, prompt_version]" },
+        "details": {
+          "type": "object",
+          "description": "JEV detail: per-category level, confidence, per-level probabilities, top level, token usage.",
+          "additionalProperties": true
+        },
+        "lineage": {
+          "type": "object",
+          "description": "Locator/provenance only; never identity.",
+          "additionalProperties": false,
+          "properties": {
+            "drive_name": { "type": "string", "minLength": 1 },
+            "drive_file_ids": { "type": "array", "items": { "type": "string", "minLength": 1 } },
+            "legacy_source_ids": { "type": "array", "items": { "type": "string", "pattern": "^src-[a-z0-9][a-z0-9._-]{2,127}$" } },
+            "migrated_from": { "type": "string" }
+          }
+        }
+      }
+    }
+  }
+}

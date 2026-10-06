@@ -47,6 +47,16 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
 
 
+def _classify(dest: Path, sync_root: Path) -> None:
+    """SUE-1327: classify-if-needed after a written Drive copy (flag-gated, never raises)."""
+    try:
+        from scripts.jev_classify.classify import classify_after_publish
+
+        classify_after_publish(str(dest), sync_root)
+    except Exception:
+        pass
+
+
 def run_sync(
     *,
     dry_run: bool = False,
@@ -135,6 +145,7 @@ def run_sync(
                 )
                 result.created += 1
                 result.actions.append(f"created: {rel} → {dest}")
+                _classify(dest, config.sync_root)
             elif prev.content_hash == item.content_hash:
                 result.skipped += 1
             else:
@@ -151,6 +162,7 @@ def run_sync(
                 )
                 result.updated += 1
                 result.actions.append(f"updated: {rel} → {prev.dest_path}")
+                _classify(Path(prev.dest_path), config.sync_root)
         except FilesystemSyncError as exc:
             result.errors += 1
             result.error_messages.append(f"{rel}: {exc}")
