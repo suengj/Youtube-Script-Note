@@ -2085,6 +2085,21 @@ def process_videos(config: dict):
         except Exception as ds:
             logger.warning("Drive YT_summary sync failed (non-fatal): %s", ds)
 
+        # SUE-1327: retry JEV entries whose last attempt failed (bounded; flag-gated; never a backfill).
+        try:
+            from scripts.jev_classify.classify import classify_enabled, retry_errors
+
+            if classify_enabled():
+                from scripts.drive_yt_summary.config import discover_yt_summary_root
+
+                yt_root = discover_yt_summary_root()
+                if yt_root is not None:
+                    retry = retry_errors(yt_root / "classification-index.json", yt_root / "source")
+                    if retry.outcomes:
+                        logger.info("JEV classify retry: %s", retry.as_dict())
+        except Exception as ce:
+            logger.warning("JEV classify retry failed (non-fatal): %s", type(ce).__name__)
+
     _run_batch_cleanup(config, dry_run_legacy=False)
     
     if failed_urls:

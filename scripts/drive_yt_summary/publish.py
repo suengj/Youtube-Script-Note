@@ -46,6 +46,7 @@ class PublishResult:
     mirror_path: str = ""
     staging_retained: bool = True
     revision: int = 0
+    classify_action: str = "skipped"  # skipped (flag off) | cached | classified | failed | unresolved | read_error
     errors: List[str] = field(default_factory=list)
 
     @property
@@ -89,6 +90,27 @@ class DriveDesktopAdapter:
             )
             save_state(self.state_path, state)
             return action, str(dest), revision
+
+
+def _classify_after_drive_write(result: PublishResult, sync_root: Path) -> None:
+    """SUE-1327: JEV classify-if-needed for this one source after its verified Drive write.
+
+    Behind P03_JEV_CLASSIFY_ENABLED (default off). Reads the Drive copy only; any failure is
+    recorded on the result and never affects publish/staging/mirror.
+    """
+    try:
+        from scripts.jev_classify.classify import classify_after_publish
+
+        outcome = classify_after_publish(result.drive_path, sync_root)
+    except Exception as exc:
+        result.classify_action = "failed"
+        result.errors.append(f"classify: {type(exc).__name__}")
+        return
+    if outcome is None:
+        return
+    result.classify_action = outcome.action
+    if outcome.error:
+        result.errors.append(f"classify: {outcome.error}")
 
 
 def _mirror_to_vault(md_root: str, rel: str, content: str) -> tuple:
@@ -144,6 +166,7 @@ def publish_final_md(
                 rel_path, drive_name, content, video_id=video_id, title=title
             )
             result.drive_action, result.drive_path, result.revision = action, dest, revision
+            _classify_after_drive_write(result, config.sync_root)
     except (DriveSyncConfigError, FilesystemSyncError, OSError) as exc:
         result.drive_action = "failed"
         result.errors.append(f"drive: {exc}")
