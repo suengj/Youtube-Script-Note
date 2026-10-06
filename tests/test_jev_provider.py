@@ -190,3 +190,13 @@ def test_rubric_hash_is_pinned_to_the_production_index():
 def jev_model():
     from scripts.jev_classify.jev import JEV_MODEL
     return JEV_MODEL
+
+
+def test_cache_key_matches_intelligence_library_golden_vector():
+    # Golden value from intelligence-library source_classify.cli._cache_key @ 2e02d7a; a change here
+    # would turn every migrated entry into a cache miss (1,542 JEV calls).
+    from scripts.jev_classify.index import cache_key
+
+    assert cache_key("a" * 64, "1.0.0", "jev", "jev-1.13.0", "jev-rubric-b03a101ddb34") == (
+        "7b1af71c576b80861138ab1c9faffc400337e6ec433a6c5c8436aabaf1814c01"
+    )
