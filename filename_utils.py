@@ -1,0 +1,100 @@
+"""Byte-bounded note filenames that never lose the video ID.
+
+Most filesystems (APFS, ext4, Drive Desktop sync) cap a single name at 255 *bytes*
+of UTF-8, not 255 characters. A long Korean or emoji title therefore overflows
+well before it looks long, and a blind slice drops the trailing video ID (and can
+cut a multibyte character in half).
+
+``fit_filename`` shrinks only the title part so that the whole name is at most
+``max_bytes`` bytes, keeps the full video ID and everything after it (lang /
+subs-type / LLM suffix / extension), and never splits a code point.
+"""
+from __future__ import annotations
+
+import unicodedata
+
+MAX_FILENAME_BYTES = 255
+ELLIPSIS = "…"
+
+
+def _blen(s: str) -> int:
+    return len(s.encode("utf-8"))
+
+
+def truncate_to_bytes(text: str, max_bytes: int, ellipsis: str = ELLIPSIS) -> str:
+    """Cut ``text`` to <= max_bytes UTF-8 bytes on a character boundary.
+
+    Appends ``ellipsis`` only when the text was cut and the ellipsis fits.
+    Combining marks / ZWJ / variation selectors left dangling at the cut are
+    dropped so an emoji sequence is not left half-formed.
+    """
+    if max_bytes <= 0:
+        return ""
+    if _blen(text) <= max_bytes:
+        return text
+    budget = max_bytes - _blen(ellipsis)
+    use_ellipsis = budget >= 0 and _blen(ellipsis) <= max_bytes
+    if not use_ellipsis:
+        budget = max_bytes
+    out = []
+    used = 0
+    for ch in text:
+        n = _blen(ch)
+        if used + n > budget:
+            break
+        out.append(ch)
+        used += n
+    # Do not end on a joiner / dangling modifier from a cut grapheme cluster.
+    while out and (out[-1] in ("‍", "️") or unicodedata.combining(out[-1])):
+        out.pop()
+    cut = "".join(out).rstrip(" ._-")
+    if use_ellipsis and cut:
+        return cut + ellipsis
+    return cut
+
+
+def fit_filename(
+    name: str,
+    video_id: str = "",
+    *,
+    protect_prefix: str = "",
+    max_bytes: int = MAX_FILENAME_BYTES,
+) -> str:
+    """Return ``name`` shortened (title only) to <= ``max_bytes`` UTF-8 bytes.
+
+    Layout assumed: ``{protect_prefix}{title}_{video_id}{tail}`` where ``tail`` holds
+    lang/type/suffix/extension. Everything from ``video_id`` onward is kept
+    verbatim; ``protect_prefix`` (e.g. the ``channel_`` prefix) is kept unless the
+    ID and tail alone leave no room for it. Names already within the limit are
+    returned unchanged (existing notes are never renamed).
+    """
+    if _blen(name) <= max_bytes:
+        return name
+
+    idx = name.rfind(video_id) if video_id else -1
+    if idx >= 0:
+        head, tail = name[:idx], name[idx:]
+    else:
+        # No ID in the name: keep the extension only.
+        dot = name.rfind(".")
+        head, tail = (name[:dot], name[dot:]) if dot > 0 else (name, "")
+
+    sep = "_" if head.endswith("_") and idx >= 0 else ""
+    if sep:
+        head = head[:-1]
+    prefix = protect_prefix if head.startswith(protect_prefix) else ""
+    title = head[len(prefix):]
+    # A title that was already shortened once must not stack ellipses.
+    title = title.rstrip(ELLIPSIS)
+
+    fixed = _blen(tail) + _blen(sep)
+    room = max_bytes - fixed - _blen(prefix)
+    if room >= _blen(ELLIPSIS) or (room > 0 and not title):
+        new_title = truncate_to_bytes(title, room) if room > 0 else ""
+        out = prefix + new_title + sep + tail
+    else:
+        # Prefix + ID/tail alone do not fit with any title: squeeze the prefix.
+        pre_room = max_bytes - fixed
+        out = truncate_to_bytes(prefix, pre_room, ellipsis="") + sep + tail
+    # Defensive: the tail itself (ID + suffix + ext) must always survive.
+    return out

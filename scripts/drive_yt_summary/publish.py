@@ -23,7 +23,7 @@ from pathlib import Path
 from typing import List, Optional
 
 from .config import DriveSyncConfigError, load_config, selective_mirror_enabled, verify_sync_root
-from .fs_transport import FilesystemSyncError, atomic_write_text, ensure_dir
+from .fs_transport import FilesystemSyncError, atomic_write_text, ensure_dir, short_tmp_path
 from .state import SyncStateEntry, load_state, save_state
 
 STAGING_DIRNAME = "output_md_staging"
@@ -122,7 +122,7 @@ def _mirror_to_vault(md_root: str, rel: str, content: str) -> tuple:
         except OSError:
             pass
     dest.parent.mkdir(parents=True, exist_ok=True)
-    tmp = dest.with_suffix(dest.suffix + ".tmp")
+    tmp = short_tmp_path(dest)
     try:
         tmp.write_text(content, encoding="utf-8-sig")
         os.replace(tmp, dest)
