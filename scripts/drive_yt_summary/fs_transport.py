@@ -4,9 +4,19 @@
 
 from __future__ import annotations
 
+import hashlib
 import os
 import shutil
 from pathlib import Path
+
+
+def short_tmp_path(path: Path) -> Path:
+    """Sibling temp path whose name is short regardless of how long ``path.name`` is.
+
+    ``name + '.tmp'`` would overflow the 255-byte limit for a name already at the cap.
+    """
+    digest = hashlib.sha1(path.name.encode("utf-8")).hexdigest()[:12]
+    return path.with_name(f".{digest}.{os.getpid()}.tmp")
 
 
 class FilesystemSyncError(Exception):
@@ -15,7 +25,7 @@ class FilesystemSyncError(Exception):
 
 def atomic_write_text(path: Path, content: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp = short_tmp_path(path)
     try:
         tmp.write_text(content, encoding="utf-8")
         os.replace(tmp, path)

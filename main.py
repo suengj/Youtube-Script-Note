@@ -52,6 +52,7 @@ if sys.stderr.encoding != 'utf-8':
 
 import stt_function_v3 as stt
 import channel_crawl
+from filename_utils import fit_filename
 import run_lock
 from job_workspace import VideoJobWorkspace, cleanup_stale_jobs
 from transcript_cache import (
@@ -845,6 +846,18 @@ def _run_batch_cleanup(config: dict, *, dry_run_legacy: bool = False) -> None:
         )
 
 
+def resolve_obsidian_mirror(v_url: str, direct_input_urls, channel_marker_by_url) -> bool:
+    """Obsidian mirror decision for one video, by input source.
+
+    A URL the owner put in input_df.csv is a specific video request and always mirrors.
+    Channel-crawl videos mirror only when channel_df marks the channel `recording`;
+    a missing entry (unknown channel) is off.
+    """
+    if v_url in direct_input_urls:
+        return True
+    return bool(channel_marker_by_url.get(v_url, False))
+
+
 def sanitize_channel_name(name: str) -> str:
     """Sanitize channel name for filename (filesystem-safe chars only, no length limit)."""
     if not name or not str(name).strip():
@@ -879,7 +892,11 @@ def atomic_write_text_with_retry(
     directory = os.path.dirname(os.path.abspath(final_path))
     os.makedirs(directory, exist_ok=True)
     base_name = os.path.basename(final_path)
-    tmp_path = os.path.join(directory, f".{base_name}.{os.getpid()}.tmp")
+    # Short temp name: a 255-byte final name must not make the temp name overflow.
+    tmp_path = os.path.join(
+        directory,
+        f".{hashlib.sha1(base_name.encode('utf-8')).hexdigest()[:12]}.{os.getpid()}.tmp",
+    )
 
     last_exc: Optional[Exception] = None
     for attempt in range(max_attempts):
@@ -1132,7 +1149,9 @@ def process_single_video(
                         subs_lang = parts[1]
                 lang_suffix = f"_{subs_lang}" if subs_lang else ""
                 subs_type = "auto_subs" if subs_source == "auto" else "subs"
-                txt_file_name = f"{base_name}{lang_suffix}_{subs_type}.txt"
+                txt_file_name = fit_filename(
+                    f"{base_name}{lang_suffix}_{subs_type}.txt", video_id or ""
+                )
                 transcription_length = len(transcription)
                 # Save full transcription to output_new/full/ (skip when auto_subs and SAVE_FULL_WHEN_AUTO_SUBS=False)
                 do_save_full = (subs_source != "auto") or config.get("SAVE_FULL_WHEN_AUTO_SUBS", False)
@@ -1426,6 +1445,13 @@ def process_single_video(
                 channel_prefix = "unknown"
             if channel_prefix:
                 output_file = f"{channel_prefix}_{output_file}"
+            # Filesystems cap names at 255 UTF-8 bytes: shrink only the title so the
+            # video ID and suffix/extension survive (SUE-1298 follow-up).
+            output_file = fit_filename(
+                output_file,
+                video_id or "",
+                protect_prefix=f"{channel_prefix}_" if channel_prefix else "",
+            )
             date_folder = v_date.replace("-", "_")  # 2026-01-28 -> 2026_01_28
             date_dir = os.path.join(output_md_path, date_folder)
             md_file_path = os.path.join(date_dir, output_file)  # vault path (mirror target only)
@@ -1640,6 +1666,7 @@ def process_videos(config: dict):
     url_list = []
     meta_for_channel_crawl = []
     url_from_input_set = set()
+    direct_input_set = set()  # every URL read from input_df.csv (even if also in a channel)
     crawl_queue_df = None
     shorts_recorded_count = 0
     if config.get('CHANNEL_CRAWL'):
@@ -1680,6 +1707,7 @@ def process_videos(config: dict):
                     })
                 # Merge input_df URLs (not yet in output_df) so both channel crawl and manual input are processed
                 input_urls = get_input_urls_for_channel_crawl(data_root, output_df)
+                direct_input_set = set(input_urls)
                 crawl_set = set(url_list)
                 input_only = [u for u in input_urls if u not in crawl_set]
                 if input_only:
@@ -1698,6 +1726,7 @@ def process_videos(config: dict):
                 if input_urls:
                     url_list = input_urls
                     url_from_input_set = set(url_list)
+                    direct_input_set = set(url_list)
                     logger.info("Channel crawl: no channel candidates; using %d URL(s) from input_df.csv", len(url_list))
         except ValueError as e:
             # ValueError/UnicodeError 계열 메시지 출력
@@ -1714,6 +1743,7 @@ def process_videos(config: dict):
         input_df, output_df = load_dataframes(data_root)
         url_list = get_url_list(input_df, output_df)
         url_from_input_set = set(url_list) if url_list else set()
+        direct_input_set = set(url_from_input_set)
     
     if not url_list:
         logger.info("No videos to process. All videos have been processed.")
@@ -1833,8 +1863,13 @@ def process_videos(config: dict):
 
     def _video_config_for_url(v_url: str) -> dict:
         video_config = {**config}
-        # Direct URL / unknown channel: mirror explicitly NOT selected (never rejected).
-        video_config["obsidian_mirror"] = bool(url_to_obsidian_mirror.get(v_url, False))
+        # Channel-crawl videos mirror only when channel_df marks the channel `recording`
+        # (unknown channel => off). Direct input_df.csv URLs are specific videos the owner
+        # asked for, so they always mirror to Obsidian (Drive is written for every video).
+        # Decided by input source, never by channel lookup.
+        video_config["obsidian_mirror"] = resolve_obsidian_mirror(
+            v_url, direct_input_set, url_to_obsidian_mirror
+        )
         if url_to_default_audio_lang and v_url in url_to_default_audio_lang:
             video_config["default_audio_lang"] = url_to_default_audio_lang[v_url]
         if url_to_auto_subs_only and v_url in url_to_auto_subs_only:
