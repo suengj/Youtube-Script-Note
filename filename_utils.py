@@ -12,9 +12,15 @@ subs-type / LLM suffix / extension), and never splits a code point.
 """
 from __future__ import annotations
 
+import re
 import unicodedata
+from typing import NamedTuple, Optional
 
-MAX_FILENAME_BYTES = 255
+MAX_FILENAME_BYTES = 255  # hard filesystem cap (bytes, measured as max(NFC, NFD))
+# Target for generated names. Headroom below the hard cap so that suffixes added later
+# (iCloud/Drive conflict copies such as " 2" / " (1)", fs_transport's ``.tmp``) can never
+# push a name past 255 and cut the video ID.
+FILENAME_BUDGET_BYTES = 240
 ELLIPSIS = "…"
 
 
@@ -66,7 +72,7 @@ def fit_filename(
     video_id: str = "",
     *,
     protect_prefix: str = "",
-    max_bytes: int = MAX_FILENAME_BYTES,
+    max_bytes: int = FILENAME_BUDGET_BYTES,
 ) -> str:
     """Return ``name`` shortened (title only) to <= ``max_bytes`` UTF-8 bytes.
 
@@ -96,6 +102,13 @@ def fit_filename(
     title = title.rstrip(ELLIPSIS)
 
     fixed = _blen(tail) + _blen(sep)
+    if fixed > max_bytes:
+        # Nothing safe to shorten: the ID + suffix + extension alone exceed the budget.
+        # (MAIN_LLM_OUTPUT_SUFFIX is length-capped at config time so this cannot happen
+        # in the pipeline.) Fail loudly instead of emitting an over-budget name.
+        raise ValueError(
+            f"filename tail ({fixed} bytes) exceeds the {max_bytes}-byte budget: {tail!r}"
+        )
     room = max_bytes - fixed - _blen(prefix)
     if room >= _blen(ELLIPSIS) or (room > 0 and not title):
         new_title = truncate_to_bytes(title, room) if room > 0 else ""
@@ -106,3 +119,46 @@ def fit_filename(
         out = truncate_to_bytes(prefix, pre_room, ellipsis="") + sep + tail
     # Defensive: the tail itself (ID + suffix + ext) must always survive.
     return out
+
+
+# MAIN_LLM_OUTPUT_SUFFIX ("5-mini", "dS4f", "luna-<effort>", ...) is configurable. It is
+# validated at config time so the tail (ID + lang + subs + suffix + ".md") stays tiny.
+MAX_LLM_SUFFIX_CHARS = 32
+_LLM_SUFFIX_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9.-]*")
+
+
+def validate_llm_suffix(suffix: str) -> str:
+    """Return ``suffix`` if usable in a note name, else raise ``ValueError``."""
+    if not (1 <= len(suffix) <= MAX_LLM_SUFFIX_CHARS) or not _LLM_SUFFIX_RE.fullmatch(suffix):
+        raise ValueError(
+            f"MAIN_LLM_OUTPUT_SUFFIX must be 1-{MAX_LLM_SUFFIX_CHARS} chars of [A-Za-z0-9.-] "
+            f"(no underscore, not starting with . or -): {suffix!r}"
+        )
+    return suffix
+
+
+class NoteNameParts(NamedTuple):
+    video_id: str
+    lang: str
+    subs_type: str   # "auto_subs" | "subs" | "" (older names without it)
+    llm_suffix: str  # MAIN_LLM_OUTPUT_SUFFIX, e.g. "5-mini", "dS4f", "luna-low"
+
+
+# Mirrors how main.py builds a note name. Subtitle path: ``{title}_{video_id}{_lang}_{auto_subs|subs}``
+# + ``_{MAIN_LLM_OUTPUT_SUFFIX}.md``. Whisper path (stt_function_v3): ``{title}.m4a+vid-{video_id}``
+# + ``_{MAIN_LLM_OUTPUT_SUFFIX}.md`` with no language/subs segment. The LLM suffix is
+# configurable, so it is matched structurally (no ``_``) rather than from a fixed list.
+_NOTE_TAIL_RE = re.compile(
+    r"(?:_|\+vid-)(?P<vid>[A-Za-z0-9_-]{11})"
+    r"(?:_(?P<lang>[A-Za-z]{2,3}(?:-[A-Za-z0-9]+)*))?"
+    r"(?:_(?P<st>auto_subs|subs))?"
+    r"_(?P<llm>[A-Za-z0-9][A-Za-z0-9.-]*)\.md$"
+)
+
+
+def parse_note_name(name: str) -> Optional[NoteNameParts]:
+    """Parse a complete P03 note name; ``None`` when the ID or suffix is incomplete."""
+    m = _NOTE_TAIL_RE.search(unicodedata.normalize("NFC", name))
+    if not m:
+        return None
+    return NoteNameParts(m.group("vid"), m.group("lang") or "", m.group("st") or "", m.group("llm"))
