@@ -1428,8 +1428,7 @@ def process_single_video(
                 output_file = f"{channel_prefix}_{output_file}"
             date_folder = v_date.replace("-", "_")  # 2026-01-28 -> 2026_01_28
             date_dir = os.path.join(output_md_path, date_folder)
-            os.makedirs(date_dir, exist_ok=True)
-            md_file_path = os.path.join(date_dir, output_file)
+            md_file_path = os.path.join(date_dir, output_file)  # vault path (mirror target only)
 
             # Mobile MD: YAML frontmatter + v2 body (Phase 1b)
             from scripts.md_mobile_utils import (
@@ -1463,48 +1462,41 @@ def process_single_video(
             )
             content_to_write = assemble_mobile_md(save_entry, body)
 
-            # Primary: OUTPUT_MD_PATH (e.g. Obsidian). Atomic write + retries.
-            # Fallback: only if primary fails — write to WORK_PATH/output_md_mirror/ (local disk).
-            work_path_cfg = (config.get("WORK_PATH") or "").strip()
-            mirror_path = None
-            if work_path_cfg and os.path.abspath(work_path_cfg) != os.path.abspath(base_path):
-                mirror_path = os.path.join(
-                    work_path_cfg, "output_md_mirror", date_folder, output_file
-                )
+            # Final MD is staged locally (work/retry cache), then published: Drive Desktop
+            # (canonical, all channels) + optional Obsidian mirror into OUTPUT_MD_PATH
+            # (obsidian-marked channels only). Failures of the two are isolated.
+            from scripts.drive_yt_summary.publish import publish_final_md, staging_root
 
-            effective_md_path: Optional[str] = None
-            try:
-                atomic_write_text_with_retry(
-                    md_file_path, content_to_write, encoding="utf-8-sig", log=logger
-                )
-                effective_md_path = md_file_path
-            except Exception as primary_exc:
-                logger.error(
-                    "Primary markdown save failed (%s): %s",
-                    md_file_path,
-                    primary_exc,
-                    exc_info=True,
-                )
-                if not mirror_path:
-                    raise primary_exc
-                try:
-                    os.makedirs(os.path.dirname(mirror_path), exist_ok=True)
-                    atomic_write_text_with_retry(
-                        mirror_path, content_to_write, encoding="utf-8-sig", log=logger
-                    )
-                    effective_md_path = mirror_path
-                    logger.warning(
-                        "Markdown saved to local fallback only (Obsidian path failed): %s",
-                        mirror_path,
-                    )
-                except Exception as fallback_exc:
-                    logger.error(
-                        "Local markdown fallback also failed (%s): %s",
-                        mirror_path,
-                        fallback_exc,
-                        exc_info=True,
-                    )
-                    raise fallback_exc from primary_exc
+            work_path_cfg = (config.get("WORK_PATH") or "").strip()
+            rel_md = f"{date_folder}/{output_file}"
+            staging_file = os.path.join(
+                str(staging_root(work_path_cfg, base_path)), date_folder, output_file
+            )
+            atomic_write_text_with_retry(
+                staging_file, content_to_write, encoding="utf-8-sig", log=logger
+            )
+            pub = publish_final_md(
+                rel_path=rel_md,
+                content=content_to_write,
+                staging_path=staging_file,
+                md_root=output_md_path,
+                mirror=bool(config.get("obsidian_mirror", False)),
+                base_path=base_path,
+                work_path=work_path_cfg,
+                video_id=video_id or "",
+                title=title,
+            )
+            for err in pub.errors:
+                logger.error("Final markdown publish issue (%s): %s", rel_md, err)
+            if pub.mirror_action in ("mirrored", "unchanged"):
+                effective_md_path = pub.mirror_path
+            elif pub.drive_ok:
+                effective_md_path = pub.drive_path
+            elif os.path.isfile(staging_file):
+                logger.warning("Markdown kept in local staging only (Drive failed): %s", staging_file)
+                effective_md_path = staging_file
+            else:
+                raise RuntimeError("final markdown publish failed: " + "; ".join(pub.errors))
 
             assert effective_md_path is not None
             md_file_size = os.path.getsize(effective_md_path)
@@ -1528,11 +1520,13 @@ def process_single_video(
             }
             wp = (config.get("WORK_PATH") or "").strip()
             dr = config.get("DATA_ROOT") or resolve_data_root(base_path, wp or None)
-            pending_catalog = {
-                "work_path": wp,
-                "data_root": dr,
-                "entry": save_entry,
-            }
+            # Catalog indexes the vault; only mirrored notes exist there.
+            if pub.mirror_action in ("mirrored", "unchanged"):
+                pending_catalog = {
+                    "work_path": wp,
+                    "data_root": dr,
+                    "entry": save_entry,
+                }
 
         except Exception as e:
             error_category = "MARKDOWN_SAVE_ERROR"
@@ -2061,8 +2055,20 @@ def process_videos(config: dict):
             logger.warning("Daily digest build failed (non-fatal): %s", de)
 
         try:
+            from scripts.drive_yt_summary.publish import flush_staging
             from scripts.drive_yt_summary.sync import run_sync_safe
 
+            retried = flush_staging(
+                md_root=config["OUTPUT_MD_PATH"],
+                base_path=base_path,
+                work_path=(config.get("WORK_PATH") or "").strip(),
+            )
+            if retried:
+                logger.info(
+                    "Drive staging retry: %s/%s published",
+                    sum(1 for r in retried if r.drive_ok),
+                    len(retried),
+                )
             drive_result = run_sync_safe()
             if drive_result.errors:
                 logger.warning(

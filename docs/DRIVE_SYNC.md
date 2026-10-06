@@ -6,6 +6,16 @@ Finalized Markdown summaries are copied to a **local Google Drive Desktop mount*
 
 No Google Drive API upload, OAuth, or service-account credentials in the active path.
 
+## Storage / mirror split (SUE-1298)
+
+Per video, `scripts/drive_yt_summary/publish.py` runs after the final Markdown is generated (content unchanged):
+
+1. **Staging** (`WORK_PATH/output_md_staging/`) - work/retry cache only. Deleted only after the Drive write is verified (local readback hash). Leftovers are retried by `flush_staging` at batch end.
+2. **Drive Desktop** (`P03_DRIVE_SYNC_ROOT/source/`) - canonical, all channels. Same hash = no-op; changed content = same file, `revision` + 1 in state/manifest (with `video_id`, `hash`).
+3. **Obsidian mirror** (`OUTPUT_MD_PATH`) - extra copy only when `video_config["obsidian_mirror"]` is true.
+
+Drive and mirror failures are isolated. `P03_DRIVE_SYNC_ENABLED=0` keeps the legacy behaviour (everything to `OUTPUT_MD_PATH`). Cloud readback is SUE-1299; Linux direct API is SUE-1314. One writer per host (Desktop path active on Mac).
+
 ## Configuration
 
 | Variable | Purpose |

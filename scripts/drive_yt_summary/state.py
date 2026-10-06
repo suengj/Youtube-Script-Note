@@ -22,6 +22,9 @@ class SyncStateEntry:
     dest_path: str
     drive_name: str
     updated_at: str
+    video_id: str = ""
+    title: str = ""
+    revision: int = 1
 
     @property
     def drive_file_id(self) -> str:
@@ -65,6 +68,9 @@ def load_state(path: Path) -> SyncState:
             dest_path=dest,
             drive_name=(entry.get("drive_name") or "").strip(),
             updated_at=(entry.get("updated_at") or "").strip(),
+            video_id=(entry.get("video_id") or "").strip(),
+            title=(entry.get("title") or "").strip(),
+            revision=int(entry.get("revision") or 1),
         )
     return SyncState(files=out, manifest_path=manifest_path)
 
@@ -82,6 +88,9 @@ def save_state(path: Path, state: SyncState) -> None:
                 "dest_path": e.dest_path,
                 "drive_name": e.drive_name,
                 "updated_at": e.updated_at,
+                "video_id": e.video_id,
+                "title": e.title,
+                "revision": e.revision,
             }
             for rel, e in sorted(state.files.items())
         },
