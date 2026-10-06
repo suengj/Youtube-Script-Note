@@ -156,3 +156,25 @@ def test_non_recording_channel_does_not_mirror():
 def test_unknown_channel_crawl_video_does_not_mirror():
     assert main.resolve_obsidian_mirror(CH_UNKNOWN, {DIRECT}, MARKERS) is False
     assert main.resolve_obsidian_mirror(CH_UNKNOWN, set(), {}) is False
+
+
+def test_concise_txt_write_path_refits_after_suffix(tmp_path):
+    # A txt name already at the 255-byte cap, then the LLM suffix is added (concise write).
+    txt = fit_filename(f"{TITLES['korean']}_{VID}_ko_subs.txt", VID)
+    assert _blen(txt) <= MAX_FILENAME_BYTES
+    out = main.derive_output_name(txt, "5-mini", VID)
+    assert _blen(out) <= MAX_FILENAME_BYTES and out.endswith("_ko_subs_5-mini.txt") and VID in out
+    p = tmp_path / out
+    main.atomic_write_text_with_retry(str(p), "요약", encoding="utf-8-sig")
+    assert p.read_text(encoding="utf-8-sig") == "요약"
+    md = main.derive_output_name(txt, "5-mini", VID, "md")
+    assert _blen(md) <= MAX_FILENAME_BYTES and md.endswith("_5-mini.md") and VID in md
+
+
+def test_derive_exact_cap_txt_plus_suffix():
+    base = f"{{t}}_{VID}_ko_subs.txt"
+    room = MAX_FILENAME_BYTES - _blen(base.format(t=""))
+    txt = base.format(t="a" * room)
+    assert _blen(txt) == MAX_FILENAME_BYTES
+    out = main.derive_output_name(txt, "5-mini", VID)
+    assert _blen(out) <= MAX_FILENAME_BYTES and VID in out

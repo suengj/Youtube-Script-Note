@@ -846,6 +846,18 @@ def _run_batch_cleanup(config: dict, *, dry_run_legacy: bool = False) -> None:
         )
 
 
+def derive_output_name(txt_file_name: str, llm_suffix: str, video_id: str, ext: str = "") -> str:
+    """Name for a file derived from the transcript .txt name (concise txt or final md).
+
+    Adds the LLM suffix (and optionally swaps the extension), then refits to 255 bytes
+    so the video ID survives; every suffix/extension change must go through here.
+    """
+    name = stt.change_filename(txt_file_name, f"_{llm_suffix}")
+    if ext:
+        name = stt.change_extension(name, ext)
+    return fit_filename(name, video_id or "")
+
+
 def resolve_obsidian_mirror(v_url: str, direct_input_urls, channel_marker_by_url) -> bool:
     """Obsidian mirror decision for one video, by input source.
 
@@ -1320,7 +1332,9 @@ def process_single_video(
             # Step 5: Save concise transcription
             logger.info(f"[STEP 5/5] Saving concise transcription")
             try:
-                output_file = stt.change_filename(txt_file_name, f"_{config.get('MAIN_LLM_OUTPUT_SUFFIX', '5-mini')}")
+                output_file = derive_output_name(
+                    txt_file_name, config.get('MAIN_LLM_OUTPUT_SUFFIX', '5-mini'), video_id
+                )
                 concise_file_path = os.path.join(output_smm_path, output_file)
 
                 with open(concise_file_path, 'w', encoding='utf-8-sig') as f:
@@ -1433,8 +1447,9 @@ def process_single_video(
         logger.info(f"[STEP 7/7] Saving markdown file")
         md_file_path = ""
         try:
-            output_file = stt.change_filename(txt_file_name, f"_{config.get('MAIN_LLM_OUTPUT_SUFFIX', '5-mini')}")
-            output_file = stt.change_extension(output_file, "md")
+            output_file = derive_output_name(
+                txt_file_name, config.get('MAIN_LLM_OUTPUT_SUFFIX', '5-mini'), video_id, "md"
+            )
             # Resolve channel: usage_channel (meta) > download > fromInput|unknown
             ch_raw = config.get("usage_channel") or (channel_name_from_dl if channel_name_from_dl else "")
             if ch_raw:
