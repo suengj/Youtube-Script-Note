@@ -48,43 +48,44 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
 
 
-# A vault name this close to the 255-byte NFD cap may have been cut by iCloud/Obsidian.
-_TRUNCATION_SUSPECT_BYTES = 240
+# Storage cuts an over-long NFD name to 255 bytes; a cut that lands mid-jamo can leave 253-254.
+_TRUNC_MIN_BYTES = 253
+_TRUNC_MAX_BYTES = 255
 
 
-def _nfd(text: str) -> str:
-    return unicodedata.normalize("NFD", text)
+def _nfd_bytes(text: str) -> bytes:
+    return unicodedata.normalize("NFD", text).encode("utf-8")
 
 
-def find_canonical_for_truncated(
-    rel: str,
-    state_rels: List[str],
-    source_names: List[str],
-) -> Optional[str]:
-    """Return the canonical (longer) name when ``rel`` is a storage-truncated copy of it.
+def find_canonical_for_truncated(rel: str, state_rels: List[str]) -> Optional[str]:
+    """Return the canonical state key when ``rel`` is a storage-truncated copy of it.
 
     iCloud/Obsidian cut over-long decomposed names to 255 bytes, so the vault can hold
     ``..._JyyAGZ1-r94_ko-orig_auto_subs_.md`` while the pipeline already published
-    ``..._luna-low.md`` to Drive. A scan of the vault must not mint a second Drive file
-    for it. Match: same date folder, near the byte cap, and the NFD stem is a strict
-    prefix of a known canonical name (state entry or file already in ``source/``).
+    ``..._luna-low.md`` to Drive. A vault scan must not mint a second Drive file for it.
+    Skip only when ALL hold:
+      (a) the candidate's NFD name is 253..255 bytes;
+      (b) the canonical's NFD name is > 255 bytes (it can only exist on the vault as a
+          truncation);
+      (c) the candidate's NFD stem (without ``.md``) is a strict byte prefix of the
+          canonical's NFD stem;
+      (d) the canonical is a sync-state entry in the same date folder. Entries whose
+          folder cannot be established (e.g. loose ``source/`` files) never match.
     """
-    folder, _, name = rel.rpartition("/")
-    if not name.endswith(".md"):
+    folder, sep, name = rel.rpartition("/")
+    if not sep or not name.endswith(".md"):
         return None
-    name_nfd = _nfd(name)
-    if len(name_nfd.encode("utf-8")) < _TRUNCATION_SUSPECT_BYTES:
+    cand = _nfd_bytes(name)
+    if not (_TRUNC_MIN_BYTES <= len(cand) <= _TRUNC_MAX_BYTES):
         return None
-    stem = name_nfd[:-3]
+    stem = cand[:-3]
     for other in state_rels:
-        o_folder, _, o_name = other.rpartition("/")
-        o_nfd = _nfd(o_name)
-        if o_folder == folder and len(o_nfd) > len(name_nfd) and o_nfd.startswith(stem):
+        o_folder, o_sep, o_name = other.rpartition("/")
+        if not o_sep or o_folder != folder or not o_name.endswith(".md"):
+            continue
+        canon = _nfd_bytes(o_name)
+        if len(canon) > _TRUNC_MAX_BYTES and len(canon[:-3]) > len(stem) and canon.startswith(stem):
             return other
-    for o_name in source_names:
-        o_nfd = _nfd(o_name)
-        if o_name.endswith(".md") and len(o_nfd) > len(name_nfd) and o_nfd.startswith(stem):
-            return o_name
     return None
 
 
@@ -132,10 +133,6 @@ def run_sync(
     titles_by_rel = {rel: item.title for rel, item in local_map.items()}
 
     state = load_state(config.state_path)
-    try:
-        source_names = [p.name for p in config.source_dir.iterdir() if p.is_file()]
-    except OSError:
-        source_names = []
     state_rels = list(state.files.keys())
 
     if dry_run:
@@ -145,7 +142,7 @@ def run_sync(
         for rel, item in sorted(local_map.items()):
             dest = config.source_dir / item.drive_name
             prev = state.files.get(rel)
-            if prev is None and find_canonical_for_truncated(rel, state_rels, source_names):
+            if prev is None and find_canonical_for_truncated(rel, state_rels):
                 result.skipped += 1
                 result.actions.append(f"skip: {rel} (truncated copy of an existing canonical note)")
             elif prev is None:
@@ -183,7 +180,7 @@ def run_sync(
         dest = config.source_dir / item.drive_name
         prev = state.files.get(rel)
         try:
-            if prev is None and find_canonical_for_truncated(rel, state_rels, source_names):
+            if prev is None and find_canonical_for_truncated(rel, state_rels):
                 result.skipped += 1
                 result.actions.append(f"skipped: {rel} (truncated copy of an existing canonical note)")
             elif prev is None:

@@ -108,18 +108,7 @@ def _sync(vault, drive, base, work):
 
 
 @pytest.mark.parametrize("name", [JYY, BE5B])
-def test_sync_skips_truncated_copy_when_canonical_in_state(tmp_path: Path, name: str) -> None:
-    vault, drive, base, work, _ = _setup(tmp_path, name)
-    canon = drive / "source" / name
-    canon.write_text(_md(), encoding="utf-8")
-    # No state entry: the source/ listing alone must be enough.
-    result = _sync(vault, drive, base, work)
-    assert result.created == 0 and result.errors == 0
-    assert [p.name for p in (drive / "source").iterdir()] == [name]
-
-
-@pytest.mark.parametrize("name", [JYY, BE5B])
-def test_sync_skips_truncated_copy_via_state_entry(tmp_path: Path, name: str) -> None:
+def test_sync_skips_truncated_copy_of_known_canonical(tmp_path: Path, name: str) -> None:
     vault, drive, base, work, _ = _setup(tmp_path, name)
     rel = f"2026_10_07/{name}"
     from scripts.drive_yt_summary.config import load_config
@@ -146,7 +135,7 @@ def test_sync_skips_truncated_copy_via_state_entry(tmp_path: Path, name: str) ->
 
 def test_sync_still_creates_unrelated_note(tmp_path: Path) -> None:
     vault, drive, base, work, _ = _setup(tmp_path, JYY)
-    (drive / "source" / JYY).write_text(_md(), encoding="utf-8")
+    _seed_state(vault, drive, base, work, [f"2026_10_07/{JYY}"])
     other = vault / "2026_10_07" / "다른채널_다른 제목_AAAAAAAAAAA_ko_subs_luna-low.md"
     other.write_text(_md(), encoding="utf-8")
     result = _sync(vault, drive, base, work)
@@ -154,8 +143,71 @@ def test_sync_still_creates_unrelated_note(tmp_path: Path) -> None:
     assert (drive / "source" / other.name).is_file()
 
 
-def test_find_canonical_requires_strict_prefix_near_cap() -> None:
-    trunc = _truncate_nfd(JYY)
-    assert find_canonical_for_truncated(f"d/{trunc}", [], [JYY]) == JYY
-    assert find_canonical_for_truncated(f"d/{trunc}", [], []) is None
-    assert find_canonical_for_truncated("d/짧은_이름.md", [], ["짧은_이름_더긴.md"]) is None
+def _seed_state(vault, drive, base, work, rels):
+    from scripts.drive_yt_summary.config import load_config
+
+    cfg = load_config(str(base), str(work), str(vault), sync_root=str(drive))
+    save_state(
+        cfg.state_path,
+        SyncState(
+            files={
+                r: SyncStateEntry(
+                    relative_path=r,
+                    content_hash="x",
+                    dest_path=str(drive / "source" / r.rpartition("/")[2]),
+                    drive_name=r.rpartition("/")[2],
+                    updated_at="2026-10-07T00:00:00+00:00",
+                )
+                for r in rels
+            }
+        ),
+    )
+
+
+def test_prefix_of_longer_name_below_cap_window_is_created(tmp_path: Path) -> None:
+    """A*240 + .md is a prefix of A*240 + _X.md but is a genuine note, not a truncation."""
+    vault, drive, base, work, trunc = _setup(tmp_path, JYY)
+    (vault / "2026_10_07" / trunc).unlink()
+    short = "A" * 240 + ".md"
+    longer = "A" * 240 + "_" + "X" * 30 + ".md"
+    (vault / "2026_10_07" / short).write_text(_md(), encoding="utf-8")
+    _seed_state(vault, drive, base, work, [f"2026_10_07/{longer}"])
+    result = _sync(vault, drive, base, work)
+    assert result.created == 1
+    assert (drive / "source" / short).is_file()
+
+
+def test_truncated_candidate_with_canonical_under_cap_is_created(tmp_path: Path) -> None:
+    vault, drive, base, work, trunc = _setup(tmp_path, JYY)
+    cand = _truncate_nfd(JYY, 253)
+    assert _b(cand, "NFD") == 253
+    canonical = cand[:-3] + "zz.md"  # 2 bytes longer: 255, within the cap -> not a truncation
+    assert _b(canonical, "NFD") == 255
+    assert find_canonical_for_truncated(f"2026_10_07/{cand}", [f"2026_10_07/{canonical}"]) is None
+    (vault / "2026_10_07" / trunc).unlink()
+    (vault / "2026_10_07" / cand).write_text(_md(), encoding="utf-8")
+    _seed_state(vault, drive, base, work, [f"2026_10_07/{canonical}"])
+    assert _sync(vault, drive, base, work).created == 1
+
+
+def test_cross_folder_canonical_is_not_a_match(tmp_path: Path) -> None:
+    vault, drive, base, work, trunc = _setup(tmp_path, JYY)
+    _seed_state(vault, drive, base, work, [f"2026_10_06/{JYY}"])
+    result = _sync(vault, drive, base, work)
+    assert result.created == 1
+    assert find_canonical_for_truncated(f"2026_10_07/{trunc}", [f"2026_10_06/{JYY}"]) is None
+
+
+def test_source_listing_without_folder_is_not_enough(tmp_path: Path) -> None:
+    vault, drive, base, work, trunc = _setup(tmp_path, JYY)
+    (drive / "source" / JYY).write_text(_md(), encoding="utf-8")
+    result = _sync(vault, drive, base, work)
+    assert result.created == 1  # folder unknown -> do not skip
+
+
+@pytest.mark.parametrize("name", [JYY, BE5B])
+def test_find_canonical_matches_real_names(name: str) -> None:
+    trunc = _truncate_nfd(name)
+    assert 253 <= _b(trunc, "NFD") <= 255
+    assert find_canonical_for_truncated(f"d/{trunc}", [f"d/{name}"]) == f"d/{name}"
+    assert find_canonical_for_truncated(f"d/{trunc}", [f"d/{trunc}"]) is None  # not strict
