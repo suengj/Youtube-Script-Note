@@ -305,14 +305,55 @@ def test_well_formed_name_never_skipped() -> None:
     assert find_canonical_for_truncated(f"d/{w}", H, _entries([f"d/{longer}"])) is None
 
 
-def test_suffix_cut_mid_word_is_still_a_truncation() -> None:
+def test_parseable_cut_suffix_is_treated_as_well_formed_and_not_skipped() -> None:
+    """Owner rule: a complete ID + lang + suffix token is never skipped, even if it is a
+    prefix of a longer canonical (``..._lu.md`` vs ``..._luna-low.md``)."""
     head = "t" * 228 + "_dQw4w9WgXcQ_ko_subs_"
     cut, full = head + "lu.md", head + "luna-low.md"
     assert _b(cut, "NFD") == 254 and _b(full, "NFD") > 255
     assert parse_note_name(cut).llm_suffix == "lu"
-    assert find_canonical_for_truncated(f"d/{cut}", H, _entries([f"d/{full}"])) == f"d/{full}"
-    other_id = head.replace("dQw4w9WgXcQ", "zzzzzzzzzzz") + "luna-low.md"
-    assert find_canonical_for_truncated(f"d/{cut}", H, _entries([f"d/{other_id}"])) is None
+    assert find_canonical_for_truncated(f"d/{cut}", H, _entries([f"d/{full}"])) is None
+
+
+def test_different_id_segment_anywhere_blocks_skip() -> None:
+    head = "t" * 220 + "_dQw4w9WgXcQ_ko-orig_auto_subs_"
+    canon = head + "luna-low.md"
+    # candidate cut inside the suffix, but with another ID-shaped segment + lang marker
+    other = "t" * 220 + "_zzzzzzzzzzz_ko-orig_auto_subs_"
+    assert 253 <= _b(other + ".md", "NFD") <= 255 and _b(canon, "NFD") > 255
+    # control: the same cut with the canonical ID IS a truncation
+    assert find_canonical_for_truncated(f"d/{head}.md", H, _entries([f"d/{canon}"])) == f"d/{canon}"
+    assert find_canonical_for_truncated(f"d/{other}.md", H, _entries([f"d/{canon}"])) is None
+
+
+def test_whisper_path_names_parse() -> None:
+    # Real vault names: ``{title}.m4a+vid-{ID}_{llm}.md`` (no lang / subs segment)
+    p = parse_note_name("금융의 미래_ '디파이'(DeFi)를 꼭 알아야하는 이유!.m4a+vid-vRUn0DB_4PU_o1-mini.md")
+    assert (p.video_id, p.lang, p.subs_type, p.llm_suffix) == ("vRUn0DB_4PU", "", "", "o1-mini")
+    p = parse_note_name("암호화폐의 단점_ 개발자가 설명해드림!.m4a+vid-ML6-Ncr_TvY_o1-mini.md")
+    assert (p.video_id, p.llm_suffix) == ("ML6-Ncr_TvY", "o1-mini")
+    p = parse_note_name("매경월가_제목_VT42abcdefg_5-mini.md")  # ID then suffix only
+    assert p.video_id == "VT42abcdefg" and p.llm_suffix == "5-mini" and p.lang == ""
+    assert parse_note_name("채널_제목_dQw4w9WgXcQ_ko_luna-low.md").lang == "ko"
+
+
+def test_whisper_candidate_is_well_formed_not_skipped() -> None:
+    name = "채널_" + "가" * 20 + ".m4a+vid-vRUn0DB_4PU_o1-mini.md"
+    assert find_canonical_for_truncated(f"d/{name}", H, _entries([f"d/{name}x"])) is None
+
+
+def test_llm_suffix_validation_and_tail_overflow() -> None:
+    from filename_utils import validate_llm_suffix
+
+    for ok in ("5-mini", "dS4f", "luna-low", "luna-medium"):
+        assert validate_llm_suffix(ok) == ok
+    for bad in ("", "x" * 33, "a_b", "-x", "한글"):
+        with pytest.raises(ValueError):
+            validate_llm_suffix(bad)
+    vid = "dQw4w9WgXcQ"
+    huge = f"채널_제목_{vid}_ko_subs_" + "s" * 300 + ".md"
+    with pytest.raises(ValueError):
+        fit_filename(huge, vid, protect_prefix="채널_")
 
 
 def test_budget_constants() -> None:

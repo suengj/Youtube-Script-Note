@@ -10,7 +10,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, List, Optional
 
-from filename_utils import KNOWN_LLM_SUFFIXES, MAX_FILENAME_BYTES, parse_note_name
+from filename_utils import MAX_FILENAME_BYTES, parse_note_name
 
 from .config import DriveSyncConfigError, load_config, verify_sync_root
 from .fs_transport import FilesystemSyncError, atomic_write_text, copy_or_update_file, ensure_dir
@@ -94,9 +94,9 @@ def find_canonical_for_truncated(
       (e) the contents are equal: the canonical's recorded content hash equals
           ``content_hash`` or, when no hash is recorded, its Drive file hashes equal.
           Unknown hash or unreadable file means no skip;
-      (f) the canonical parses as a complete P03 name (``filename_utils.parse_note_name``),
-          the candidate is NOT itself well-formed (complete ID + full suffix), and a
-          complete ID inside the candidate equals the canonical's ID;
+      (f) the canonical parses as a complete P03 name (``filename_utils.parse_note_name``)
+          and the candidate does NOT (a note with a complete ID + lang/subs + suffix is
+          well-formed and never skipped; only a cut ID or suffix qualifies);
       (g) exactly one canonical matches.
     """
     folder, sep, name = rel.rpartition("/")
@@ -106,38 +106,24 @@ def find_canonical_for_truncated(
     if not (_TRUNC_MIN_BYTES <= len(cand) <= _TRUNC_MAX_BYTES):
         return None
     stem = cand[:-3]
-    cand_parts = parse_note_name(name)
+    # A candidate with a complete, parseable ID + lang/subs + suffix is a well-formed
+    # note (fit_filename always keeps them): never a truncation, whatever else matches.
+    if parse_note_name(name) is not None:
+        return None
     matches = []
     for other, entry in state_files.items():
         o_folder, o_sep, o_name = other.rpartition("/")
         if not o_sep or o_folder != folder or not o_name.endswith(".md"):
             continue
         canon = _nfd_bytes(o_name)
+        # (c) strict prefix. Because the candidate's bytes equal the canonical's up to
+        # the cut, any ID-shaped segment or lang/subs marker the candidate still holds is
+        # the canonical's own; a different ID anywhere breaks the prefix.
         if not (len(canon) > _TRUNC_MAX_BYTES and len(canon[:-3]) > len(stem) and canon.startswith(stem)):
             continue
-        # (f) the canonical must be a complete P03 name, otherwise nothing proves a cut.
-        canon_parts = parse_note_name(o_name)
-        if canon_parts is None:
+        # The canonical must be a complete P03 name, otherwise nothing proves a cut.
+        if parse_note_name(o_name) is None:
             continue
-        # (g) a candidate that still carries a complete ID must carry the same ID, and a
-        # well-formed candidate (ID + full suffix) is never a truncation. The one
-        # exception is a suffix cut mid-word (``..._lu.md``), a strict prefix of the
-        # canonical's suffix.
-        marker = f"_{canon_parts.video_id}".encode("utf-8")
-        at = canon.rfind(marker)
-        if at >= 0 and len(stem) >= at + len(marker):
-            if stem[at : at + len(marker)] != marker:
-                continue
-        if cand_parts is not None:
-            if cand_parts.video_id != canon_parts.video_id:
-                continue
-            partial = (
-                cand_parts.llm_suffix not in KNOWN_LLM_SUFFIXES
-                and cand_parts.llm_suffix != canon_parts.llm_suffix
-                and canon_parts.llm_suffix.startswith(cand_parts.llm_suffix)
-            )
-            if not partial:
-                continue
         if _same_content(entry, content_hash):
             matches.append(other)
     # Ambiguous (e.g. ID cut before it: two videos share the title prefix): don't skip.

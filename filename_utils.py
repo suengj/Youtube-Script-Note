@@ -102,6 +102,13 @@ def fit_filename(
     title = title.rstrip(ELLIPSIS)
 
     fixed = _blen(tail) + _blen(sep)
+    if fixed > max_bytes:
+        # Nothing safe to shorten: the ID + suffix + extension alone exceed the budget.
+        # (MAIN_LLM_OUTPUT_SUFFIX is length-capped at config time so this cannot happen
+        # in the pipeline.) Fail loudly instead of emitting an over-budget name.
+        raise ValueError(
+            f"filename tail ({fixed} bytes) exceeds the {max_bytes}-byte budget: {tail!r}"
+        )
     room = max_bytes - fixed - _blen(prefix)
     if room >= _blen(ELLIPSIS) or (room > 0 and not title):
         new_title = truncate_to_bytes(title, room) if room > 0 else ""
@@ -114,9 +121,20 @@ def fit_filename(
     return out
 
 
-# LLM output suffixes main.py produces: MAIN_LLM_OUTPUT_SUFFIX defaults ("5-mini", "dS4f")
-# and ``luna-<DIRECT_LLM_REASONING_EFFORT>`` (low | medium | high, see config.py).
-KNOWN_LLM_SUFFIXES = frozenset({"5-mini", "dS4f", "luna-low", "luna-medium", "luna-high"})
+# MAIN_LLM_OUTPUT_SUFFIX ("5-mini", "dS4f", "luna-<effort>", ...) is configurable. It is
+# validated at config time so the tail (ID + lang + subs + suffix + ".md") stays tiny.
+MAX_LLM_SUFFIX_CHARS = 32
+_LLM_SUFFIX_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9.-]*")
+
+
+def validate_llm_suffix(suffix: str) -> str:
+    """Return ``suffix`` if usable in a note name, else raise ``ValueError``."""
+    if not (1 <= len(suffix) <= MAX_LLM_SUFFIX_CHARS) or not _LLM_SUFFIX_RE.fullmatch(suffix):
+        raise ValueError(
+            f"MAIN_LLM_OUTPUT_SUFFIX must be 1-{MAX_LLM_SUFFIX_CHARS} chars of [A-Za-z0-9.-] "
+            f"(no underscore, not starting with . or -): {suffix!r}"
+        )
+    return suffix
 
 
 class NoteNameParts(NamedTuple):
@@ -126,12 +144,13 @@ class NoteNameParts(NamedTuple):
     llm_suffix: str  # MAIN_LLM_OUTPUT_SUFFIX, e.g. "5-mini", "dS4f", "luna-low"
 
 
-# Mirrors how main.py builds a note name: ``{title}_{video_id}{_lang}_{auto_subs|subs}``
-# (txt name) + ``_{MAIN_LLM_OUTPUT_SUFFIX}`` + ``.md``. The LLM suffix is configurable, so
-# it is matched structurally (no ``_``) rather than from a fixed list.
+# Mirrors how main.py builds a note name. Subtitle path: ``{title}_{video_id}{_lang}_{auto_subs|subs}``
+# + ``_{MAIN_LLM_OUTPUT_SUFFIX}.md``. Whisper path (stt_function_v3): ``{title}.m4a+vid-{video_id}``
+# + ``_{MAIN_LLM_OUTPUT_SUFFIX}.md`` with no language/subs segment. The LLM suffix is
+# configurable, so it is matched structurally (no ``_``) rather than from a fixed list.
 _NOTE_TAIL_RE = re.compile(
-    r"_(?P<vid>[A-Za-z0-9_-]{11})"
-    r"_(?P<lang>[A-Za-z]{2,3}(?:-[A-Za-z0-9]+)*)"
+    r"(?:_|\+vid-)(?P<vid>[A-Za-z0-9_-]{11})"
+    r"(?:_(?P<lang>[A-Za-z]{2,3}(?:-[A-Za-z0-9]+)*))?"
     r"(?:_(?P<st>auto_subs|subs))?"
     r"_(?P<llm>[A-Za-z0-9][A-Za-z0-9.-]*)\.md$"
 )
@@ -142,4 +161,4 @@ def parse_note_name(name: str) -> Optional[NoteNameParts]:
     m = _NOTE_TAIL_RE.search(unicodedata.normalize("NFC", name))
     if not m:
         return None
-    return NoteNameParts(m.group("vid"), m.group("lang"), m.group("st") or "", m.group("llm"))
+    return NoteNameParts(m.group("vid"), m.group("lang") or "", m.group("st") or "", m.group("llm"))

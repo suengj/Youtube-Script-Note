@@ -52,7 +52,7 @@ if sys.stderr.encoding != 'utf-8':
 
 import stt_function_v3 as stt
 import channel_crawl
-from filename_utils import fit_filename
+from filename_utils import fit_filename, validate_llm_suffix
 import run_lock
 from job_workspace import VideoJobWorkspace, cleanup_stale_jobs
 from transcript_cache import (
@@ -363,6 +363,7 @@ def load_config() -> dict:
         raise ValueError('DIRECT_LLM_REASONING_EFFORT must be low, medium, or high')
     if os.getenv('MAIN_LLM_OUTPUT_SUFFIX') is None and config['LLM_PIPELINE_MODE'] == 'direct_luna':
         config['MAIN_LLM_OUTPUT_SUFFIX'] = 'luna-' + config['DIRECT_LLM_REASONING_EFFORT']
+    validate_llm_suffix(config['MAIN_LLM_OUTPUT_SUFFIX'])  # keeps the filename tail short
     _save_full = os.getenv('SAVE_FULL_WHEN_AUTO_SUBS', '').strip().lower()
     if _save_full:
         config['SAVE_FULL_WHEN_AUTO_SUBS'] = _save_full in ('true', '1', 'yes')
