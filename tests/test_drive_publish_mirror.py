@@ -48,7 +48,8 @@ def env(tmp_path, monkeypatch):
     return type("E", (), dict(drive=drive, vault=vault, base=base, work=work, run=staticmethod(run), stage=staticmethod(stage)))
 
 
-def test_adapter_contract_korean_filename(env):
+def test_adapter_contract_korean_filename(env, monkeypatch):
+    monkeypatch.setenv("P03_SELECTIVE_MIRROR", "1")
     res, st = env.run()
     dest = env.drive / "source" / NAME
     assert res.drive_action == "created" and res.revision == 1
@@ -58,7 +59,8 @@ def test_adapter_contract_korean_filename(env):
     assert not (env.vault / REL).exists()  # unselected stays out of vault
 
 
-def test_marker_subset_mirrors_only_on(env):
+def test_marker_subset_mirrors_only_on(env, monkeypatch):
+    monkeypatch.setenv("P03_SELECTIVE_MIRROR", "1")
     on, _ = env.run(mirror=True, rel="2026_10_06/on_a.md")
     off, _ = env.run(mirror=False, rel="2026_10_06/off_b.md")
     assert on.mirror_action == "mirrored"
@@ -77,7 +79,8 @@ def test_staging_retained_on_drive_failure_and_flush_retries(env, tmp_path):
     assert (env.drive / "source" / NAME).is_file() and not st.exists()
 
 
-def test_mirror_failure_does_not_fail_drive(env):
+def test_mirror_failure_does_not_fail_drive(env, monkeypatch):
+    monkeypatch.setenv("P03_SELECTIVE_MIRROR", "1")
     (env.vault / "2026_10_06").write_text("i am a file, not a dir")  # blocks mkdir
     res, st = env.run(mirror=True)
     assert res.mirror_action == "failed"
@@ -85,7 +88,8 @@ def test_mirror_failure_does_not_fail_drive(env):
     assert any(e.startswith("mirror:") for e in res.errors)
 
 
-def test_drive_failure_does_not_block_mirror(env, tmp_path):
+def test_drive_failure_does_not_block_mirror(env, tmp_path, monkeypatch):
+    monkeypatch.setenv("P03_SELECTIVE_MIRROR", "1")
     res, st = env.run(mirror=True, sync_root=tmp_path / "nope")
     assert res.drive_action == "failed" and res.mirror_action == "mirrored"
     assert st.is_file()  # still retained: Drive not verified
@@ -119,3 +123,47 @@ def test_disabled_falls_back_to_vault(env, monkeypatch):
     res, st = env.run(mirror=False)
     assert res.drive_action == "disabled" and res.mirror_action == "mirrored"
     assert not list((env.drive / "source").glob("*.md")) and not st.exists()
+
+
+def test_flag_off_mirrors_unmarked_channel(env):
+    res, _ = env.run(mirror=False)  # default: P03_SELECTIVE_MIRROR off
+    assert res.drive_ok and res.mirror_action == "mirrored"
+    assert (env.vault / REL).is_file()
+
+
+def test_flag_off_unmarked_is_catalogued_path(env):
+    # main.py catalogues whenever mirror_action in (mirrored, unchanged)
+    env.run(mirror=False)
+    again, _ = env.run(mirror=False)
+    assert again.mirror_action == "unchanged"
+
+
+def test_flag_on_unmarked_not_mirrored(env, monkeypatch):
+    monkeypatch.setenv("P03_SELECTIVE_MIRROR", "1")
+    res, _ = env.run(mirror=False)
+    assert res.drive_ok and res.mirror_action == "skipped"
+    assert not (env.vault / REL).exists()
+
+
+def test_drive_config_error_still_mirrors_when_selective(env, tmp_path, monkeypatch):
+    monkeypatch.setenv("P03_SELECTIVE_MIRROR", "1")
+    from scripts.drive_yt_summary import config as cfg
+
+    def boom(*a, **k):
+        raise cfg.DriveSyncConfigError("no root")
+
+    monkeypatch.setattr(pub, "load_config", boom)
+    res, st = env.run(mirror=False)
+    assert res.drive_action == "failed" and res.mirror_action == "mirrored"
+    assert (env.vault / REL).is_file() and st.is_file()
+
+
+def test_corrupting_write_fails_readback_and_keeps_staging(env, monkeypatch):
+    def corrupt(path, content):
+        Path(path).parent.mkdir(parents=True, exist_ok=True)
+        Path(path).write_text(content[:-5], encoding="utf-8")
+
+    monkeypatch.setattr(pub, "atomic_write_text", corrupt)
+    res, st = env.run(mirror=False)
+    assert res.drive_action == "failed" and any("verify failed" in e for e in res.errors)
+    assert res.staging_retained and st.is_file()
