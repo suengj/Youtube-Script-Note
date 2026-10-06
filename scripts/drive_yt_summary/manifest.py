@@ -36,8 +36,13 @@ def build_manifest_yaml(
         entry = entries[rel]
         item: dict = {
             "file": entry.drive_name,
-            "title": titles_by_rel.get(rel, entry.drive_name),
+            "title": titles_by_rel.get(rel) or entry.title or entry.drive_name,
         }
+        if entry.video_id:
+            item["video_id"] = entry.video_id
+        if entry.content_hash:
+            item["hash"] = entry.content_hash
+        item["revision"] = entry.revision
         date_val = dates_by_rel.get(rel) or _date_from_relative_path(rel)
         if date_val:
             normalized = normalize_date(date_val)

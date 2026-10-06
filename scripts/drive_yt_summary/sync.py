@@ -145,6 +145,9 @@ def run_sync(
                     dest_path=prev.dest_path,
                     drive_name=item.drive_name,
                     updated_at=_now_iso(),
+                    video_id=prev.video_id,
+                    title=prev.title or item.title,
+                    revision=prev.revision + 1,
                 )
                 result.updated += 1
                 result.actions.append(f"updated: {rel} → {prev.dest_path}")

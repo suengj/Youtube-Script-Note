@@ -38,6 +38,11 @@ def _env_bool(name: str, default: bool = True) -> bool:
     return raw not in {"0", "false", "no", "off"}
 
 
+def selective_mirror_enabled() -> bool:
+    """P03_SELECTIVE_MIRROR (default off): off = mirror every channel to the vault (legacy)."""
+    return _env_bool("P03_SELECTIVE_MIRROR", False)
+
+
 def discover_yt_summary_root() -> Optional[Path]:
     """Find Google Drive Desktop local YT_summary folder (no hard-coded account path)."""
     raw = (os.getenv("P03_DRIVE_SYNC_ROOT") or "").strip()
