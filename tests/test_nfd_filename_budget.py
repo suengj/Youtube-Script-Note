@@ -17,7 +17,7 @@ import pytest
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from filename_utils import MAX_FILENAME_BYTES, fit_filename  # noqa: E402
+from filename_utils import FILENAME_BUDGET_BYTES, MAX_FILENAME_BYTES, fit_filename, parse_note_name  # noqa: E402
 from scripts.drive_yt_summary.sync import find_canonical_for_truncated, run_sync  # noqa: E402
 from scripts.drive_yt_summary.state import SyncState, SyncStateEntry, save_state  # noqa: E402
 
@@ -45,8 +45,8 @@ def test_fixture_names_match_the_run() -> None:
 def test_nfd_over_budget_is_shortened_and_keeps_id_and_suffix(name, vid, tail, prefix) -> None:
     out = fit_filename(name, vid, protect_prefix=prefix)
     assert out != name
-    assert _b(out, "NFD") <= MAX_FILENAME_BYTES
-    assert _b(out, "NFC") <= MAX_FILENAME_BYTES
+    assert _b(out, "NFD") <= FILENAME_BUDGET_BYTES
+    assert _b(out, "NFC") <= FILENAME_BUDGET_BYTES
     assert out.endswith(tail)
     assert out.startswith(prefix)
     assert out == ud.normalize("NFC", out)  # written normalization stays NFC
@@ -259,3 +259,85 @@ def test_unknown_hash_reads_drive_file_or_does_not_skip(tmp_path: Path) -> None:
     # readable but different content -> no skip
     f.write_text(_md() + "x", encoding="utf-8")
     assert find_canonical_for_truncated(trunc, H, _entries([rel], h="", dest_dir=tmp_path)) is None
+
+
+def test_a252_identical_content_not_skipped_canonical_not_p03_name(tmp_path: Path) -> None:
+    cand = "A" * 252 + ".md"
+    canon = "A" * 252 + "_" + "B" * 12 + ".md"
+    assert _b(cand, "NFD") == 255 and _b(canon, "NFD") > 255
+    assert find_canonical_for_truncated(f"d/{cand}", H, _entries([f"d/{canon}"])) is None
+    vault, drive, base, work, trunc = _setup(tmp_path, JYY)
+    (vault / "2026_10_07" / trunc).unlink()
+    (vault / "2026_10_07" / cand).write_text(_md(), encoding="utf-8")
+    _seed_state(vault, drive, base, work, [f"2026_10_07/{canon}"])  # identical content hash
+    assert _sync(vault, drive, base, work).created == 1
+
+
+def test_parse_note_name() -> None:
+    p = parse_note_name(JYY)
+    assert (p.video_id, p.lang, p.subs_type, p.llm_suffix) == ("JyyAGZ1-r94", "ko-orig", "auto_subs", "luna-low")
+    assert parse_note_name("c_t_dQw4w9WgXcQ_ko_subs_5-mini.md").llm_suffix == "5-mini"
+    assert parse_note_name(_truncate_nfd(JYY)) is None  # suffix cut
+    assert parse_note_name(_truncate_nfd(BE5B)) is None  # ID cut
+
+
+def test_two_videos_same_long_title_prefix_neither_skipped(tmp_path: Path) -> None:
+    title = "공통제목" * 20
+    n1 = f"채널_{title}_AAAAAAAAAAA_ko_subs_luna-low.md"
+    n2 = f"채널_{title}_BBBBBBBBBBB_ko_subs_luna-low.md"
+    # storage-style cut of each (ID gone) is ambiguous and well-formed names are never cut
+    c1, c2 = _truncate_nfd(n1), _truncate_nfd(n2)
+    ents = _entries([f"d/{n1}", f"d/{n2}"])
+    for c in (c1, c2):
+        assert find_canonical_for_truncated(f"d/{c}", H, ents) is None  # ambiguous: two canonicals
+    # well-formed names with the same prefix, each next to the other's entry
+    w1 = f"채널_{'a' * 207}_AAAAAAAAAAA_ko_subs_luna-low.md"
+    w2 = f"채널_{'a' * 207}_BBBBBBBBBBB_ko_subs_luna-low.md"
+    assert _b(w1, "NFD") == 255
+    for w, other in ((w1, w2), (w2, w1)):
+        assert find_canonical_for_truncated(f"d/{w}", H, _entries([f"d/{other}"])) is None
+
+
+def test_well_formed_name_never_skipped() -> None:
+    w = f"채널_{'a' * 207}_dQw4w9WgXcQ_ko_subs_luna-low.md"
+    assert 253 <= _b(w, "NFD") <= 255
+    longer = f"채널_{'a' * 207}_dQw4w9WgXcQ_ko_subs_luna-low-extra-long-suffix-x.md"
+    assert find_canonical_for_truncated(f"d/{w}", H, _entries([f"d/{longer}"])) is None
+
+
+def test_suffix_cut_mid_word_is_still_a_truncation() -> None:
+    head = "t" * 228 + "_dQw4w9WgXcQ_ko_subs_"
+    cut, full = head + "lu.md", head + "luna-low.md"
+    assert _b(cut, "NFD") == 254 and _b(full, "NFD") > 255
+    assert parse_note_name(cut).llm_suffix == "lu"
+    assert find_canonical_for_truncated(f"d/{cut}", H, _entries([f"d/{full}"])) == f"d/{full}"
+    other_id = head.replace("dQw4w9WgXcQ", "zzzzzzzzzzz") + "luna-low.md"
+    assert find_canonical_for_truncated(f"d/{cut}", H, _entries([f"d/{other_id}"])) is None
+
+
+def test_budget_constants() -> None:
+    assert FILENAME_BUDGET_BYTES == 240 and MAX_FILENAME_BYTES == 255
+
+
+def test_extreme_long_suffix_and_500_byte_korean_title() -> None:
+    vid = "dQw4w9WgXcQ"
+    tail = f"_{vid}_en-US-orig_auto_subs_luna-medium.md"
+    title = "한" * 170  # 510 bytes NFC, 1190 NFD
+    name = f"채널_{title}{tail}"
+    out = fit_filename(name, vid, protect_prefix="채널_")
+    assert _b(out, "NFD") <= FILENAME_BUDGET_BYTES
+    assert out.endswith(tail) and out.startswith("채널_")
+    assert fit_filename(out, vid, protect_prefix="채널_") == out
+
+
+def test_headroom_survives_conflict_and_tmp_suffixes() -> None:
+    out = fit_filename(JYY, "JyyAGZ1-r94", protect_prefix="교양의 시대_")
+    for extra in (" 2", " (1)", ".tmp"):
+        assert _b(out + extra, "NFD") <= MAX_FILENAME_BYTES
+
+
+def test_sync_skip_window_tied_to_hard_cap() -> None:
+    from scripts.drive_yt_summary import sync
+
+    assert sync._TRUNC_MAX_BYTES == MAX_FILENAME_BYTES == 255
+    assert sync._TRUNC_MIN_BYTES == 253

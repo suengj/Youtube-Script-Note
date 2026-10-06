@@ -12,9 +12,15 @@ subs-type / LLM suffix / extension), and never splits a code point.
 """
 from __future__ import annotations
 
+import re
 import unicodedata
+from typing import NamedTuple, Optional
 
-MAX_FILENAME_BYTES = 255
+MAX_FILENAME_BYTES = 255  # hard filesystem cap (bytes, measured as max(NFC, NFD))
+# Target for generated names. Headroom below the hard cap so that suffixes added later
+# (iCloud/Drive conflict copies such as " 2" / " (1)", fs_transport's ``.tmp``) can never
+# push a name past 255 and cut the video ID.
+FILENAME_BUDGET_BYTES = 240
 ELLIPSIS = "…"
 
 
@@ -66,7 +72,7 @@ def fit_filename(
     video_id: str = "",
     *,
     protect_prefix: str = "",
-    max_bytes: int = MAX_FILENAME_BYTES,
+    max_bytes: int = FILENAME_BUDGET_BYTES,
 ) -> str:
     """Return ``name`` shortened (title only) to <= ``max_bytes`` UTF-8 bytes.
 
@@ -106,3 +112,34 @@ def fit_filename(
         out = truncate_to_bytes(prefix, pre_room, ellipsis="") + sep + tail
     # Defensive: the tail itself (ID + suffix + ext) must always survive.
     return out
+
+
+# LLM output suffixes main.py produces: MAIN_LLM_OUTPUT_SUFFIX defaults ("5-mini", "dS4f")
+# and ``luna-<DIRECT_LLM_REASONING_EFFORT>`` (low | medium | high, see config.py).
+KNOWN_LLM_SUFFIXES = frozenset({"5-mini", "dS4f", "luna-low", "luna-medium", "luna-high"})
+
+
+class NoteNameParts(NamedTuple):
+    video_id: str
+    lang: str
+    subs_type: str   # "auto_subs" | "subs" | "" (older names without it)
+    llm_suffix: str  # MAIN_LLM_OUTPUT_SUFFIX, e.g. "5-mini", "dS4f", "luna-low"
+
+
+# Mirrors how main.py builds a note name: ``{title}_{video_id}{_lang}_{auto_subs|subs}``
+# (txt name) + ``_{MAIN_LLM_OUTPUT_SUFFIX}`` + ``.md``. The LLM suffix is configurable, so
+# it is matched structurally (no ``_``) rather than from a fixed list.
+_NOTE_TAIL_RE = re.compile(
+    r"_(?P<vid>[A-Za-z0-9_-]{11})"
+    r"_(?P<lang>[A-Za-z]{2,3}(?:-[A-Za-z0-9]+)*)"
+    r"(?:_(?P<st>auto_subs|subs))?"
+    r"_(?P<llm>[A-Za-z0-9][A-Za-z0-9.-]*)\.md$"
+)
+
+
+def parse_note_name(name: str) -> Optional[NoteNameParts]:
+    """Parse a complete P03 note name; ``None`` when the ID or suffix is incomplete."""
+    m = _NOTE_TAIL_RE.search(unicodedata.normalize("NFC", name))
+    if not m:
+        return None
+    return NoteNameParts(m.group("vid"), m.group("lang"), m.group("st") or "", m.group("llm"))

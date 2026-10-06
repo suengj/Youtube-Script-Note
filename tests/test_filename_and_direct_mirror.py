@@ -13,7 +13,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import main
 from filename_utils import (
     ELLIPSIS,
-    MAX_FILENAME_BYTES,
+    FILENAME_BUDGET_BYTES,
     fit_filename,
     truncate_to_bytes,
 )
@@ -33,7 +33,7 @@ def _blen(s):
 
 
 def _check(out, tail=TAIL):
-    assert _blen(out) <= MAX_FILENAME_BYTES
+    assert _blen(out) <= FILENAME_BUDGET_BYTES
     assert out.endswith(tail)
     assert VID in out
     out.encode("utf-8").decode("utf-8")  # valid UTF-8, no half characters
@@ -50,7 +50,7 @@ TITLES = {
 @pytest.mark.parametrize("kind", TITLES)
 def test_long_titles_fit_and_keep_id(kind):
     name = f"{PREFIX}{TITLES[kind]}{TAIL}"
-    assert _blen(name) > MAX_FILENAME_BYTES
+    assert _blen(name) > FILENAME_BUDGET_BYTES
     out = fit_filename(name, VID, protect_prefix=PREFIX)
     _check(out)
     assert out.startswith(PREFIX)
@@ -59,21 +59,21 @@ def test_long_titles_fit_and_keep_id(kind):
 
 def test_exactly_255_bytes_unchanged():
     base = f"{PREFIX}{{t}}{TAIL}"
-    room = MAX_FILENAME_BYTES - _blen(base.format(t=""))
+    room = FILENAME_BUDGET_BYTES - _blen(base.format(t=""))
     title = "a" * room  # ASCII: identical in NFC and NFD
     name = base.format(t=title)
-    assert _blen(name) == MAX_FILENAME_BYTES
+    assert _blen(name) == FILENAME_BUDGET_BYTES
     assert fit_filename(name, VID, protect_prefix=PREFIX) == name
 
 
 def test_256_bytes_shrinks_by_title_only():
     base = f"{PREFIX}{{t}}{TAIL}"
-    room = MAX_FILENAME_BYTES + 1 - _blen(base.format(t=""))
+    room = FILENAME_BUDGET_BYTES + 1 - _blen(base.format(t=""))
     name = base.format(t="a" * room)
-    assert _blen(name) == 256
+    assert _blen(name) == FILENAME_BUDGET_BYTES + 1
     out = fit_filename(name, VID, protect_prefix=PREFIX)
     _check(out)
-    assert _blen(out) == MAX_FILENAME_BYTES  # 1 byte over -> only trimmed, ellipsis fills
+    assert _blen(out) == FILENAME_BUDGET_BYTES  # 1 byte over -> only trimmed, ellipsis fills
     assert out.startswith(PREFIX)
 
 
@@ -166,20 +166,20 @@ def test_unknown_channel_crawl_video_does_not_mirror():
 def test_concise_txt_write_path_refits_after_suffix(tmp_path):
     # A txt name already at the 255-byte cap, then the LLM suffix is added (concise write).
     txt = fit_filename(f"{TITLES['korean']}_{VID}_ko_subs.txt", VID)
-    assert _blen(txt) <= MAX_FILENAME_BYTES
+    assert _blen(txt) <= FILENAME_BUDGET_BYTES
     out = main.derive_output_name(txt, "5-mini", VID)
-    assert _blen(out) <= MAX_FILENAME_BYTES and out.endswith("_ko_subs_5-mini.txt") and VID in out
+    assert _blen(out) <= FILENAME_BUDGET_BYTES and out.endswith("_ko_subs_5-mini.txt") and VID in out
     p = tmp_path / out
     main.atomic_write_text_with_retry(str(p), "요약", encoding="utf-8-sig")
     assert p.read_text(encoding="utf-8-sig") == "요약"
     md = main.derive_output_name(txt, "5-mini", VID, "md")
-    assert _blen(md) <= MAX_FILENAME_BYTES and md.endswith("_5-mini.md") and VID in md
+    assert _blen(md) <= FILENAME_BUDGET_BYTES and md.endswith("_5-mini.md") and VID in md
 
 
 def test_derive_exact_cap_txt_plus_suffix():
     base = f"{{t}}_{VID}_ko_subs.txt"
-    room = MAX_FILENAME_BYTES - _blen(base.format(t=""))
+    room = FILENAME_BUDGET_BYTES - _blen(base.format(t=""))
     txt = base.format(t="a" * room)
-    assert _blen(txt) == MAX_FILENAME_BYTES
+    assert _blen(txt) == FILENAME_BUDGET_BYTES
     out = main.derive_output_name(txt, "5-mini", VID)
-    assert _blen(out) <= MAX_FILENAME_BYTES and VID in out
+    assert _blen(out) <= FILENAME_BUDGET_BYTES and VID in out

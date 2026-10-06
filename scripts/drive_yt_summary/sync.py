@@ -10,6 +10,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, List, Optional
 
+from filename_utils import KNOWN_LLM_SUFFIXES, MAX_FILENAME_BYTES, parse_note_name
+
 from .config import DriveSyncConfigError, load_config, verify_sync_root
 from .fs_transport import FilesystemSyncError, atomic_write_text, copy_or_update_file, ensure_dir
 from .legacy import migrate_contents_gen_to_legacy
@@ -49,8 +51,8 @@ def _now_iso() -> str:
 
 
 # Storage cuts an over-long NFD name to 255 bytes; a cut that lands mid-jamo can leave 253-254.
-_TRUNC_MIN_BYTES = 253
-_TRUNC_MAX_BYTES = 255
+_TRUNC_MAX_BYTES = MAX_FILENAME_BYTES  # tied to the 255-byte HARD cap, not the 240 budget
+_TRUNC_MIN_BYTES = MAX_FILENAME_BYTES - 2
 
 
 def _nfd_bytes(text: str) -> bytes:
@@ -81,7 +83,7 @@ def find_canonical_for_truncated(
     iCloud/Obsidian cut over-long decomposed names to 255 bytes, so the vault can hold
     ``..._JyyAGZ1-r94_ko-orig_auto_subs_.md`` while the pipeline already published
     ``..._luna-low.md`` to Drive. A vault scan must not mint a second Drive file for it.
-    Skip only when ALL five hold:
+    Skip only when ALL hold:
       (a) the candidate's NFD name is 253..255 bytes;
       (b) the canonical's NFD name is > 255 bytes (it can only exist on the vault as a
           truncation);
@@ -91,7 +93,11 @@ def find_canonical_for_truncated(
           folder cannot be established (e.g. loose ``source/`` files) never match;
       (e) the contents are equal: the canonical's recorded content hash equals
           ``content_hash`` or, when no hash is recorded, its Drive file hashes equal.
-          Unknown hash or unreadable file means no skip.
+          Unknown hash or unreadable file means no skip;
+      (f) the canonical parses as a complete P03 name (``filename_utils.parse_note_name``),
+          the candidate is NOT itself well-formed (complete ID + full suffix), and a
+          complete ID inside the candidate equals the canonical's ID;
+      (g) exactly one canonical matches.
     """
     folder, sep, name = rel.rpartition("/")
     if not sep or not name.endswith(".md"):
@@ -100,15 +106,42 @@ def find_canonical_for_truncated(
     if not (_TRUNC_MIN_BYTES <= len(cand) <= _TRUNC_MAX_BYTES):
         return None
     stem = cand[:-3]
+    cand_parts = parse_note_name(name)
+    matches = []
     for other, entry in state_files.items():
         o_folder, o_sep, o_name = other.rpartition("/")
         if not o_sep or o_folder != folder or not o_name.endswith(".md"):
             continue
         canon = _nfd_bytes(o_name)
-        if len(canon) > _TRUNC_MAX_BYTES and len(canon[:-3]) > len(stem) and canon.startswith(stem):
-            if _same_content(entry, content_hash):
-                return other
-    return None
+        if not (len(canon) > _TRUNC_MAX_BYTES and len(canon[:-3]) > len(stem) and canon.startswith(stem)):
+            continue
+        # (f) the canonical must be a complete P03 name, otherwise nothing proves a cut.
+        canon_parts = parse_note_name(o_name)
+        if canon_parts is None:
+            continue
+        # (g) a candidate that still carries a complete ID must carry the same ID, and a
+        # well-formed candidate (ID + full suffix) is never a truncation. The one
+        # exception is a suffix cut mid-word (``..._lu.md``), a strict prefix of the
+        # canonical's suffix.
+        marker = f"_{canon_parts.video_id}".encode("utf-8")
+        at = canon.rfind(marker)
+        if at >= 0 and len(stem) >= at + len(marker):
+            if stem[at : at + len(marker)] != marker:
+                continue
+        if cand_parts is not None:
+            if cand_parts.video_id != canon_parts.video_id:
+                continue
+            partial = (
+                cand_parts.llm_suffix not in KNOWN_LLM_SUFFIXES
+                and cand_parts.llm_suffix != canon_parts.llm_suffix
+                and canon_parts.llm_suffix.startswith(cand_parts.llm_suffix)
+            )
+            if not partial:
+                continue
+        if _same_content(entry, content_hash):
+            matches.append(other)
+    # Ambiguous (e.g. ID cut before it: two videos share the title prefix): don't skip.
+    return matches[0] if len(matches) == 1 else None
 
 
 def _classify(dest: Path, sync_root: Path) -> None:
