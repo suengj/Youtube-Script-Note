@@ -14,6 +14,7 @@ import random
 import logging
 import json
 import hashlib
+import glob
 from datetime import datetime
 from pathlib import Path
 from dataclasses import dataclass
@@ -52,14 +53,14 @@ if sys.stderr.encoding != 'utf-8':
 
 import stt_function_v3 as stt
 import channel_crawl
-from filename_utils import fit_filename, validate_llm_suffix
+from filename_utils import fit_filename, parse_note_name, validate_llm_suffix
 import run_lock
 from job_workspace import VideoJobWorkspace, cleanup_stale_jobs
 from transcript_cache import (
     TranscriptCache,
-    find_durable_full_transcript,
     should_write_transcript_cache,
 )
+from scripts.note_catalog_utils import extract_vid_from_filename
 from subtitle_lifecycle import (
     cleanup_expired_quarantine,
     delete_subtitle_file,
@@ -266,6 +267,166 @@ def _append_llm_usage(data_root: str, record: dict, video_id: str) -> None:
     row.setdefault("prompt_sha256", DIRECT_PROMPT_SHA256)
     with open(os.path.join(data_root, "logs", "llm_usage.jsonl"), "a", encoding="utf-8") as handle:
         handle.write(json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n")
+
+
+def _channel_extra_tags(usage_channel: str) -> list[str]:
+    """Parse P03_CHANNEL_EXTRA_TAGS entries formatted as Channel:tag,tag."""
+    tags: list[str] = []
+    for entry in (os.getenv("P03_CHANNEL_EXTRA_TAGS") or "").split(";"):
+        channel, sep, raw_tags = entry.partition(":")
+        if sep and channel.strip().casefold() == (usage_channel or "").strip().casefold():
+            tags.extend(tag.strip().lower() for tag in raw_tags.split(",") if tag.strip())
+    return list(dict.fromkeys(tags))
+
+
+def _drive_canonical_relative_path(video_id: str, config: dict, base_path: str) -> Optional[str]:
+    """Find a Drive note only by exact frontmatter or parsed filename identity."""
+    if not video_id:
+        return None
+
+    def filename_matches(name: str) -> bool:
+        parsed = parse_note_name(name)
+        if parsed is not None:
+            return parsed.video_id == video_id
+        return extract_vid_from_filename(name) == video_id
+
+    def frontmatter_matches(path: Path) -> bool:
+        try:
+            raw = path.read_text(encoding="utf-8-sig")
+        except (OSError, UnicodeError):
+            return False
+        sections = raw.split("---", 2)
+        if len(sections) < 3:
+            return False
+        match = re.search(r"(?m)^vid:\s*['\"]?([^\s'\"]+)['\"]?\s*$", sections[1])
+        return bool(match and match.group(1) == video_id)
+
+    def destination_matches(path: Path) -> bool:
+        """Trust a state entry only when its destination identifies this video."""
+        try:
+            raw = path.read_text(encoding="utf-8-sig")
+        except (OSError, UnicodeError):
+            return False
+        sections = raw.split("---", 2)
+        if len(sections) >= 3:
+            match = re.search(r"(?m)^vid:\s*['\"]?([^\s'\"]+)['\"]?\s*$", sections[1])
+            if match:
+                return match.group(1) == video_id
+        return filename_matches(path.name)
+
+    try:
+        from scripts.drive_yt_summary.config import load_config as load_drive_config
+        from scripts.drive_yt_summary.state import load_state
+
+        drive_config = load_drive_config(
+            config.get("BASE_PATH") or base_path,
+            config.get("WORK_PATH"),
+            config.get("OUTPUT_MD_PATH"),
+        )
+        state = load_state(drive_config.state_path)
+        for rel, entry in sorted(state.files.items()):
+            if (filename_matches(Path(rel).name)
+                    or filename_matches(Path(entry.dest_path).name)):
+                destination = Path(entry.dest_path)
+                if destination.is_file() and destination_matches(destination):
+                    return entry.relative_path or rel
+
+        source_dir = drive_config.source_dir
+        if source_dir.is_dir():
+            for path in sorted(source_dir.glob("*.md")):
+                if filename_matches(path.name):
+                    # Recover the original relative path from the manifest/state when possible.
+                    for rel, entry in sorted(state.files.items()):
+                        if Path(entry.dest_path) == path:
+                            return entry.relative_path or rel
+                    return f"canonical/{path.name}"
+                if frontmatter_matches(path):
+                    for rel, entry in sorted(state.files.items()):
+                        if Path(entry.dest_path) == path:
+                            return entry.relative_path or rel
+                    return f"canonical/{path.name}"
+
+        # A manifest can outlive a missing state entry. Match its video_id/file pair,
+        # then recover the relative path from state if it is still present there.
+        manifest = drive_config.sync_root / "manifest.yaml"
+        if manifest.is_file():
+            try:
+                import yaml
+                items = yaml.safe_load(manifest.read_text(encoding="utf-8")) or {}
+                for item in items.get("items", []):
+                    name = str(item.get("file", ""))
+                    if not filename_matches(name):
+                        continue
+                    drive_path = (source_dir / name).resolve()
+                    try:
+                        drive_path.relative_to(source_dir.resolve())
+                    except ValueError:
+                        continue
+                    if not drive_path.is_file():
+                        continue
+                    for rel, entry in sorted(state.files.items()):
+                        if entry.drive_name == name or Path(entry.dest_path).name == name:
+                            return entry.relative_path or rel
+                    return f"canonical/{name}"
+            except Exception:
+                pass
+    except Exception:
+        return None
+    return None
+
+
+def _has_drive_canonical_for_video(video_id: str, config: dict, base_path: str) -> bool:
+    return _drive_canonical_relative_path(video_id, config, base_path) is not None
+
+
+def _find_exact_durable_full_transcript(output_full_path: str, video_id: str) -> Optional[str]:
+    """Find a durable transcript whose parsed filename video ID matches exactly."""
+    if not output_full_path or not video_id or not os.path.isdir(output_full_path):
+        return None
+    for path in sorted(glob.glob(os.path.join(output_full_path, f"*{video_id}*.txt"))):
+        if not os.path.isfile(path) or os.path.getsize(path) <= 0:
+            continue
+        name = os.path.basename(path)
+        if "+vid-" in name:
+            exact_segment = re.search(
+                rf"\+vid-{re.escape(video_id)}(?:_full)?\.txt$", name
+            )
+            parsed_video_id = video_id if exact_segment else None
+        else:
+            parsed_video_id = extract_vid_from_filename(name)
+        if parsed_video_id == video_id:
+            return path
+    return None
+
+
+def _read_durable_full_transcript(output_full_path: str, video_id: str) -> tuple[Optional[str], Optional[str]]:
+    """Return path and readable non-empty text; a present but unreadable file returns its path."""
+    path = _find_exact_durable_full_transcript(output_full_path, video_id or "") if video_id else None
+    if not path or not os.path.isfile(path):
+        return None, None
+    try:
+        if os.path.getsize(path) <= 0:
+            return path, None
+        try:
+            with open(path, "r", encoding="utf-8-sig") as transcript_file:
+                text = transcript_file.read()
+        except UnicodeError:
+            with open(path, "r", encoding="utf-8") as transcript_file:
+                text = transcript_file.read()
+        return (path, text) if text.strip() else (path, None)
+    except OSError:
+        return path, None
+    except UnicodeError:
+        return path, None
+
+
+def _should_retry_unknown_with_transcript(
+    status: str, durable_full_path: Optional[str], video_id: str, config: dict, base_path: str
+) -> bool:
+    return bool(
+        status == "unknown" and durable_full_path
+        and not _has_drive_canonical_for_video(video_id, config, base_path)
+    )
 
 
 def run_direct_summary(client, transcription: str, filename: str, video_id: str, config: dict):
@@ -1025,122 +1186,163 @@ def process_single_video(
     work_path = config.get('WORK_PATH') or base_path
     transcript_cache = _build_transcript_cache(config)
 
+    # Decide terminal dedupe outcomes before opening any durable transcript. A damaged
+    # transcript must not change the historical result for an already completed video.
+    durable_full_path: Optional[str] = (
+        _find_exact_durable_full_transcript(output_full_path, video_id) if video_id else None
+    )
+    _terminal_skip_statuses = frozenset({
+        "passed_shorts", "live_scheduled", "video_unavailable",
+        "skipped_auto_subs_only", "oversized_file",
+    })
+    _retryable_statuses = frozenset({
+        "download_failed", "api_error", "file_error", "mlx_error", "error",
+    })
+    if 'v_id' in output_df.columns and len(output_df) > 0:
+        prior = output_df[output_df['v_id'] == video_id]
+        if len(prior) > 0:
+            if (prior['status'] == 'success').any():
+                logger.info("[STEP 2/5] ✓ Video already processed with status: success")
+                clear_video_context()
+                return _vr("already_existed", video_id, None, stage="dedupe")
+            latest_status = str(prior.iloc[-1]['status'])
+            if latest_status in _retryable_statuses:
+                logger.info(f"[STEP 2/5] Retrying prior failed video (status: {latest_status})")
+            elif latest_status == "already_existed" and (prior['status'] == 'download_failed').any():
+                logger.info("[STEP 2/5] Retrying video previously skipped after download_failed")
+            elif latest_status in _terminal_skip_statuses or latest_status in (
+                "already_existed", "unknown"
+            ):
+                if _should_retry_unknown_with_transcript(
+                    latest_status, durable_full_path, video_id, config, base_path
+                ):
+                    logger.info(
+                        "[STEP 2/5] Retrying unknown output status because durable transcript exists and no Drive canonical is recorded"
+                    )
+                else:
+                    logger.info(f"[STEP 2/5] ✓ Video already processed with status: {latest_status}")
+                    clear_video_context()
+                    return _vr("already_existed", video_id, None, stage="dedupe")
+            else:
+                logger.info(f"[STEP 2/5] Retrying video with prior status: {latest_status}")
+
     if video_id and config.get('USE_JOB_WORKSPACE', True):
         job_workspace = VideoJobWorkspace(work_path, video_id)
         job_workspace.ensure()
         job_workspace.write_metadata({"url": v_url})
     
     try:
-        # Step 1: Download YouTube video (or subs only when uploader subs exist and YT_DOWNLOAD_IF_SUBS_Y=False)
-        logger.info(f"[STEP 1/5] Downloading video: {v_url}")
-        set_pipeline_context(video_id=video_id or "", stage="download")
-        stt.clear_last_ytdlp_failure()
-        if download_limiter:
-            download_limiter.wait_for_admission()
-        try:
-            download_config = dict(config)
-            if job_workspace is not None:
-                download_config['JOB_SUBS_DIR'] = job_workspace.subs_dir
-            download_result = stt.yt_downloader(
-                URL=v_url,
-                DOWNLOAD_PATH=audio_path,
-                config=download_config,
-            )
+        # Reuse an existing durable full transcript before attempting any media download.
+        reused_transcription: Optional[str] = None
+        reused_metadata: dict = {}
+        durable_full_path, reused_transcription = _read_durable_full_transcript(output_full_path, video_id or "")
+        if durable_full_path and reused_transcription is None:
+            return _vr("durable_transcript_unreadable", video_id, "durable full transcript exists but cannot be read as UTF-8", stage="transcript_reuse")
+        if reused_transcription is not None:
+            try:
+                from youtube_api_metadata import fetch_video_metadata_batch, get_api_key
+                metadata_key = get_api_key()
+                if metadata_key:
+                    reused_metadata = fetch_video_metadata_batch(metadata_key, [video_id]).get(video_id, {})
+            except Exception as metadata_exc:
+                logger.info("YouTube metadata unavailable for reused transcript (%s)", type(metadata_exc).__name__)
+            audio_nm = (reused_metadata.get("title") or os.path.basename(durable_full_path or "")).rsplit(".", 1)[0]
+            audio_path_file = None
+            video_len = 0
+            channel_id = ""
+            channel_url = ""
+            subs_path = None
+            subs_source = None
+            subs_lang = None
+            channel_name_from_dl = reused_metadata.get("channel_title") or config.get("usage_channel", "")
+            upload_date = reused_metadata.get("upload_date", "")
+            logger.info("TRANSCRIPT_REUSED: video_id=%s path=%s", video_id, durable_full_path)
+        else:
+            # Step 1: Download YouTube video (or subs only when uploader subs exist and YT_DOWNLOAD_IF_SUBS_Y=False)
+            logger.info(f"[STEP 1/5] Downloading video: {v_url}")
+            set_pipeline_context(video_id=video_id or "", stage="download")
+            stt.clear_last_ytdlp_failure()
+            if download_limiter:
+                download_limiter.wait_for_admission()
+            try:
+                download_config = dict(config)
+                if job_workspace is not None:
+                    download_config['JOB_SUBS_DIR'] = job_workspace.subs_dir
+                download_result = stt.yt_downloader(
+                    URL=v_url,
+                    DOWNLOAD_PATH=audio_path,
+                    config=download_config,
+                )
             
-            if download_result is None:
-                error_category = "DOWNLOAD_FAILED"
-                detail = stt.get_last_ytdlp_failure_reason().strip()
-                error_msg = detail if detail else "Download failed after all retry attempts"
+                if download_result is None:
+                    error_category = "DOWNLOAD_FAILED"
+                    detail = stt.get_last_ytdlp_failure_reason().strip()
+                    error_msg = detail if detail else "Download failed after all retry attempts"
+                    logger.error(f"[ERROR] {error_category} - URL: {v_url}")
+                    logger.error(f"  Details: YouTube downloader returned None after retries — {error_msg}")
+                    logger.error(f"  Possible causes: Network issue, IP block, video unavailable, or YouTube API change")
+                    return _vr("download_failed", video_id, error_msg, stage="download")
+            
+                if len(download_result) >= 7 and download_result[0] == "__LIVE_SCHEDULED__":
+                    logger.info("[STEP 1/5] Skipped (live/scheduled live event, no VOD): %s", v_url)
+                    return _vr("live_scheduled", download_result[2], None, stage="download")
+                if len(download_result) >= 7 and download_result[0] == "__VIDEO_UNAVAILABLE__":
+                    logger.info("[STEP 1/5] Skipped (video unavailable or private): %s", v_url)
+                    return _vr("video_unavailable", download_result[2], None, stage="download")
+                if len(download_result) >= 7 and download_result[0] == "__SKIP_AUTO_SUBS_ONLY__":
+                    logger.info("[STEP 1/5] Skipped (auto_subs_only channel, no subs): %s", v_url)
+                    return _vr("skipped_auto_subs_only", download_result[2], None, stage="download")
+            
+                audio_path_file, audio_nm, video_id, video_len, channel_id, channel_url, subs_path, subs_source, subs_lang, channel_name_from_dl, upload_date = (
+                    (*download_result, None, None, None, "", "")[:11]
+                )
+                subs_path_for_cleanup = subs_path
+                if job_workspace is not None:
+                    job_workspace.touch_active()
+                download_triggered = audio_path_file is not None
+                logger.info("DOWNLOAD_TRIGGERED: %s", download_triggered)
+                if subs_path:
+                    if subs_source == "auto":
+                        logger.info("Using YouTube auto-generated captions (Whisper skipped)")
+                    else:
+                        logger.info("Using uploader subtitles for transcription (Whisper will be skipped)")
+                logger.info(f"[STEP 1/5] ✓ Video downloaded successfully" if download_triggered else "[STEP 1/5] ✓ Subs only (no video download)")
+                logger.info(f"  Video ID: {video_id}")
+                logger.info(f"  Video Length: {video_len} seconds")
+                logger.info(f"  Channel: {channel_id}")
+                logger.info(f"  Audio file: {audio_nm}")
+            
+            except Exception as e:
+                error_category = "DOWNLOAD_EXCEPTION"
+                error_type = type(e).__name__
+                error_msg = f"{error_type}: {str(e)}"
                 logger.error(f"[ERROR] {error_category} - URL: {v_url}")
-                logger.error(f"  Details: YouTube downloader returned None after retries — {error_msg}")
-                logger.error(f"  Possible causes: Network issue, IP block, video unavailable, or YouTube API change")
+                logger.error(f"  Exception Type: {error_type}")
+                logger.error(f"  Error Message: {str(e)}")
+                logger.error(f"  Video ID extracted: {video_id if video_id else 'Failed to extract'}")
+                logger.error(f"  Stack trace:", exc_info=True)
+            
+                # Check for specific error types
+                if "RegexMatchError" in error_type:
+                    logger.error(f"  Cause: YouTube JavaScript structure changed (pytubefix needs update)")
+                elif "VideoUnavailable" in error_type:
+                    logger.error(f"  Cause: Video is unavailable or private")
+                elif "AgeRestrictedError" in error_type:
+                    logger.error(f"  Cause: Age-restricted video")
+                elif "Network" in error_type or "Connection" in error_type:
+                    logger.error(f"  Cause: Network connectivity issue")
+            
                 return _vr("download_failed", video_id, error_msg, stage="download")
-            
-            if len(download_result) >= 7 and download_result[0] == "__LIVE_SCHEDULED__":
-                logger.info("[STEP 1/5] Skipped (live/scheduled live event, no VOD): %s", v_url)
-                return _vr("live_scheduled", download_result[2], None, stage="download")
-            if len(download_result) >= 7 and download_result[0] == "__VIDEO_UNAVAILABLE__":
-                logger.info("[STEP 1/5] Skipped (video unavailable or private): %s", v_url)
-                return _vr("video_unavailable", download_result[2], None, stage="download")
-            if len(download_result) >= 7 and download_result[0] == "__SKIP_AUTO_SUBS_ONLY__":
-                logger.info("[STEP 1/5] Skipped (auto_subs_only channel, no subs): %s", v_url)
-                return _vr("skipped_auto_subs_only", download_result[2], None, stage="download")
-            
-            audio_path_file, audio_nm, video_id, video_len, channel_id, channel_url, subs_path, subs_source, subs_lang, channel_name_from_dl, upload_date = (
-                (*download_result, None, None, None, "", "")[:11]
-            )
-            subs_path_for_cleanup = subs_path
-            if job_workspace is not None:
-                job_workspace.touch_active()
-            download_triggered = audio_path_file is not None
-            logger.info("DOWNLOAD_TRIGGERED: %s", download_triggered)
-            if subs_path:
-                if subs_source == "auto":
-                    logger.info("Using YouTube auto-generated captions (Whisper skipped)")
-                else:
-                    logger.info("Using uploader subtitles for transcription (Whisper will be skipped)")
-            logger.info(f"[STEP 1/5] ✓ Video downloaded successfully" if download_triggered else "[STEP 1/5] ✓ Subs only (no video download)")
-            logger.info(f"  Video ID: {video_id}")
-            logger.info(f"  Video Length: {video_len} seconds")
-            logger.info(f"  Channel: {channel_id}")
-            logger.info(f"  Audio file: {audio_nm}")
-            
-        except Exception as e:
-            error_category = "DOWNLOAD_EXCEPTION"
-            error_type = type(e).__name__
-            error_msg = f"{error_type}: {str(e)}"
-            logger.error(f"[ERROR] {error_category} - URL: {v_url}")
-            logger.error(f"  Exception Type: {error_type}")
-            logger.error(f"  Error Message: {str(e)}")
-            logger.error(f"  Video ID extracted: {video_id if video_id else 'Failed to extract'}")
-            logger.error(f"  Stack trace:", exc_info=True)
-            
-            # Check for specific error types
-            if "RegexMatchError" in error_type:
-                logger.error(f"  Cause: YouTube JavaScript structure changed (pytubefix needs update)")
-            elif "VideoUnavailable" in error_type:
-                logger.error(f"  Cause: Video is unavailable or private")
-            elif "AgeRestrictedError" in error_type:
-                logger.error(f"  Cause: Age-restricted video")
-            elif "Network" in error_type or "Connection" in error_type:
-                logger.error(f"  Cause: Network connectivity issue")
-            
-            return _vr("download_failed", video_id, error_msg, stage="download")
-        
-        # Step 2: Check if video already processed (retry transient failures)
-        logger.info(f"[STEP 2/5] Checking if video already processed: {video_id}")
-        _terminal_skip_statuses = frozenset({
-            "passed_shorts", "live_scheduled", "video_unavailable",
-            "skipped_auto_subs_only", "oversized_file",
-        })
-        _retryable_statuses = frozenset({
-            "download_failed", "api_error", "file_error", "mlx_error", "error",
-        })
-        if 'v_id' in output_df.columns and len(output_df) > 0:
-            prior = output_df[output_df['v_id'] == video_id]
-            if len(prior) > 0:
-                if (prior['status'] == 'success').any():
-                    logger.info("[STEP 2/5] ✓ Video already processed with status: success")
-                    return _vr("already_existed", video_id, None, stage="dedupe")
-                latest_status = str(prior.iloc[-1]['status'])
-                if latest_status in _retryable_statuses:
-                    logger.info(f"[STEP 2/5] Retrying prior failed video (status: {latest_status})")
-                elif latest_status == "already_existed" and (prior['status'] == 'download_failed').any():
-                    logger.info(
-                        "[STEP 2/5] Retrying video previously skipped after download_failed"
-                    )
-                elif latest_status in _terminal_skip_statuses or latest_status in (
-                    "already_existed", "unknown"
-                ):
-                    logger.info(f"[STEP 2/5] ✓ Video already processed with status: {latest_status}")
-                    return _vr("already_existed", video_id, None, stage="dedupe")
-                else:
-                    logger.info(f"[STEP 2/5] Retrying video with prior status: {latest_status}")
         
         # Step 3: Transcribe (uploader subs → plain text; else Whisper MLX)
         logger.info(f"[STEP 3/5] Starting transcription for video: {video_id}")
-        durable_full_path: Optional[str] = None
-        if subs_path:
+        if reused_transcription is not None:
+            transcription = reused_transcription
+            transcription_length = len(transcription)
+            txt_file_name = os.path.basename(durable_full_path or f"{video_id}_full.txt")
+            logger.info("WHISPER_USED: False (durable transcript reused)")
+            logger.info("[STEP 3/5] ✓ Durable transcription reused (%d characters)", transcription_length)
+        elif subs_path:
             logger.info("WHISPER_USED: False")
             try:
                 transcription = stt.subtitle_file_to_plain_text(subs_path)
@@ -1175,7 +1377,7 @@ def process_single_video(
                     logger.info(f"  Full transcription saved: {full_txt_path}")
                     durable_full_path = full_txt_path
                 else:
-                    durable_full_path = find_durable_full_transcript(output_full_path, video_id or "")
+                    durable_full_path = _find_exact_durable_full_transcript(output_full_path, video_id or "")
                 if should_write_transcript_cache(
                     enabled=bool(config.get('TRANSCRIPT_CACHE_ENABLED', True)),
                     durable_full_path=durable_full_path,
@@ -1469,6 +1671,12 @@ def process_single_video(
                 protect_prefix=f"{channel_prefix}_" if channel_prefix else "",
             )
             date_folder = v_date.replace("-", "_")  # 2026-01-28 -> 2026_01_28
+            existing_canonical = _drive_canonical_relative_path(video_id or "", config, base_path)
+            if existing_canonical:
+                existing_parts = Path(existing_canonical).parts
+                if len(existing_parts) > 1:
+                    date_folder = existing_parts[0]
+                output_file = Path(existing_canonical).name
             date_dir = os.path.join(output_md_path, date_folder)
             md_file_path = os.path.join(date_dir, output_file)  # vault path (mirror target only)
 
@@ -1498,7 +1706,7 @@ def process_single_video(
                 lang=lang,
                 suffix=suffix,
                 source_url=source_url,
-                tags=tags,
+                tags=list(dict.fromkeys([*tags, *_channel_extra_tags(ch_raw)])),
                 title=title,
                 tldr=tldr,
             )
@@ -1527,6 +1735,7 @@ def process_single_video(
                 work_path=work_path_cfg,
                 video_id=video_id or "",
                 title=title,
+                never_mirror=(str(ch_raw).strip().casefold() == "bromath"),
             )
             for err in pub.errors:
                 logger.error("Final markdown publish issue (%s): %s", rel_md, err)
@@ -1547,7 +1756,8 @@ def process_single_video(
             logger.info(f"  File size: {md_file_size} bytes")
 
             # Defer metadata/catalog to single writer
-            method = "whisper" if not subs_path else ("subs" if subs_source == "uploader" else "auto_subs")
+            method = ("transcript_reuse" if reused_transcription is not None else
+                      ("whisper" if not subs_path else ("subs" if subs_source == "uploader" else "auto_subs")))
             jsonl_path = os.path.join(config.get("DATA_ROOT", base_path), "video_metadata_live.jsonl")
             pending_metadata = {
                 "jsonl": {

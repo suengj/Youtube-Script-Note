@@ -800,6 +800,11 @@ def build_queue_and_get_candidates(
     backfill = bool(config.get("CHANNEL_BACKFILL") or False)
     start_date_s = (config.get("CHANNEL_START_DATE") or "").strip()
     end_date_s = (config.get("CHANNEL_END_DATE") or "").strip()
+    empty_cursor_backfill = {
+        channel_id.strip()
+        for channel_id in os.getenv("P03_CHANNEL_EMPTY_CURSOR_BACKFILL", "").split(",")
+        if channel_id.strip()
+    }
     if backfill and not end_date_s:
         raise ValueError("CHANNEL_BACKFILL=true requires CHANNEL_END_DATE to be set.")
 
@@ -843,7 +848,10 @@ def build_queue_and_get_candidates(
         if ch_url:
             logger.info("channel_crawl:   source channel_url=%s", ch_url)
 
-        if not backfill and not last_discovered_s and not last_processed_s:
+        channel_empty_backfill = (
+            cid in empty_cursor_backfill and not last_discovered_s and not last_processed_s
+        )
+        if not backfill and not channel_empty_backfill and not last_discovered_s and not last_processed_s:
             logger.warning(
                 "channel_df: last_processed_published_at/last_discovered_published_at is required when CHANNEL_BACKFILL is false; "
                 "skipping channel: %s",
@@ -859,7 +867,8 @@ def build_queue_and_get_candidates(
             uploads_id = None
 
         entries, feed_title, uploads_id_returned = fetch_channel_via_api(
-            api_key, cid, uploads_id=uploads_id, cursor_dt=cursor_dt if not backfill else None
+            api_key, cid, uploads_id=uploads_id,
+            cursor_dt=cursor_dt if not backfill and not channel_empty_backfill else None
         )
         if uploads_id_returned:
             ch["uploads_playlist_id"] = uploads_id_returned
@@ -877,10 +886,7 @@ def build_queue_and_get_candidates(
             if not pub_dt:
                 continue
 
-            if not backfill:
-                if cursor_dt and pub_dt <= cursor_dt:
-                    continue
-            else:
+            if backfill:
                 end_dt = _parse_iso_date(end_date_s)
                 if not end_dt:
                     continue
@@ -890,6 +896,8 @@ def build_queue_and_get_candidates(
                     start_dt = _parse_iso_date(start_date_s)
                     if start_dt and pub_dt < start_dt:
                         continue
+            elif not channel_empty_backfill and cursor_dt and pub_dt <= cursor_dt:
+                continue
 
             if not discovered_dt_max or pub_dt > discovered_dt_max:
                 discovered_dt_max = pub_dt

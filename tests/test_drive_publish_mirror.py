@@ -138,6 +138,76 @@ def test_flag_off_unmarked_is_catalogued_path(env):
     assert again.mirror_action == "unchanged"
 
 
+def test_never_mirror_keeps_failed_drive_publish_out_of_vault(env, tmp_path, monkeypatch):
+    monkeypatch.delenv("P03_SELECTIVE_MIRROR", raising=False)
+    # Exercise the real publish function directly with its hard no-mirror guard.
+    st = env.stage(rel="legacy_import/bromath.md")
+    res = publish_final_md(
+        rel_path="legacy_import/bromath.md", content=CONTENT, staging_path=str(st),
+        md_root=str(env.vault), mirror=False, base_path=str(env.base), work_path=str(env.work),
+        sync_root=str(tmp_path / "missing" / "YT_summary"), video_id="abcdefghijk",
+        never_mirror=True,
+    )
+    assert res.drive_action == "failed" and res.staging_retained
+    assert list(env.vault.rglob("*.md")) == []
+    assert st.is_file()
+
+
+def test_bromath_channel_staging_retry_never_mirrors_after_drive_failure(env, tmp_path, monkeypatch):
+    monkeypatch.delenv("P03_SELECTIVE_MIRROR", raising=False)
+    bromath = "---\nchannel: BroMath\n---\n\n# Legacy note\n"
+    st = env.stage(content=bromath, rel="2026_10_06/bromath_abcdefghijk.md")
+    first = publish_final_md(
+        rel_path="2026_10_06/bromath_abcdefghijk.md", content=bromath, staging_path=str(st),
+        md_root=str(env.vault), mirror=False, base_path=str(env.base), work_path=str(env.work),
+        sync_root=str(tmp_path / "missing" / "YT_summary"), video_id="abcdefghijk",
+        never_mirror=True,
+    )
+    marker = st.with_name(st.name + ".never_mirror")
+    assert first.drive_action == "failed" and marker.is_file()
+    retried = flush_staging(
+        md_root=str(env.vault), base_path=str(env.base), work_path=str(env.work),
+        sync_root=str(tmp_path / "still_missing" / "YT_summary"),
+    )
+    assert [result.drive_action for result in retried] == ["failed"]
+    assert list(env.vault.rglob("*.md")) == []
+    assert st.is_file() and marker.is_file()
+
+
+def test_bromath_tag_alone_does_not_suppress_staging_retry_mirror(env, tmp_path, monkeypatch):
+    monkeypatch.delenv("P03_SELECTIVE_MIRROR", raising=False)
+    tagged = "---\ntitle: Imported\ntags:\n  - bromath\n---\n\n# Legacy note\n"
+    st = env.stage(content=tagged, rel="2026_10_06/tagged_abcdefghijk.md")
+    assert not st.with_name(st.name + ".never_mirror").exists()
+    retried = flush_staging(
+        md_root=str(env.vault), base_path=str(env.base), work_path=str(env.work),
+        sync_root=str(tmp_path / "still_missing" / "YT_summary"),
+    )
+    assert [result.drive_action for result in retried] == ["failed"]
+    assert retried[0].mirror_action == "mirrored"
+    assert (env.vault / "2026_10_06/tagged_abcdefghijk.md").is_file()
+
+
+def test_staging_retry_honors_persisted_never_mirror_marker(env, tmp_path, monkeypatch):
+    monkeypatch.delenv("P03_SELECTIVE_MIRROR", raising=False)
+    rel = "2026_10_06/legacy_import_note.md"
+    st = env.stage(content="---\ntitle: Imported\n---\nbody\n", rel=rel)
+    first = publish_final_md(
+        rel_path=rel, content=st.read_text(encoding="utf-8-sig"), staging_path=str(st),
+        md_root=str(env.vault), mirror=False, base_path=str(env.base), work_path=str(env.work),
+        sync_root=str(tmp_path / "missing" / "YT_summary"), never_mirror=True,
+    )
+    marker = st.with_name(st.name + ".never_mirror")
+    assert first.drive_action == "failed" and marker.is_file()
+    retried = flush_staging(
+        md_root=str(env.vault), base_path=str(env.base), work_path=str(env.work),
+        sync_root=str(tmp_path / "still_missing" / "YT_summary"),
+    )
+    assert [result.drive_action for result in retried] == ["failed"]
+    assert list(env.vault.rglob("*.md")) == []
+    assert marker.is_file()
+
+
 def test_flag_on_unmarked_not_mirrored(env, monkeypatch):
     monkeypatch.setenv("P03_SELECTIVE_MIRROR", "1")
     res, _ = env.run(mirror=False)
