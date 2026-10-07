@@ -162,6 +162,28 @@ def test_unknown_rerun_requires_exact_drive_video_identity(tmp_path, monkeypatch
     assert not main._has_drive_canonical_for_video("abcdefghijk", {}, str(tmp_path))
 
 
+def test_stale_drive_manifest_entry_does_not_count_as_canonical(tmp_path, monkeypatch):
+    from scripts.drive_yt_summary import config as drive_config
+
+    sync_root = tmp_path / "drive"
+    source = sync_root / "source"
+    source.mkdir(parents=True)
+    name = "channel_title_abcdefghijk_ko_5-mini.md"
+    (sync_root / "manifest.yaml").write_text(
+        f"version: 1\nitems:\n  - file: {name}\n", encoding="utf-8"
+    )
+    fake = SimpleNamespace(
+        state_path=tmp_path / "state.json", source_dir=source, sync_root=sync_root,
+    )
+    monkeypatch.setattr(drive_config, "load_config", lambda *_args, **_kwargs: fake)
+
+    assert not main._has_drive_canonical_for_video("abcdefghijk", {}, str(tmp_path))
+    assert main._drive_canonical_relative_path("abcdefghijk", {}, str(tmp_path)) is None
+
+    (source / name).write_text("body\n", encoding="utf-8")
+    assert main._drive_canonical_relative_path("abcdefghijk", {}, str(tmp_path)) == f"canonical/{name}"
+
+
 def test_processed_video_dedupes_before_reading_damaged_transcript(tmp_path, monkeypatch):
     monkeypatch.setattr(main.stt, "extract_youtube_id", lambda _url: "abcdefghijk")
     monkeypatch.setattr(main, "_find_exact_durable_full_transcript", lambda *_: str(tmp_path / "damaged.txt"))

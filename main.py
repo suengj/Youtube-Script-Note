@@ -339,12 +339,20 @@ def _drive_canonical_relative_path(video_id: str, config: dict, base_path: str) 
                 import yaml
                 items = yaml.safe_load(manifest.read_text(encoding="utf-8")) or {}
                 for item in items.get("items", []):
-                    if filename_matches(str(item.get("file", ""))):
-                        name = str(item.get("file", ""))
-                        for rel, entry in sorted(state.files.items()):
-                            if entry.drive_name == name or Path(entry.dest_path).name == name:
-                                return entry.relative_path or rel
-                        return f"canonical/{name}"
+                    name = str(item.get("file", ""))
+                    if not filename_matches(name):
+                        continue
+                    drive_path = (source_dir / name).resolve()
+                    try:
+                        drive_path.relative_to(source_dir.resolve())
+                    except ValueError:
+                        continue
+                    if not drive_path.is_file():
+                        continue
+                    for rel, entry in sorted(state.files.items()):
+                        if entry.drive_name == name or Path(entry.dest_path).name == name:
+                            return entry.relative_path or rel
+                    return f"canonical/{name}"
             except Exception:
                 pass
     except Exception:
