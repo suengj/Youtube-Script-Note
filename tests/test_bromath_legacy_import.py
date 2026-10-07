@@ -97,6 +97,144 @@ def test_empty_cursor_backfill_flag_defaults_off(tmp_path, monkeypatch):
     assert candidates.empty
 
 
+def test_unpublished_requeue_is_channel_scoped_and_skips_drive_canonical(tmp_path, monkeypatch):
+    listed, unlisted = BRO_ID, "UC" + "d" * 22
+    monkeypatch.setenv("P03_CHANNEL_REQUEUE_UNPUBLISHED", listed)
+    channels = [
+        {"channel_url": f"https://www.youtube.com/channel/{cid}", "channel_name": cid,
+         "usage_channel": cid, "channel_id": cid, "uploads_playlist_id": "UU" + cid[2:],
+         "last_processed_published_at": "2024-01-01T00:00:00Z",
+         "last_discovered_published_at": "2024-01-01T00:00:00Z"}
+        for cid in (listed, unlisted)
+    ]
+    _channel_root(tmp_path, channels)
+    monkeypatch.setattr(cc, "fetch_channel_via_api", lambda _key, cid, **_kwargs: (
+        [{"video_id": "abcdefghijk" if cid == listed else "othervideo1",
+          "url": f"https://youtu.be/{'abcdefghijk' if cid == listed else 'othervideo1'}",
+          "published_at": "2024-01-02T00:00:00Z"}], "", "UU" + cid[2:]
+    ))
+    output = pd.DataFrame([
+        {"v_id": "abcdefghijk", "status": "unknown"},
+        {"v_id": "othervideo1", "status": "unknown"},
+    ])
+    _, candidates, _ = cc.build_queue_and_get_candidates(
+        str(tmp_path), {"YOUTUBE_API_KEY": "fixture"}, output,
+        has_drive_canonical=lambda _vid: False,
+    )
+    assert candidates["video_id"].tolist() == ["abcdefghijk"]
+
+
+def test_unpublished_requeue_skips_video_already_on_drive(tmp_path, monkeypatch):
+    monkeypatch.setenv("P03_CHANNEL_REQUEUE_UNPUBLISHED", BRO_ID)
+    _channel_root(tmp_path, [{
+        "channel_url": f"https://www.youtube.com/channel/{BRO_ID}", "channel_name": "BroMath",
+        "usage_channel": "BroMath", "channel_id": BRO_ID, "uploads_playlist_id": BRO_UPLOADS,
+        "last_processed_published_at": "2024-01-01T00:00:00Z",
+        "last_discovered_published_at": "2024-01-01T00:00:00Z",
+    }])
+    monkeypatch.setattr(cc, "fetch_channel_via_api", lambda *_args, **_kwargs: (
+        [{"video_id": "abcdefghijk", "url": "https://youtu.be/abcdefghijk",
+          "published_at": "2024-01-02T00:00:00Z"}], "", BRO_UPLOADS
+    ))
+    _, candidates, _ = cc.build_queue_and_get_candidates(
+        str(tmp_path), {"YOUTUBE_API_KEY": "fixture"},
+        pd.DataFrame([{"v_id": "abcdefghijk", "status": "unknown"}]),
+        has_drive_canonical=lambda _vid: True,
+    )
+    assert candidates.empty
+
+    queued = {column: "" for column in cc.CRAWL_QUEUE_COLUMNS}
+    queued.update(video_id="abcdefghijk", channel_id=BRO_ID, status="done")
+    prior_queue = pd.DataFrame([queued])
+    reconciled = cc.reconcile_queue_with_output_df(
+        prior_queue,
+        pd.DataFrame([{"v_id": "abcdefghijk", "status": "unknown"}]),
+        {BRO_ID},
+        lambda _vid: True,
+    )
+    assert reconciled.iloc[0]["status"] == "done"
+    queued_again = cc.reconcile_queue_with_output_df(
+        prior_queue,
+        pd.DataFrame([{"v_id": "abcdefghijk", "status": "unknown"}]),
+        {BRO_ID},
+        lambda _vid: False,
+    )
+    assert queued_again.iloc[0]["status"] == "queued"
+
+
+def test_unpublished_requeue_preserves_retry_limit_and_output_outcomes():
+    rows = []
+    for vid, status, retry_count in [
+        ("atmaxvideo01", "queued", 2),
+        ("apierrorvid01", "queued", 0),
+        ("skippedvideo1", "queued", 0),
+        ("failedvideo01", "failed", 1),
+        ("unknownvideo1", "queued", 1),
+    ]:
+        row = {column: "" for column in cc.CRAWL_QUEUE_COLUMNS}
+        row.update(video_id=vid, channel_id=BRO_ID, status=status, retry_count=retry_count)
+        rows.append(row)
+
+    output = pd.DataFrame([
+        {"v_id": "atmaxvideo01", "status": "unknown"},
+        {"v_id": "apierrorvid01", "status": "api_error"},
+        {"v_id": "skippedvideo1", "status": "skipped_auto_subs_only"},
+        {"v_id": "failedvideo01", "status": "unknown"},
+        {"v_id": "unknownvideo1", "status": "unknown"},
+    ])
+    reconciled = cc.reconcile_queue_with_output_df(
+        pd.DataFrame(rows), output, {BRO_ID}, lambda _vid: False, max_retries=2
+    ).set_index("video_id")
+
+    assert reconciled.at["atmaxvideo01", "status"] == "failed"
+    assert reconciled.at["atmaxvideo01", "last_error"] == "requeue_retry_limit"
+    assert reconciled.at["atmaxvideo01", "retry_count"] == 2
+    candidates = cc.select_process_candidates(reconciled.reset_index(), max_retries=2)
+    assert "atmaxvideo01" not in candidates["video_id"].tolist()
+    assert reconciled.at["apierrorvid01", "status"] == "failed"
+    assert reconciled.at["apierrorvid01", "last_error"] == "api_error"
+    assert reconciled.at["skippedvideo1", "status"] == "done"
+    assert reconciled.at["failedvideo01", "status"] == "failed"
+    assert reconciled.at["unknownvideo1", "status"] == "queued"
+    assert reconciled.at["unknownvideo1", "retry_count"] == 1
+
+
+@pytest.mark.parametrize("output_status, expected_candidates", [
+    ("unknown", ["abcdefghijk"]),
+    ("api_error", []),
+    ("skipped_auto_subs_only", []),
+])
+def test_discovery_requeues_only_legacy_unknown_status(
+    tmp_path, monkeypatch, output_status, expected_candidates
+):
+    monkeypatch.setenv("P03_CHANNEL_REQUEUE_UNPUBLISHED", BRO_ID)
+    _channel_root(tmp_path, [{
+        "channel_url": f"https://www.youtube.com/channel/{BRO_ID}", "channel_name": "BroMath",
+        "usage_channel": "BroMath", "channel_id": BRO_ID, "uploads_playlist_id": BRO_UPLOADS,
+        "last_processed_published_at": "2024-01-01T00:00:00Z",
+        "last_discovered_published_at": "2024-01-01T00:00:00Z",
+    }])
+    monkeypatch.setattr(cc, "fetch_channel_via_api", lambda *_args, **_kwargs: (
+        [{"video_id": "abcdefghijk", "url": "https://youtu.be/abcdefghijk",
+          "published_at": "2024-01-02T00:00:00Z"}], "", BRO_UPLOADS
+    ))
+    _, candidates, _ = cc.build_queue_and_get_candidates(
+        str(tmp_path), {"YOUTUBE_API_KEY": "fixture"},
+        pd.DataFrame([{"v_id": "abcdefghijk", "status": output_status}]),
+        has_drive_canonical=lambda _vid: False,
+    )
+    assert candidates["video_id"].tolist() == expected_candidates
+
+
+def test_unpublished_retry_requires_listed_channel_but_not_durable_transcript(monkeypatch):
+    monkeypatch.setenv("P03_CHANNEL_REQUEUE_UNPUBLISHED", BRO_ID)
+    monkeypatch.setattr(main, "_has_drive_canonical_for_video", lambda *_: False)
+    assert main._is_requeue_unpublished_video("abcdefghijk", {"channel_id": BRO_ID}, ".")
+    assert not main._is_requeue_unpublished_video("abcdefghijk", {"channel_id": "unlisted"}, ".")
+    monkeypatch.setattr(main, "_has_drive_canonical_for_video", lambda *_: True)
+    assert not main._is_requeue_unpublished_video("abcdefghijk", {"channel_id": BRO_ID}, ".")
+
+
 def test_durable_transcript_reuse_and_channel_extra_tags(tmp_path, monkeypatch):
     transcript = tmp_path / "title+vid-abcdefghijk.txt"
     transcript.write_text("\ufeffdurable words", encoding="utf-8")
@@ -105,6 +243,35 @@ def test_durable_transcript_reuse_and_channel_extra_tags(tmp_path, monkeypatch):
     monkeypatch.setenv("P03_CHANNEL_EXTRA_TAGS", "BroMath:bromath;Other:finance")
     assert main._channel_extra_tags("BroMath") == ["bromath"]
     assert main._channel_extra_tags("other") == ["finance"]
+
+
+def test_channel_extra_tag_survives_frontmatter_cap_with_five_llm_tags(monkeypatch):
+    import yaml
+
+    from scripts.md_mobile_utils import assemble_mobile_md, build_save_entry
+
+    monkeypatch.setenv("P03_CHANNEL_EXTRA_TAGS", "BroMath:bromath")
+    tags = main._tags_with_channel_extras(
+        ["llm-one", "llm-two", "llm-three", "llm-four", "llm-five"], "BroMath"
+    )
+    entry = build_save_entry(
+        md_abs_path="/vault/2026_10_07/example.md",
+        md_root="/vault",
+        vid="abcdefghijk",
+        channel="bromath",
+        upload_date="2026-10-07",
+        transcript_date="2026-10-07",
+        lang="ko",
+        suffix="5-mini",
+        source_url="https://www.youtube.com/watch?v=abcdefghijk",
+        tags=tags,
+    )
+
+    assembled = assemble_mobile_md(entry, "body")
+    frontmatter = assembled.split("---", 2)[1]
+    assert yaml.safe_load(frontmatter)["tags"] == [
+        "bromath", "llm-one", "llm-two", "llm-three", "llm-four"
+    ]
 
 
 def test_durable_transcript_reuse_requires_exact_parsed_video_id(tmp_path):
