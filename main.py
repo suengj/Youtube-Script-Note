@@ -301,6 +301,19 @@ def _drive_canonical_relative_path(video_id: str, config: dict, base_path: str) 
         match = re.search(r"(?m)^vid:\s*['\"]?([^\s'\"]+)['\"]?\s*$", sections[1])
         return bool(match and match.group(1) == video_id)
 
+    def destination_matches(path: Path) -> bool:
+        """Trust a state entry only when its destination identifies this video."""
+        try:
+            raw = path.read_text(encoding="utf-8-sig")
+        except (OSError, UnicodeError):
+            return False
+        sections = raw.split("---", 2)
+        if len(sections) >= 3:
+            match = re.search(r"(?m)^vid:\s*['\"]?([^\s'\"]+)['\"]?\s*$", sections[1])
+            if match:
+                return match.group(1) == video_id
+        return filename_matches(path.name)
+
     try:
         from scripts.drive_yt_summary.config import load_config as load_drive_config
         from scripts.drive_yt_summary.state import load_state
@@ -313,8 +326,10 @@ def _drive_canonical_relative_path(video_id: str, config: dict, base_path: str) 
         state = load_state(drive_config.state_path)
         for rel, entry in sorted(state.files.items()):
             if (filename_matches(Path(rel).name)
-                    or filename_matches(Path(entry.dest_path).name)) and Path(entry.dest_path).is_file():
-                return entry.relative_path or rel
+                    or filename_matches(Path(entry.dest_path).name)):
+                destination = Path(entry.dest_path)
+                if destination.is_file() and destination_matches(destination):
+                    return entry.relative_path or rel
 
         source_dir = drive_config.source_dir
         if source_dir.is_dir():

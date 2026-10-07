@@ -162,6 +162,33 @@ def test_unknown_rerun_requires_exact_drive_video_identity(tmp_path, monkeypatch
     assert not main._has_drive_canonical_for_video("abcdefghijk", {}, str(tmp_path))
 
 
+def test_drive_state_entry_requires_destination_video_identity(tmp_path, monkeypatch):
+    from scripts.drive_yt_summary import config as drive_config
+    from scripts.drive_yt_summary import state as drive_state
+
+    source = tmp_path / "drive" / "source"
+    source.mkdir(parents=True)
+    note = source / "generic_canonical.md"
+    note.write_text("---\nvid: anothervideo1\n---\nbody\n", encoding="utf-8")
+    entry = SimpleNamespace(
+        dest_path=note,
+        relative_path="canonical/abcdefghijk.md",
+    )
+    fake_config = SimpleNamespace(
+        state_path=tmp_path / "state.json", source_dir=source, sync_root=source.parent,
+    )
+    monkeypatch.setattr(drive_config, "load_config", lambda *_args, **_kwargs: fake_config)
+    monkeypatch.setattr(
+        drive_state, "load_state",
+        lambda _path: SimpleNamespace(files={"abcdefghijk.md": entry}),
+    )
+
+    assert not main._has_drive_canonical_for_video("abcdefghijk", {}, str(tmp_path))
+
+    note.write_text("---\nvid: abcdefghijk\n---\nbody\n", encoding="utf-8")
+    assert main._has_drive_canonical_for_video("abcdefghijk", {}, str(tmp_path))
+
+
 def test_stale_drive_manifest_entry_does_not_count_as_canonical(tmp_path, monkeypatch):
     from scripts.drive_yt_summary import config as drive_config
 
