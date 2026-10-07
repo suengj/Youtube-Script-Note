@@ -153,10 +153,9 @@ def test_never_mirror_keeps_failed_drive_publish_out_of_vault(env, tmp_path, mon
     assert st.is_file()
 
 
-@pytest.mark.parametrize("frontmatter", ["channel: BroMath\n", "tags:\n  - bromath\n"])
-def test_bromath_staging_retry_never_mirrors_after_drive_failure(env, tmp_path, monkeypatch, frontmatter):
+def test_bromath_channel_staging_retry_never_mirrors_after_drive_failure(env, tmp_path, monkeypatch):
     monkeypatch.delenv("P03_SELECTIVE_MIRROR", raising=False)
-    bromath = f"---\n{frontmatter}---\n\n# Legacy note\n"
+    bromath = "---\nchannel: BroMath\n---\n\n# Legacy note\n"
     st = env.stage(content=bromath, rel="2026_10_06/bromath_abcdefghijk.md")
     first = publish_final_md(
         rel_path="2026_10_06/bromath_abcdefghijk.md", content=bromath, staging_path=str(st),
@@ -173,6 +172,20 @@ def test_bromath_staging_retry_never_mirrors_after_drive_failure(env, tmp_path, 
     assert [result.drive_action for result in retried] == ["failed"]
     assert list(env.vault.rglob("*.md")) == []
     assert st.is_file() and marker.is_file()
+
+
+def test_bromath_tag_alone_does_not_suppress_staging_retry_mirror(env, tmp_path, monkeypatch):
+    monkeypatch.delenv("P03_SELECTIVE_MIRROR", raising=False)
+    tagged = "---\ntitle: Imported\ntags:\n  - bromath\n---\n\n# Legacy note\n"
+    st = env.stage(content=tagged, rel="2026_10_06/tagged_abcdefghijk.md")
+    assert not st.with_name(st.name + ".never_mirror").exists()
+    retried = flush_staging(
+        md_root=str(env.vault), base_path=str(env.base), work_path=str(env.work),
+        sync_root=str(tmp_path / "still_missing" / "YT_summary"),
+    )
+    assert [result.drive_action for result in retried] == ["failed"]
+    assert retried[0].mirror_action == "mirrored"
+    assert (env.vault / "2026_10_06/tagged_abcdefghijk.md").is_file()
 
 
 def test_staging_retry_honors_persisted_never_mirror_marker(env, tmp_path, monkeypatch):

@@ -145,10 +145,7 @@ def _is_bromath_note(content: str) -> bool:
         return False
     frontmatter = parts[1]
     channel = re.search(r"(?im)^channel:\s*['\"]?([^\s'\"]+)", frontmatter)
-    if channel and channel.group(1).casefold() == "bromath":
-        return True
-    tags = re.search(r"(?ims)^tags:\s*(.*?)(?=^[A-Za-z_][\w-]*:|\Z)", frontmatter)
-    return bool(tags and re.search(r"(?i)(?:^|[\s,\[\]-])bromath(?:$|[\s,\]])", tags.group(1)))
+    return bool(channel and channel.group(1) == "BroMath")
 
 
 def publish_final_md(
@@ -178,7 +175,7 @@ def publish_final_md(
         try:
             _never_mirror_marker(Path(staging_path)).write_text("never_mirror\n", encoding="utf-8")
         except OSError:
-            # BroMath frontmatter is also checked when retrying staged content.
+            # Exact BroMath frontmatter is also checked when retrying staged content.
             pass
 
     try:

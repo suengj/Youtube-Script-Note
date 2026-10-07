@@ -98,20 +98,31 @@ def test_empty_cursor_backfill_flag_defaults_off(tmp_path, monkeypatch):
 
 
 def test_durable_transcript_reuse_and_channel_extra_tags(tmp_path, monkeypatch):
-    transcript = tmp_path / "title_videoid12345_full.txt"
+    transcript = tmp_path / "title+vid-abcdefghijk.txt"
     transcript.write_text("\ufeffdurable words", encoding="utf-8")
-    monkeypatch.setattr(main, "find_durable_full_transcript", lambda root, vid: str(transcript) if vid == "videoid12345" else None)
-    assert main._read_durable_full_transcript(str(tmp_path), "videoid12345") == (str(transcript), "durable words")
+    assert main._read_durable_full_transcript(str(tmp_path), "abcdefghijk") == (str(transcript), "durable words")
     assert main._read_durable_full_transcript(str(tmp_path), "differentid1") == (None, None)
     monkeypatch.setenv("P03_CHANNEL_EXTRA_TAGS", "BroMath:bromath;Other:finance")
     assert main._channel_extra_tags("BroMath") == ["bromath"]
     assert main._channel_extra_tags("other") == ["finance"]
 
 
+def test_durable_transcript_reuse_requires_exact_parsed_video_id(tmp_path):
+    wrong = tmp_path / "title_prefixabcdefghijk_full.txt"
+    wrong.write_text("wrong video transcript", encoding="utf-8")
+    overlong = tmp_path / "title+vid-abcdefghijkextra.txt"
+    overlong.write_text("wrong video transcript", encoding="utf-8")
+    assert main._find_exact_durable_full_transcript(str(tmp_path), "abcdefghijk") is None
+
+    exact = tmp_path / "title.m4a+vid-abcdefghijk_full.txt"
+    exact.write_text("exact video transcript", encoding="utf-8")
+    assert main._find_exact_durable_full_transcript(str(tmp_path), "abcdefghijk") == str(exact)
+
+
 def test_unreadable_durable_transcript_is_reported_as_present(tmp_path, monkeypatch):
-    transcript = tmp_path / "title_abcdefghijk_full.txt"
+    transcript = tmp_path / "title+vid-abcdefghijk.txt"
     transcript.write_bytes(b"valid prefix \xff invalid utf8")
-    monkeypatch.setattr(main, "find_durable_full_transcript", lambda *_: str(transcript))
+    monkeypatch.setattr(main, "_find_exact_durable_full_transcript", lambda *_: str(transcript))
     path, text = main._read_durable_full_transcript(str(tmp_path), "abcdefghijk")
     assert path == str(transcript) and text is None
 
@@ -153,7 +164,7 @@ def test_unknown_rerun_requires_exact_drive_video_identity(tmp_path, monkeypatch
 
 def test_processed_video_dedupes_before_reading_damaged_transcript(tmp_path, monkeypatch):
     monkeypatch.setattr(main.stt, "extract_youtube_id", lambda _url: "abcdefghijk")
-    monkeypatch.setattr(main, "find_durable_full_transcript", lambda *_: str(tmp_path / "damaged.txt"))
+    monkeypatch.setattr(main, "_find_exact_durable_full_transcript", lambda *_: str(tmp_path / "damaged.txt"))
     monkeypatch.setattr(main, "_read_durable_full_transcript", lambda *_: pytest.fail("must dedupe before transcript read"))
     transcript = tmp_path / "damaged.txt"
     transcript.write_bytes(b"old transcript \xff")

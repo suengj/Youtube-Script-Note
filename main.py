@@ -14,6 +14,7 @@ import random
 import logging
 import json
 import hashlib
+import glob
 from datetime import datetime
 from pathlib import Path
 from dataclasses import dataclass
@@ -57,7 +58,6 @@ import run_lock
 from job_workspace import VideoJobWorkspace, cleanup_stale_jobs
 from transcript_cache import (
     TranscriptCache,
-    find_durable_full_transcript,
     should_write_transcript_cache,
 )
 from scripts.note_catalog_utils import extract_vid_from_filename
@@ -356,9 +356,29 @@ def _has_drive_canonical_for_video(video_id: str, config: dict, base_path: str) 
     return _drive_canonical_relative_path(video_id, config, base_path) is not None
 
 
+def _find_exact_durable_full_transcript(output_full_path: str, video_id: str) -> Optional[str]:
+    """Find a durable transcript whose parsed filename video ID matches exactly."""
+    if not output_full_path or not video_id or not os.path.isdir(output_full_path):
+        return None
+    for path in sorted(glob.glob(os.path.join(output_full_path, f"*{video_id}*.txt"))):
+        if not os.path.isfile(path) or os.path.getsize(path) <= 0:
+            continue
+        name = os.path.basename(path)
+        if "+vid-" in name:
+            exact_segment = re.search(
+                rf"\+vid-{re.escape(video_id)}(?:_full)?\.txt$", name
+            )
+            parsed_video_id = video_id if exact_segment else None
+        else:
+            parsed_video_id = extract_vid_from_filename(name)
+        if parsed_video_id == video_id:
+            return path
+    return None
+
+
 def _read_durable_full_transcript(output_full_path: str, video_id: str) -> tuple[Optional[str], Optional[str]]:
     """Return path and readable non-empty text; a present but unreadable file returns its path."""
-    path = find_durable_full_transcript(output_full_path, video_id or "") if video_id else None
+    path = _find_exact_durable_full_transcript(output_full_path, video_id or "") if video_id else None
     if not path or not os.path.isfile(path):
         return None, None
     try:
@@ -1146,7 +1166,7 @@ def process_single_video(
     # Decide terminal dedupe outcomes before opening any durable transcript. A damaged
     # transcript must not change the historical result for an already completed video.
     durable_full_path: Optional[str] = (
-        find_durable_full_transcript(output_full_path, video_id) if video_id else None
+        _find_exact_durable_full_transcript(output_full_path, video_id) if video_id else None
     )
     _terminal_skip_statuses = frozenset({
         "passed_shorts", "live_scheduled", "video_unavailable",
@@ -1334,7 +1354,7 @@ def process_single_video(
                     logger.info(f"  Full transcription saved: {full_txt_path}")
                     durable_full_path = full_txt_path
                 else:
-                    durable_full_path = find_durable_full_transcript(output_full_path, video_id or "")
+                    durable_full_path = _find_exact_durable_full_transcript(output_full_path, video_id or "")
                 if should_write_transcript_cache(
                     enabled=bool(config.get('TRANSCRIPT_CACHE_ENABLED', True)),
                     durable_full_path=durable_full_path,
