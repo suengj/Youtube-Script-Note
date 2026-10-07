@@ -800,7 +800,11 @@ def build_queue_and_get_candidates(
     backfill = bool(config.get("CHANNEL_BACKFILL") or False)
     start_date_s = (config.get("CHANNEL_START_DATE") or "").strip()
     end_date_s = (config.get("CHANNEL_END_DATE") or "").strip()
-    empty_cursor_backfill = os.getenv("P03_CHANNEL_EMPTY_CURSOR_BACKFILL", "").strip() == "1"
+    empty_cursor_backfill = {
+        channel_id.strip()
+        for channel_id in os.getenv("P03_CHANNEL_EMPTY_CURSOR_BACKFILL", "").split(",")
+        if channel_id.strip()
+    }
     if backfill and not end_date_s:
         raise ValueError("CHANNEL_BACKFILL=true requires CHANNEL_END_DATE to be set.")
 
@@ -844,7 +848,9 @@ def build_queue_and_get_candidates(
         if ch_url:
             logger.info("channel_crawl:   source channel_url=%s", ch_url)
 
-        channel_empty_backfill = empty_cursor_backfill and not last_discovered_s and not last_processed_s
+        channel_empty_backfill = (
+            cid in empty_cursor_backfill and not last_discovered_s and not last_processed_s
+        )
         if not backfill and not channel_empty_backfill and not last_discovered_s and not last_processed_s:
             logger.warning(
                 "channel_df: last_processed_published_at/last_discovered_published_at is required when CHANNEL_BACKFILL is false; "

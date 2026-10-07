@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import re
 import threading
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -133,6 +134,23 @@ def _mirror_to_vault(md_root: str, rel: str, content: str) -> tuple:
     return "mirrored", str(dest)
 
 
+def _never_mirror_marker(path: Path) -> Path:
+    return path.with_name(path.name + ".never_mirror")
+
+
+def _is_bromath_note(content: str) -> bool:
+    """Recognize BroMath frontmatter on staged legacy notes."""
+    parts = content.split("---", 2)
+    if len(parts) < 3:
+        return False
+    frontmatter = parts[1]
+    channel = re.search(r"(?im)^channel:\s*['\"]?([^\s'\"]+)", frontmatter)
+    if channel and channel.group(1).casefold() == "bromath":
+        return True
+    tags = re.search(r"(?ims)^tags:\s*(.*?)(?=^[A-Za-z_][\w-]*:|\Z)", frontmatter)
+    return bool(tags and re.search(r"(?i)(?:^|[\s,\[\]-])bromath(?:$|[\s,\]])", tags.group(1)))
+
+
 def publish_final_md(
     *,
     rel_path: str,
@@ -155,6 +173,13 @@ def publish_final_md(
     result = PublishResult()
     drive_name = Path(rel_path).name
     disabled = False
+
+    if never_mirror and staging_path:
+        try:
+            _never_mirror_marker(Path(staging_path)).write_text("never_mirror\n", encoding="utf-8")
+        except OSError:
+            # BroMath frontmatter is also checked when retrying staged content.
+            pass
 
     try:
         config = load_config(base_path, work_path, md_root, sync_root=sync_root)
@@ -188,6 +213,7 @@ def publish_final_md(
     if safe_to_drop and staging_path:
         try:
             Path(staging_path).unlink(missing_ok=True)
+            _never_mirror_marker(Path(staging_path)).unlink(missing_ok=True)
             result.staging_retained = False
         except OSError:
             pass
@@ -210,10 +236,12 @@ def flush_staging(
         except OSError:
             continue
         rel = path.relative_to(root).as_posix()
+        never_mirror = _never_mirror_marker(path).is_file() or _is_bromath_note(content)
         out.append(
             publish_final_md(
                 rel_path=rel, content=content, staging_path=str(path), md_root=md_root,
                 mirror=False, base_path=base_path, work_path=work_path, sync_root=sync_root,
+                never_mirror=never_mirror,
             )
         )
     return out

@@ -52,7 +52,7 @@ if sys.stderr.encoding != 'utf-8':
 
 import stt_function_v3 as stt
 import channel_crawl
-from filename_utils import fit_filename, validate_llm_suffix
+from filename_utils import fit_filename, parse_note_name, validate_llm_suffix
 import run_lock
 from job_workspace import VideoJobWorkspace, cleanup_stale_jobs
 from transcript_cache import (
@@ -60,6 +60,7 @@ from transcript_cache import (
     find_durable_full_transcript,
     should_write_transcript_cache,
 )
+from scripts.note_catalog_utils import extract_vid_from_filename
 from subtitle_lifecycle import (
     cleanup_expired_quarantine,
     delete_subtitle_file,
@@ -279,9 +280,27 @@ def _channel_extra_tags(usage_channel: str) -> list[str]:
 
 
 def _drive_canonical_relative_path(video_id: str, config: dict, base_path: str) -> Optional[str]:
-    """Find an existing Drive note by ledger identity, filename, or frontmatter vid."""
+    """Find a Drive note only by exact frontmatter or parsed filename identity."""
     if not video_id:
         return None
+
+    def filename_matches(name: str) -> bool:
+        parsed = parse_note_name(name)
+        if parsed is not None:
+            return parsed.video_id == video_id
+        return extract_vid_from_filename(name) == video_id
+
+    def frontmatter_matches(path: Path) -> bool:
+        try:
+            raw = path.read_text(encoding="utf-8-sig")
+        except (OSError, UnicodeError):
+            return False
+        sections = raw.split("---", 2)
+        if len(sections) < 3:
+            return False
+        match = re.search(r"(?m)^vid:\s*['\"]?([^\s'\"]+)['\"]?\s*$", sections[1])
+        return bool(match and match.group(1) == video_id)
+
     try:
         from scripts.drive_yt_summary.config import load_config as load_drive_config
         from scripts.drive_yt_summary.state import load_state
@@ -293,31 +312,24 @@ def _drive_canonical_relative_path(video_id: str, config: dict, base_path: str) 
         )
         state = load_state(drive_config.state_path)
         for rel, entry in sorted(state.files.items()):
-            if (video_id in entry.video_id or video_id in Path(rel).name
-                    or video_id in Path(entry.dest_path).name) and Path(entry.dest_path).is_file():
+            if (filename_matches(Path(rel).name)
+                    or filename_matches(Path(entry.dest_path).name)) and Path(entry.dest_path).is_file():
                 return entry.relative_path or rel
 
         source_dir = drive_config.source_dir
         if source_dir.is_dir():
             for path in sorted(source_dir.glob("*.md")):
-                if video_id in path.name:
+                if filename_matches(path.name):
                     # Recover the original relative path from the manifest/state when possible.
                     for rel, entry in sorted(state.files.items()):
                         if Path(entry.dest_path) == path:
                             return entry.relative_path or rel
                     return f"canonical/{path.name}"
-                try:
-                    raw = path.read_text(encoding="utf-8-sig")
-                except (OSError, UnicodeError):
-                    continue
-                frontmatter = raw.split("---", 2)
-                if len(frontmatter) >= 3:
-                    match = re.search(r"(?m)^vid:\s*['\"]?([^\s'\"]+)", frontmatter[1])
-                    if match and video_id in match.group(1):
-                        for rel, entry in sorted(state.files.items()):
-                            if Path(entry.dest_path) == path:
-                                return entry.relative_path or rel
-                        return f"canonical/{path.name}"
+                if frontmatter_matches(path):
+                    for rel, entry in sorted(state.files.items()):
+                        if Path(entry.dest_path) == path:
+                            return entry.relative_path or rel
+                    return f"canonical/{path.name}"
 
         # A manifest can outlive a missing state entry. Match its video_id/file pair,
         # then recover the relative path from state if it is still present there.
@@ -327,7 +339,7 @@ def _drive_canonical_relative_path(video_id: str, config: dict, base_path: str) 
                 import yaml
                 items = yaml.safe_load(manifest.read_text(encoding="utf-8")) or {}
                 for item in items.get("items", []):
-                    if video_id in str(item.get("video_id", "")) or video_id in str(item.get("file", "")):
+                    if filename_matches(str(item.get("file", ""))):
                         name = str(item.get("file", ""))
                         for rel, entry in sorted(state.files.items()):
                             if entry.drive_name == name or Path(entry.dest_path).name == name:
@@ -1131,6 +1143,46 @@ def process_single_video(
     work_path = config.get('WORK_PATH') or base_path
     transcript_cache = _build_transcript_cache(config)
 
+    # Decide terminal dedupe outcomes before opening any durable transcript. A damaged
+    # transcript must not change the historical result for an already completed video.
+    durable_full_path: Optional[str] = (
+        find_durable_full_transcript(output_full_path, video_id) if video_id else None
+    )
+    _terminal_skip_statuses = frozenset({
+        "passed_shorts", "live_scheduled", "video_unavailable",
+        "skipped_auto_subs_only", "oversized_file",
+    })
+    _retryable_statuses = frozenset({
+        "download_failed", "api_error", "file_error", "mlx_error", "error",
+    })
+    if 'v_id' in output_df.columns and len(output_df) > 0:
+        prior = output_df[output_df['v_id'] == video_id]
+        if len(prior) > 0:
+            if (prior['status'] == 'success').any():
+                logger.info("[STEP 2/5] ✓ Video already processed with status: success")
+                clear_video_context()
+                return _vr("already_existed", video_id, None, stage="dedupe")
+            latest_status = str(prior.iloc[-1]['status'])
+            if latest_status in _retryable_statuses:
+                logger.info(f"[STEP 2/5] Retrying prior failed video (status: {latest_status})")
+            elif latest_status == "already_existed" and (prior['status'] == 'download_failed').any():
+                logger.info("[STEP 2/5] Retrying video previously skipped after download_failed")
+            elif latest_status in _terminal_skip_statuses or latest_status in (
+                "already_existed", "unknown"
+            ):
+                if _should_retry_unknown_with_transcript(
+                    latest_status, durable_full_path, video_id, config, base_path
+                ):
+                    logger.info(
+                        "[STEP 2/5] Retrying unknown output status because durable transcript exists and no Drive canonical is recorded"
+                    )
+                else:
+                    logger.info(f"[STEP 2/5] ✓ Video already processed with status: {latest_status}")
+                    clear_video_context()
+                    return _vr("already_existed", video_id, None, stage="dedupe")
+            else:
+                logger.info(f"[STEP 2/5] Retrying video with prior status: {latest_status}")
+
     if video_id and config.get('USE_JOB_WORKSPACE', True):
         job_workspace = VideoJobWorkspace(work_path, video_id)
         job_workspace.ensure()
@@ -1138,7 +1190,6 @@ def process_single_video(
     
     try:
         # Reuse an existing durable full transcript before attempting any media download.
-        durable_full_path: Optional[str] = None
         reused_transcription: Optional[str] = None
         reused_metadata: dict = {}
         durable_full_path, reused_transcription = _read_durable_full_transcript(output_full_path, video_id or "")
@@ -1239,43 +1290,6 @@ def process_single_video(
                     logger.error(f"  Cause: Network connectivity issue")
             
                 return _vr("download_failed", video_id, error_msg, stage="download")
-        
-        # Step 2: Check if video already processed (retry transient failures)
-        logger.info(f"[STEP 2/5] Checking if video already processed: {video_id}")
-        _terminal_skip_statuses = frozenset({
-            "passed_shorts", "live_scheduled", "video_unavailable",
-            "skipped_auto_subs_only", "oversized_file",
-        })
-        _retryable_statuses = frozenset({
-            "download_failed", "api_error", "file_error", "mlx_error", "error",
-        })
-        if 'v_id' in output_df.columns and len(output_df) > 0:
-            prior = output_df[output_df['v_id'] == video_id]
-            if len(prior) > 0:
-                if (prior['status'] == 'success').any():
-                    logger.info("[STEP 2/5] ✓ Video already processed with status: success")
-                    return _vr("already_existed", video_id, None, stage="dedupe")
-                latest_status = str(prior.iloc[-1]['status'])
-                if latest_status in _retryable_statuses:
-                    logger.info(f"[STEP 2/5] Retrying prior failed video (status: {latest_status})")
-                elif latest_status == "already_existed" and (prior['status'] == 'download_failed').any():
-                    logger.info(
-                        "[STEP 2/5] Retrying video previously skipped after download_failed"
-                    )
-                elif latest_status in _terminal_skip_statuses or latest_status in (
-                    "already_existed", "unknown"
-                ):
-                    if _should_retry_unknown_with_transcript(
-                        latest_status, durable_full_path, video_id, config, base_path
-                    ):
-                        logger.info(
-                            "[STEP 2/5] Retrying unknown output status because durable transcript exists and no Drive canonical is recorded"
-                        )
-                    else:
-                        logger.info(f"[STEP 2/5] ✓ Video already processed with status: {latest_status}")
-                        return _vr("already_existed", video_id, None, stage="dedupe")
-                else:
-                    logger.info(f"[STEP 2/5] Retrying video with prior status: {latest_status}")
         
         # Step 3: Transcribe (uploader subs → plain text; else Whisper MLX)
         logger.info(f"[STEP 3/5] Starting transcription for video: {video_id}")

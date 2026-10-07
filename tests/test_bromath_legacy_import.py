@@ -28,7 +28,7 @@ def _channel_root(path: Path, channels: list[dict[str, str]]) -> None:
 
 
 def test_empty_cursor_backfill_is_channel_scoped_and_still_filters_shorts(tmp_path, monkeypatch):
-    monkeypatch.setenv("P03_CHANNEL_EMPTY_CURSOR_BACKFILL", "1")
+    monkeypatch.setenv("P03_CHANNEL_EMPTY_CURSOR_BACKFILL", BRO_ID)
     cid2, upload2 = "UC" + "b" * 22, "UU" + "b" * 22
     channels = [
         {"channel_url": "https://www.youtube.com/@bromath_zero", "channel_name": "BroMath",
@@ -62,6 +62,27 @@ def test_empty_cursor_backfill_is_channel_scoped_and_still_filters_shorts(tmp_pa
     assert [row["v_id"] for row in shorts] == ["shortvid001"]
     saved = cc.load_channel_df(str(tmp_path))
     assert all(row["last_discovered_published_at"] for row in saved)
+
+
+def test_empty_cursor_backfill_skips_unlisted_channel(tmp_path, monkeypatch):
+    selected, unlisted = BRO_ID, "UC" + "c" * 22
+    monkeypatch.setenv("P03_CHANNEL_EMPTY_CURSOR_BACKFILL", f" {selected} ")
+    _channel_root(tmp_path, [
+        {"channel_url": "https://www.youtube.com/@selected", "channel_name": "Selected",
+         "channel_id": selected, "uploads_playlist_id": BRO_UPLOADS,
+         "last_processed_published_at": "", "last_discovered_published_at": ""},
+        {"channel_url": f"https://www.youtube.com/channel/{unlisted}", "channel_name": "Unlisted",
+         "channel_id": unlisted, "uploads_playlist_id": "UU" + "c" * 22,
+         "last_processed_published_at": "", "last_discovered_published_at": ""},
+    ])
+    calls = []
+    monkeypatch.setattr(cc, "fetch_channel_via_api", lambda _key, cid, **kwargs: (
+        calls.append((cid, kwargs.get("cursor_dt"))) or ([], "", kwargs.get("uploads_id") or "")
+    ))
+    cc.build_queue_and_get_candidates(
+        str(tmp_path), {"YOUTUBE_API_KEY": "fixture"}, pd.DataFrame(columns=["v_id"])
+    )
+    assert calls == [(selected, None)]
 
 
 def test_empty_cursor_backfill_flag_defaults_off(tmp_path, monkeypatch):
@@ -105,7 +126,7 @@ def test_unreadable_durable_transcript_is_reported_as_present(tmp_path, monkeypa
     assert result.status == "durable_transcript_unreadable"
 
 
-def test_unknown_rerun_detects_drive_source_frontmatter_and_reuses_relative_path(tmp_path, monkeypatch):
+def test_unknown_rerun_requires_exact_drive_video_identity(tmp_path, monkeypatch):
     from scripts.drive_yt_summary import config as drive_config
 
     source = tmp_path / "drive" / "source"
@@ -116,8 +137,34 @@ def test_unknown_rerun_detects_drive_source_frontmatter_and_reuses_relative_path
         state_path=tmp_path / "state.json", source_dir=source, sync_root=source.parent,
     )
     monkeypatch.setattr(drive_config, "load_config", lambda *_args, **_kwargs: fake)
+    assert not main._has_drive_canonical_for_video("abcdefghijk", {}, str(tmp_path))
+    note.write_text("---\nvid: abcdefghijk\n---\nbody\n", encoding="utf-8")
     assert main._has_drive_canonical_for_video("abcdefghijk", {}, str(tmp_path))
     assert main._drive_canonical_relative_path("abcdefghijk", {}, str(tmp_path)) == "canonical/old_date_canonical.md"
+    note.unlink()
+    exact_name = source / "channel_title_abcdefghijk_ko_5-mini.md"
+    exact_name.write_text("body\n", encoding="utf-8")
+    assert main._has_drive_canonical_for_video("abcdefghijk", {}, str(tmp_path))
+    exact_name.unlink()
+    substring_name = source / "channel_title_prefixabcdefghijk_ko_5-mini.md"
+    substring_name.write_text("body\n", encoding="utf-8")
+    assert not main._has_drive_canonical_for_video("abcdefghijk", {}, str(tmp_path))
+
+
+def test_processed_video_dedupes_before_reading_damaged_transcript(tmp_path, monkeypatch):
+    monkeypatch.setattr(main.stt, "extract_youtube_id", lambda _url: "abcdefghijk")
+    monkeypatch.setattr(main, "find_durable_full_transcript", lambda *_: str(tmp_path / "damaged.txt"))
+    monkeypatch.setattr(main, "_read_durable_full_transcript", lambda *_: pytest.fail("must dedupe before transcript read"))
+    transcript = tmp_path / "damaged.txt"
+    transcript.write_bytes(b"old transcript \xff")
+    config = {"WORK_PATH": str(tmp_path), "USE_JOB_WORKSPACE": False, "TRANSCRIPT_CACHE_ENABLED": False}
+    result = main.process_single_video(
+        "https://www.youtube.com/watch?v=abcdefghijk", config, object(), object(),
+        pd.DataFrame([{"v_id": "abcdefghijk", "status": "success"}]),
+        str(tmp_path), str(tmp_path), str(tmp_path), str(tmp_path), str(tmp_path),
+        str(tmp_path), str(tmp_path),
+    )
+    assert result.status == "already_existed" and result.stage == "dedupe"
 
 
 def test_unknown_output_retries_only_with_unpublished_durable_transcript(monkeypatch):

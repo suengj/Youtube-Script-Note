@@ -153,6 +153,48 @@ def test_never_mirror_keeps_failed_drive_publish_out_of_vault(env, tmp_path, mon
     assert st.is_file()
 
 
+@pytest.mark.parametrize("frontmatter", ["channel: BroMath\n", "tags:\n  - bromath\n"])
+def test_bromath_staging_retry_never_mirrors_after_drive_failure(env, tmp_path, monkeypatch, frontmatter):
+    monkeypatch.delenv("P03_SELECTIVE_MIRROR", raising=False)
+    bromath = f"---\n{frontmatter}---\n\n# Legacy note\n"
+    st = env.stage(content=bromath, rel="2026_10_06/bromath_abcdefghijk.md")
+    first = publish_final_md(
+        rel_path="2026_10_06/bromath_abcdefghijk.md", content=bromath, staging_path=str(st),
+        md_root=str(env.vault), mirror=False, base_path=str(env.base), work_path=str(env.work),
+        sync_root=str(tmp_path / "missing" / "YT_summary"), video_id="abcdefghijk",
+        never_mirror=True,
+    )
+    marker = st.with_name(st.name + ".never_mirror")
+    assert first.drive_action == "failed" and marker.is_file()
+    retried = flush_staging(
+        md_root=str(env.vault), base_path=str(env.base), work_path=str(env.work),
+        sync_root=str(tmp_path / "still_missing" / "YT_summary"),
+    )
+    assert [result.drive_action for result in retried] == ["failed"]
+    assert list(env.vault.rglob("*.md")) == []
+    assert st.is_file() and marker.is_file()
+
+
+def test_staging_retry_honors_persisted_never_mirror_marker(env, tmp_path, monkeypatch):
+    monkeypatch.delenv("P03_SELECTIVE_MIRROR", raising=False)
+    rel = "2026_10_06/legacy_import_note.md"
+    st = env.stage(content="---\ntitle: Imported\n---\nbody\n", rel=rel)
+    first = publish_final_md(
+        rel_path=rel, content=st.read_text(encoding="utf-8-sig"), staging_path=str(st),
+        md_root=str(env.vault), mirror=False, base_path=str(env.base), work_path=str(env.work),
+        sync_root=str(tmp_path / "missing" / "YT_summary"), never_mirror=True,
+    )
+    marker = st.with_name(st.name + ".never_mirror")
+    assert first.drive_action == "failed" and marker.is_file()
+    retried = flush_staging(
+        md_root=str(env.vault), base_path=str(env.base), work_path=str(env.work),
+        sync_root=str(tmp_path / "still_missing" / "YT_summary"),
+    )
+    assert [result.drive_action for result in retried] == ["failed"]
+    assert list(env.vault.rglob("*.md")) == []
+    assert marker.is_file()
+
+
 def test_flag_on_unmarked_not_mirrored(env, monkeypatch):
     monkeypatch.setenv("P03_SELECTIVE_MIRROR", "1")
     res, _ = env.run(mirror=False)
