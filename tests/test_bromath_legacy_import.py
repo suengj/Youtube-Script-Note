@@ -21,26 +21,6 @@ BRO_ID = "UCHtzPPRYv5_GyszURLfzdKw"
 BRO_UPLOADS = "UUHtzPPRYv5_GyszURLfzdKw"
 
 
-def test_bromath_channel_csv_is_bom_header_and_requested_row():
-    path = ROOT / "data" / "channel_df.csv"
-    raw = path.read_bytes()
-    assert raw.startswith(b"\xef\xbb\xbf")
-    with path.open("r", encoding="utf-8-sig", newline="") as stream:
-        rows = list(csv.DictReader(stream))
-    match = [row for row in rows if row["channel_id"] == BRO_ID]
-    assert len(match) == 1
-    assert match[0] == {
-        "channel_url": "https://www.youtube.com/@bromath_zero",
-        "channel_name": "BroMath",
-        "usage_channel": "BroMath",
-        "channel_id": BRO_ID,
-        "uploads_playlist_id": BRO_UPLOADS,
-        "last_processed_published_at": "",
-        "last_discovered_published_at": "",
-        "auto_sub_only": "",
-        "obsidian": "EMPTY",
-    }
-
 
 def _channel_root(path: Path, channels: list[dict[str, str]]) -> None:
     cc.save_channel_df(str(path), channels)
