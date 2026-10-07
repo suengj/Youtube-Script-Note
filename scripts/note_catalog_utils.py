@@ -385,6 +385,7 @@ def build_frontmatter_yaml(entry: Dict[str, Any]) -> str:
         "transcript_date",
         "lang",
         "suffix",
+        "source",
         "source_url",
         "title",
         "tldr",

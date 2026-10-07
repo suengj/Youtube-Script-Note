@@ -165,7 +165,6 @@ def import_reconciliation(
             entry["source_url"] = f"https://www.youtube.com/watch?v={video_id}" if video_id else ""
             entry["source"] = "legacy_import"
             content = assemble_mobile_md(entry, body)
-            content = content.replace("---\n", "---\nsource: legacy_import\n", 1)
             root = staging_root(work_path, base_path)
             staging_file = root / rel_path
             staging_file.parent.mkdir(parents=True, exist_ok=True)
@@ -180,6 +179,7 @@ def import_reconciliation(
                 work_path=work_path,
                 video_id=video_id,
                 title=title,
+                never_mirror=True,
             )
             if not published.drive_ok:
                 counts["failed"] += 1

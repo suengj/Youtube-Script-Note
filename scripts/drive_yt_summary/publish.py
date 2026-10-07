@@ -145,6 +145,7 @@ def publish_final_md(
     sync_root: Optional[str] = None,
     video_id: str = "",
     title: str = "",
+    never_mirror: bool = False,
 ) -> PublishResult:
     """Drive write (canonical) then optional vault mirror; neither failure blocks the other.
 
@@ -174,9 +175,9 @@ def publish_final_md(
         result.drive_action = "failed"
         result.errors.append(f"drive: {type(exc).__name__}: {exc}")
 
-    # Mirror all channels unless selective mode is on; always mirror when Drive did not
-    # succeed so an outage never leaves a note only in staging.
-    if mirror or disabled or not selective_mirror_enabled() or not result.drive_ok:
+    # Mirror all channels unless selective mode is on; Drive failures fall back to the
+    # vault unless the caller has explicitly prohibited any vault write.
+    if not never_mirror and (mirror or disabled or not selective_mirror_enabled() or not result.drive_ok):
         try:
             result.mirror_action, result.mirror_path = _mirror_to_vault(md_root, rel_path, content)
         except Exception as exc:

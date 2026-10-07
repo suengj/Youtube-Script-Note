@@ -278,10 +278,10 @@ def _channel_extra_tags(usage_channel: str) -> list[str]:
     return list(dict.fromkeys(tags))
 
 
-def _has_drive_canonical_for_video(video_id: str, config: dict, base_path: str) -> bool:
-    """Read the local Drive sync ledger; a note is canonical only after verified publish."""
+def _drive_canonical_relative_path(video_id: str, config: dict, base_path: str) -> Optional[str]:
+    """Find an existing Drive note by ledger identity, filename, or frontmatter vid."""
     if not video_id:
-        return False
+        return None
     try:
         from scripts.drive_yt_summary.config import load_config as load_drive_config
         from scripts.drive_yt_summary.state import load_state
@@ -292,27 +292,77 @@ def _has_drive_canonical_for_video(video_id: str, config: dict, base_path: str) 
             config.get("OUTPUT_MD_PATH"),
         )
         state = load_state(drive_config.state_path)
-        return any(
-            entry.video_id == video_id and Path(entry.dest_path).is_file()
-            for entry in state.files.values()
-        )
+        for rel, entry in sorted(state.files.items()):
+            if (video_id in entry.video_id or video_id in Path(rel).name
+                    or video_id in Path(entry.dest_path).name) and Path(entry.dest_path).is_file():
+                return entry.relative_path or rel
+
+        source_dir = drive_config.source_dir
+        if source_dir.is_dir():
+            for path in sorted(source_dir.glob("*.md")):
+                if video_id in path.name:
+                    # Recover the original relative path from the manifest/state when possible.
+                    for rel, entry in sorted(state.files.items()):
+                        if Path(entry.dest_path) == path:
+                            return entry.relative_path or rel
+                    return f"canonical/{path.name}"
+                try:
+                    raw = path.read_text(encoding="utf-8-sig")
+                except (OSError, UnicodeError):
+                    continue
+                frontmatter = raw.split("---", 2)
+                if len(frontmatter) >= 3:
+                    match = re.search(r"(?m)^vid:\s*['\"]?([^\s'\"]+)", frontmatter[1])
+                    if match and video_id in match.group(1):
+                        for rel, entry in sorted(state.files.items()):
+                            if Path(entry.dest_path) == path:
+                                return entry.relative_path or rel
+                        return f"canonical/{path.name}"
+
+        # A manifest can outlive a missing state entry. Match its video_id/file pair,
+        # then recover the relative path from state if it is still present there.
+        manifest = drive_config.sync_root / "manifest.yaml"
+        if manifest.is_file():
+            try:
+                import yaml
+                items = yaml.safe_load(manifest.read_text(encoding="utf-8")) or {}
+                for item in items.get("items", []):
+                    if video_id in str(item.get("video_id", "")) or video_id in str(item.get("file", "")):
+                        name = str(item.get("file", ""))
+                        for rel, entry in sorted(state.files.items()):
+                            if entry.drive_name == name or Path(entry.dest_path).name == name:
+                                return entry.relative_path or rel
+                        return f"canonical/{name}"
+            except Exception:
+                pass
     except Exception:
-        return False
+        return None
+    return None
+
+
+def _has_drive_canonical_for_video(video_id: str, config: dict, base_path: str) -> bool:
+    return _drive_canonical_relative_path(video_id, config, base_path) is not None
 
 
 def _read_durable_full_transcript(output_full_path: str, video_id: str) -> tuple[Optional[str], Optional[str]]:
-    """Return (path, non-empty text) for the durable transcript matching this video ID."""
+    """Return path and readable non-empty text; a present but unreadable file returns its path."""
     path = find_durable_full_transcript(output_full_path, video_id or "") if video_id else None
     if not path or not os.path.isfile(path):
         return None, None
     try:
         if os.path.getsize(path) <= 0:
-            return None, None
-        with open(path, "r", encoding="utf-8-sig") as transcript_file:
-            text = transcript_file.read()
-        return (path, text) if text.strip() else (None, None)
-    except (OSError, UnicodeError):
-        return None, None
+            return path, None
+        try:
+            with open(path, "r", encoding="utf-8-sig") as transcript_file:
+                text = transcript_file.read()
+        except UnicodeError:
+            with open(path, "r", encoding="utf-8") as transcript_file:
+                text = transcript_file.read()
+        return (path, text) if text.strip() else (path, None)
+    except OSError:
+        return path, None
+    except UnicodeError:
+        return path, None
 
 
 def _should_retry_unknown_with_transcript(
@@ -1092,6 +1142,8 @@ def process_single_video(
         reused_transcription: Optional[str] = None
         reused_metadata: dict = {}
         durable_full_path, reused_transcription = _read_durable_full_transcript(output_full_path, video_id or "")
+        if durable_full_path and reused_transcription is None:
+            return _vr("durable_transcript_unreadable", video_id, "durable full transcript exists but cannot be read as UTF-8", stage="transcript_reuse")
         if reused_transcription is not None:
             try:
                 from youtube_api_metadata import fetch_video_metadata_batch, get_api_key
@@ -1562,6 +1614,12 @@ def process_single_video(
                 protect_prefix=f"{channel_prefix}_" if channel_prefix else "",
             )
             date_folder = v_date.replace("-", "_")  # 2026-01-28 -> 2026_01_28
+            existing_canonical = _drive_canonical_relative_path(video_id or "", config, base_path)
+            if existing_canonical:
+                existing_parts = Path(existing_canonical).parts
+                if len(existing_parts) > 1:
+                    date_folder = existing_parts[0]
+                output_file = Path(existing_canonical).name
             date_dir = os.path.join(output_md_path, date_folder)
             md_file_path = os.path.join(date_dir, output_file)  # vault path (mirror target only)
 
@@ -1620,6 +1678,7 @@ def process_single_video(
                 work_path=work_path_cfg,
                 video_id=video_id or "",
                 title=title,
+                never_mirror=(str(ch_raw).strip().casefold() == "bromath"),
             )
             for err in pub.errors:
                 logger.error("Final markdown publish issue (%s): %s", rel_md, err)

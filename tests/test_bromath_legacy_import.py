@@ -3,6 +3,7 @@ from __future__ import annotations
 import csv
 import hashlib
 import json
+from types import SimpleNamespace
 import sys
 from pathlib import Path
 
@@ -86,6 +87,39 @@ def test_durable_transcript_reuse_and_channel_extra_tags(tmp_path, monkeypatch):
     assert main._channel_extra_tags("other") == ["finance"]
 
 
+def test_unreadable_durable_transcript_is_reported_as_present(tmp_path, monkeypatch):
+    transcript = tmp_path / "title_abcdefghijk_full.txt"
+    transcript.write_bytes(b"valid prefix \xff invalid utf8")
+    monkeypatch.setattr(main, "find_durable_full_transcript", lambda *_: str(transcript))
+    path, text = main._read_durable_full_transcript(str(tmp_path), "abcdefghijk")
+    assert path == str(transcript) and text is None
+
+    monkeypatch.setattr(main.stt, "extract_youtube_id", lambda _url: "abcdefghijk")
+    monkeypatch.setattr(main.stt, "yt_downloader", lambda **_kwargs: pytest.fail("must not download when durable transcript is unreadable"))
+    config = {"WORK_PATH": str(tmp_path), "USE_JOB_WORKSPACE": False, "TRANSCRIPT_CACHE_ENABLED": False}
+    result = main.process_single_video(
+        "https://www.youtube.com/watch?v=abcdefghijk", config, object(), object(),
+        pd.DataFrame(columns=["v_id", "status"]), str(tmp_path), str(tmp_path),
+        str(tmp_path), str(tmp_path), str(tmp_path), str(tmp_path), str(tmp_path),
+    )
+    assert result.status == "durable_transcript_unreadable"
+
+
+def test_unknown_rerun_detects_drive_source_frontmatter_and_reuses_relative_path(tmp_path, monkeypatch):
+    from scripts.drive_yt_summary import config as drive_config
+
+    source = tmp_path / "drive" / "source"
+    source.mkdir(parents=True)
+    note = source / "old_date_canonical.md"
+    note.write_text("---\nvid: prefixabcdefghijksuffix\n---\nbody\n", encoding="utf-8")
+    fake = SimpleNamespace(
+        state_path=tmp_path / "state.json", source_dir=source, sync_root=source.parent,
+    )
+    monkeypatch.setattr(drive_config, "load_config", lambda *_args, **_kwargs: fake)
+    assert main._has_drive_canonical_for_video("abcdefghijk", {}, str(tmp_path))
+    assert main._drive_canonical_relative_path("abcdefghijk", {}, str(tmp_path)) == "canonical/old_date_canonical.md"
+
+
 def test_unknown_output_retries_only_with_unpublished_durable_transcript(monkeypatch):
     monkeypatch.setattr(main, "_has_drive_canonical_for_video", lambda *_: False)
     assert main._should_retry_unknown_with_transcript("unknown", "/full/a.txt", "abcdefghijk", {}, ".")
@@ -139,6 +173,9 @@ def test_legacy_import_hash_state_frontmatter_jev_and_dry_run(tmp_path, monkeypa
     assert [call[1] for call in summary_calls] == ["", "abcdefghijk"]
     assert all(call["mirror"] is False for call in published)
     unmatched_md, matched_md = [call["content"] for call in published]
+    assert all(call["never_mirror"] is True for call in published)
+    assert unmatched_md.split("---", 2)[1].count("source:") == 1
+    assert matched_md.split("---", 2)[1].count("source:") == 1
     assert "source: legacy_import" in unmatched_md and "tags:\n- bromath" in unmatched_md
     with pytest.raises(UnresolvedSource):
         resolve_identity(unmatched_md.encode())
