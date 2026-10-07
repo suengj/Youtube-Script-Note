@@ -186,8 +186,11 @@ def test_unpublished_requeue_preserves_retry_limit_and_output_outcomes():
         pd.DataFrame(rows), output, {BRO_ID}, lambda _vid: False, max_retries=2
     ).set_index("video_id")
 
-    assert reconciled.at["atmaxvideo01", "status"] == "queued"
+    assert reconciled.at["atmaxvideo01", "status"] == "failed"
+    assert reconciled.at["atmaxvideo01", "last_error"] == "requeue_retry_limit"
     assert reconciled.at["atmaxvideo01", "retry_count"] == 2
+    candidates = cc.select_process_candidates(reconciled.reset_index(), max_retries=2)
+    assert "atmaxvideo01" not in candidates["video_id"].tolist()
     assert reconciled.at["apierrorvid01", "status"] == "failed"
     assert reconciled.at["apierrorvid01", "last_error"] == "api_error"
     assert reconciled.at["skippedvideo1", "status"] == "done"

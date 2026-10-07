@@ -492,7 +492,11 @@ def reconcile_queue_with_output_df(
         ):
             retry_count = pd.to_numeric(q.at[idx, "retry_count"], errors="coerce") if "retry_count" in q.columns else 0
             retry_count = int(retry_count) if pd.notna(retry_count) else 0
-            if str(q.at[idx, "status"]).strip() == "failed" or retry_count >= max_retries:
+            if str(q.at[idx, "status"]).strip() == "failed":
+                continue
+            if retry_count >= max_retries:
+                q.at[idx, "status"] = "failed"
+                q.at[idx, "last_error"] = "requeue_retry_limit"
                 continue
             if has_drive_canonical(vid):
                 q.at[idx, "status"] = "done"
