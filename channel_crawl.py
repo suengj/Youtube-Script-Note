@@ -455,7 +455,9 @@ def save_crawl_queue_df(base_path: str, queue_df) -> None:
             raise
 
 
-def reconcile_queue_with_output_df(queue_df, output_df):
+def reconcile_queue_with_output_df(
+    queue_df, output_df, channel_requeue_unpublished=None, has_drive_canonical=None
+):
     """
     output_df_new.csv 상태를 기준으로 queue 상태를 보정.
     """
@@ -480,6 +482,22 @@ def reconcile_queue_with_output_df(queue_df, output_df):
         if not vid or vid not in status_map:
             continue
         st = status_map[vid]
+        channel_id = str(row.get("channel_id", "")).strip()
+        if (
+            channel_id in (channel_requeue_unpublished or set())
+            and st not in DONE_STATUSES
+            and has_drive_canonical is not None
+        ):
+            if has_drive_canonical(vid):
+                q.at[idx, "status"] = "done"
+                if not str(q.at[idx, "done_at"]).strip():
+                    q.at[idx, "done_at"] = now_iso
+                q.at[idx, "last_error"] = ""
+            else:
+                q.at[idx, "status"] = "queued"
+                q.at[idx, "done_at"] = ""
+                q.at[idx, "last_error"] = ""
+            continue
         if st in DONE_STATUSES or st == SHORTS_STATUS or st == LIVE_SCHEDULED_STATUS or st == VIDEO_UNAVAILABLE_STATUS or st == SKIPPED_AUTO_SUBS_ONLY_STATUS:
             q.at[idx, "status"] = "done"
             if not str(q.at[idx, "done_at"]).strip():
@@ -778,6 +796,7 @@ def build_queue_and_get_candidates(
     base_path: str,
     config: dict,
     output_df,
+    has_drive_canonical=None,
 ):
     """
     Channel crawl discovery -> queue persistence -> candidate selection.
@@ -785,17 +804,23 @@ def build_queue_and_get_candidates(
     """
     import pandas as pd
 
+    channel_requeue_unpublished = {
+        channel_id.strip()
+        for channel_id in os.getenv("P03_CHANNEL_REQUEUE_UNPUBLISHED", "").split(",")
+        if channel_id.strip()
+    }
+
     channels = load_channel_df(base_path)
     if not channels:
         logger.info("channel_crawl: no channels loaded from channel_df.csv")
         q = load_crawl_queue_df(base_path)
-        q = reconcile_queue_with_output_df(q, output_df)
+        q = reconcile_queue_with_output_df(q, output_df, channel_requeue_unpublished, has_drive_canonical)
         save_crawl_queue_df(base_path, q)
         return q, select_process_candidates(q, int(config.get("CRAWL_QUEUE_MAX_RETRIES", 3))), []
 
     logger.info("channel_crawl: loaded %d channels from channel_df.csv", len(channels))
     queue_df = load_crawl_queue_df(base_path)
-    queue_df = reconcile_queue_with_output_df(queue_df, output_df)
+    queue_df = reconcile_queue_with_output_df(queue_df, output_df, channel_requeue_unpublished, has_drive_canonical)
 
     backfill = bool(config.get("CHANNEL_BACKFILL") or False)
     start_date_s = (config.get("CHANNEL_START_DATE") or "").strip()
@@ -817,8 +842,14 @@ def build_queue_and_get_candidates(
         raise ValueError("CHANNEL_CRAWL requires YOUTUBE_API_KEY in .env. See docs/YOUTUBE_API_SETUP.md")
 
     done_v_ids = set()
+    output_status_by_vid = {}
     if output_df is not None and hasattr(output_df, "columns") and "v_id" in output_df.columns:
         done_v_ids = set(output_df["v_id"].astype(str).str.strip())
+        if "status" in output_df.columns:
+            statuses = output_df[["v_id", "status"]].copy()
+            statuses["v_id"] = statuses["v_id"].astype(str).str.strip()
+            statuses["status"] = statuses["status"].astype(str).str.strip()
+            output_status_by_vid = dict(zip(statuses["v_id"], statuses["status"]))
 
     queue_video_ids = set()
     if queue_df is not None and len(queue_df) > 0 and "video_id" in queue_df.columns:
@@ -906,7 +937,14 @@ def build_queue_and_get_candidates(
             if not vid:
                 continue
             if vid in done_v_ids:
-                continue
+                retry_unpublished = (
+                    cid in channel_requeue_unpublished
+                    and output_status_by_vid.get(vid, "") not in DONE_STATUSES
+                    and has_drive_canonical is not None
+                    and not has_drive_canonical(vid)
+                )
+                if not retry_unpublished:
+                    continue
             if vid in queue_video_ids:
                 continue
             filtered_entries.append(e)

@@ -279,6 +279,11 @@ def _channel_extra_tags(usage_channel: str) -> list[str]:
     return list(dict.fromkeys(tags))
 
 
+def _tags_with_channel_extras(llm_tags: list[str], usage_channel: str) -> list[str]:
+    """Keep configured channel tags ahead of model tags before frontmatter capping."""
+    return list(dict.fromkeys([*_channel_extra_tags(usage_channel), *llm_tags]))
+
+
 def _drive_canonical_relative_path(video_id: str, config: dict, base_path: str) -> Optional[str]:
     """Find a Drive note only by exact frontmatter or parsed filename identity."""
     if not video_id:
@@ -425,6 +430,20 @@ def _should_retry_unknown_with_transcript(
 ) -> bool:
     return bool(
         status == "unknown" and durable_full_path
+        and not _has_drive_canonical_for_video(video_id, config, base_path)
+    )
+
+
+def _is_requeue_unpublished_video(video_id: str, config: dict, base_path: str) -> bool:
+    channel_id = str(config.get("channel_id") or "").strip()
+    allowed_channels = {
+        item.strip()
+        for item in os.getenv("P03_CHANNEL_REQUEUE_UNPUBLISHED", "").split(",")
+        if item.strip()
+    }
+    return bool(
+        channel_id in allowed_channels
+        and video_id
         and not _has_drive_canonical_for_video(video_id, config, base_path)
     )
 
@@ -1213,7 +1232,14 @@ def process_single_video(
             elif latest_status in _terminal_skip_statuses or latest_status in (
                 "already_existed", "unknown"
             ):
-                if _should_retry_unknown_with_transcript(
+                if (
+                    latest_status == "unknown"
+                    and _is_requeue_unpublished_video(video_id, config, base_path)
+                ):
+                    logger.info(
+                        "[STEP 2/5] Retrying unknown output status for configured channel with no Drive canonical"
+                    )
+                elif _should_retry_unknown_with_transcript(
                     latest_status, durable_full_path, video_id, config, base_path
                 ):
                     logger.info(
@@ -1706,7 +1732,7 @@ def process_single_video(
                 lang=lang,
                 suffix=suffix,
                 source_url=source_url,
-                tags=list(dict.fromkeys([*tags, *_channel_extra_tags(ch_raw)])),
+                tags=_tags_with_channel_extras(tags, ch_raw),
                 title=title,
                 tldr=tldr,
             )
@@ -1899,7 +1925,12 @@ def process_videos(config: dict):
         output_df = load_output_df_only(data_root)
         logger.info("Channel crawl: building persistent queue from channel_df.csv...")
         try:
-            crawl_queue_df, candidate_df, shorts_rows = channel_crawl.build_queue_and_get_candidates(data_root, config, output_df)
+            crawl_queue_df, candidate_df, shorts_rows = channel_crawl.build_queue_and_get_candidates(
+                data_root,
+                config,
+                output_df,
+                has_drive_canonical=lambda vid: _has_drive_canonical_for_video(vid, config, base_path),
+            )
             if shorts_rows:
                 shorts_df = pd.DataFrame(shorts_rows)
                 if len(shorts_df) > 0:
@@ -1995,6 +2026,7 @@ def process_videos(config: dict):
     url_to_default_audio_lang = {}
     url_to_auto_subs_only = {}
     url_to_usage_channel = {}
+    url_to_channel_id = {}
     url_to_obsidian_mirror = {}
     if config.get('CHANNEL_CRAWL') and meta_for_channel_crawl:
         url_to_obsidian_mirror = {
@@ -2019,6 +2051,11 @@ def process_videos(config: dict):
         }
         url_to_usage_channel = {
             str(m.get("url", "")): str(m.get("usage_channel", "")).strip()
+            for m in meta_for_channel_crawl
+            if str(m.get("url", "")).strip()
+        }
+        url_to_channel_id = {
+            str(m.get("url", "")): str(m.get("channel_id", "")).strip()
             for m in meta_for_channel_crawl
             if str(m.get("url", "")).strip()
         }
@@ -2102,6 +2139,8 @@ def process_videos(config: dict):
             video_config["auto_subs_only"] = True
         if url_to_usage_channel and v_url in url_to_usage_channel:
             video_config["usage_channel"] = url_to_usage_channel[v_url]
+        if url_to_channel_id and v_url in url_to_channel_id:
+            video_config["channel_id"] = url_to_channel_id[v_url]
         if v_url in url_from_input_set:
             video_config["from_input"] = True
         return video_config
