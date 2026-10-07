@@ -82,9 +82,11 @@ def fetch_video_metadata_batch(
             vid = str(vid)
             snip = it.get("snippet") or {}
             title = snip.get("title") or ""
+            channel_title = snip.get("channelTitle") or ""
             pub = snip.get("publishedAt") or ""
             result[vid] = {
                 "title": title,
+                "channel_title": channel_title,
                 "upload_date": _parse_published_at(pub),
             }
         if tqdm and hasattr(iterator, "set_postfix"):
