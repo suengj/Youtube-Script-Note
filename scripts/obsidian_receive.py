@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import csv
+import errno
 import hashlib
 import json
 import os
@@ -118,7 +119,7 @@ def _load_ledger(path: Path) -> Dict[str, dict]:
     return raw["files"]
 
 
-def _atomic_write(vault: Path, name: str, data: bytes) -> None:
+def _atomic_write(vault: Path, name: str, data: bytes, *, replace: bool = True) -> bool:
     """Atomic sibling replace using a pinned directory fd (safe from symlink swaps)."""
     if not re.fullmatch(r"[^/\\\x00]+\.md", name) or name in {".md", "..md"} or len(name.encode("utf-8")) > 240:
         raise ReceiveError("Drive returned an unsafe or oversized note name")
@@ -138,8 +139,14 @@ def _atomic_write(vault: Path, name: str, data: bytes) -> None:
                     out.write(data)
                     out.flush()
                     os.fsync(out.fileno())
-                os.replace(temp_name, name, src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
-                return
+                if replace:
+                    os.replace(temp_name, name, src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
+                else:
+                    # A hard link installs the completed sibling atomically and
+                    # fails if any file appeared at the destination meanwhile.
+                    os.link(temp_name, name, src_dir_fd=dir_fd, dst_dir_fd=dir_fd, follow_symlinks=False)
+                    os.unlink(temp_name, dir_fd=dir_fd)
+                return True
             except OSError as exc:
                 if fd >= 0:
                     os.close(fd)
@@ -147,12 +154,27 @@ def _atomic_write(vault: Path, name: str, data: bytes) -> None:
                     os.unlink(temp_name, dir_fd=dir_fd)
                 except OSError:
                     pass
+                if not replace and exc.errno == errno.EEXIST:
+                    return False
                 if exc.errno == 11 and attempt < 2:
                     time.sleep(0.1 * (attempt + 1))
                     continue
                 raise ReceiveError(f"atomic vault write failed: {type(exc).__name__}") from exc
     finally:
         os.close(dir_fd)
+
+
+def _candidate_name(vault: Path, name: str, video_id: str, drive_md5: str, data: bytes) -> str:
+    """Install the candidate at a never-before-used basename, without clobbering races."""
+    stem = name[:-3]
+    suffix = f".update-candidate-{drive_md5[:8]}"
+    number = 1
+    while True:
+        numbered = suffix if number == 1 else f"{suffix}-{number}"
+        target = fit_filename(f"{stem}{numbered}.md", video_id, max_bytes=240)
+        if _atomic_write(vault, target, data, replace=False):
+            return target
+        number += 1
 
 
 def _local_hash(vault: Path, name: str) -> Optional[str]:
@@ -233,9 +255,9 @@ def receive(*, service=None, channel_csv: Optional[Path] = None, vault: Optional
     drive = service or _drive_service()
     result = {"received": 0, "updated": 0, "candidates": 0, "skipped": 0, "errors": 0}
     changed = False
-    considered = 0
+    written = 0
     for item in _list_summaries(drive):
-        if considered >= bound:
+        if written >= bound:
             break
         props = item.get("appProperties")
         if (not isinstance(props, dict) or props.get("p03_kind") != "summary" or
@@ -256,7 +278,6 @@ def receive(*, service=None, channel_csv: Optional[Path] = None, vault: Optional
                 not re.fullmatch(r"[0-9a-f]{32}", md5) or
                 not isinstance(name, str) or props.get("p03_video_id") not in name):
             continue
-        considered += 1
         try:
             old = ledger.get(drive_id)
             if old:
@@ -271,27 +292,27 @@ def receive(*, service=None, channel_csv: Optional[Path] = None, vault: Optional
                     target_name = local_name
                     kind = "updated"
                 else:
-                    target_name = fit_filename(name[:-3] + ".update-candidate.md", props["p03_video_id"], max_bytes=240)
-                    if _local_hash(vault_root, target_name) is not None:
-                        target_name = fit_filename(name[:-3] + ".update-candidate-" + drive_id[:8] + ".md", props["p03_video_id"], max_bytes=240)
                     kind = "candidates"
             else:
                 target_name = name
                 current = _local_hash(vault_root, target_name)
                 if current is not None:
                     # A note not written by this ledger is user-owned from the receiver's perspective.
-                    target_name = fit_filename(name[:-3] + ".update-candidate.md", props["p03_video_id"], max_bytes=240)
                     kind = "candidates"
                 else:
                     kind = "received"
             data = drive.files().get_media(fileId=drive_id).execute()
             if not isinstance(data, bytes) or len(data) > MAX_NOTE_BYTES or hashlib.md5(data).hexdigest() != md5:
                 raise ReceiveError("Drive summary body failed size or MD5 verification")
-            _atomic_write(vault_root, target_name, data)
+            if kind == "candidates":
+                target_name = _candidate_name(vault_root, name, props["p03_video_id"], md5, data)
+            else:
+                _atomic_write(vault_root, target_name, data)
             local_sha = _local_hash(vault_root, target_name)
             if local_sha != _sha(data):
                 raise ReceiveError("vault readback SHA-256 verification failed")
             result[kind] += 1
+            written += 1
             ledger[drive_id] = {"md5": md5, "local_path": target_name, "local_sha256": local_sha}
             changed = True
         except ReceiveError:

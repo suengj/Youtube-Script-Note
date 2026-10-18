@@ -9,4 +9,4 @@ set -a
 source "$P03_RECEIVE_ENV_FILE"
 set +a
 
-exec /opt/homebrew/bin/python3 scripts/obsidian_receive.py
+exec /opt/homebrew/bin/python3 -m scripts.obsidian_receive

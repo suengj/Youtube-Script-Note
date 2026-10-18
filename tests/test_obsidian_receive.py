@@ -3,6 +3,9 @@ from __future__ import annotations
 import csv
 import hashlib
 import json
+import os
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -95,7 +98,49 @@ def test_unchanged_skips_and_user_edit_becomes_update_candidate(tmp_path):
     original.write_bytes(b"user edit\n")
     assert _receive(setup)["candidates"] == 1
     assert original.read_bytes() == b"user edit\n"
-    assert (setup[0] / item["name"].replace(".md", ".update-candidate.md")).read_bytes() == setup[4]["drive-a"]
+    candidate = setup[0] / item["name"].replace(".md", f".update-candidate-{item['md5Checksum'][:8]}.md")
+    assert candidate.read_bytes() == setup[4]["drive-a"]
+
+
+def test_existing_candidate_names_are_preserved_and_next_name_is_used(tmp_path):
+    item = _item("drive-a", CID_A, VID_A, b"# drive-a\n")
+    setup = _setup(tmp_path, [item])
+    assert _receive(setup)["received"] == 1
+    original = setup[0] / item["name"]
+    original.write_bytes(b"user edit\n")
+    first = setup[0] / item["name"].replace(".md", f".update-candidate-{item['md5Checksum'][:8]}.md")
+    second = first.with_name(first.stem + "-2.md")
+    first.write_bytes(b"first user file\n")
+    second.write_bytes(b"second user file\n")
+    assert _receive(setup)["candidates"] == 1
+    assert first.read_bytes() == b"first user file\n"
+    assert second.read_bytes() == b"second user file\n"
+    assert (setup[0] / (first.stem + "-3.md")).read_bytes() == setup[4]["drive-a"]
+
+
+def test_candidate_install_race_uses_next_name_without_replacing_file(tmp_path, monkeypatch):
+    import os
+    from scripts import obsidian_receive as receiver
+
+    item = _item("drive-a", CID_A, VID_A, b"# drive-a\n")
+    setup = _setup(tmp_path, [item])
+    assert _receive(setup)["received"] == 1
+    (setup[0] / item["name"]).write_bytes(b"user edit\n")
+    candidate = setup[0] / item["name"].replace(".md", f".update-candidate-{item['md5Checksum'][:8]}.md")
+    real_link = os.link
+    raced = False
+
+    def link_with_race(src, dst, *args, **kwargs):
+        nonlocal raced
+        if not raced and dst == candidate.name:
+            candidate.write_bytes(b"arrived during install\n")
+            raced = True
+        return real_link(src, dst, *args, **kwargs)
+
+    monkeypatch.setattr(receiver.os, "link", link_with_race)
+    assert _receive(setup)["candidates"] == 1
+    assert candidate.read_bytes() == b"arrived during install\n"
+    assert (setup[0] / candidate.with_name(candidate.stem + "-2.md").name).read_bytes() == setup[4]["drive-a"]
 
 
 def test_drive_revision_updates_owned_note_but_never_deletes(tmp_path):
@@ -126,6 +171,34 @@ def test_bounded_count_and_token_never_appears_in_output(tmp_path, monkeypatch, 
     captured = capsys.readouterr()
     assert "safe refusal" in captured.err
     assert "/secret/token-path" not in captured.out + captured.err
+
+
+def test_bound_progresses_past_unchanged_items(tmp_path):
+    first = _item("drive-a", CID_A, VID_A, b"# unchanged\n")
+    setup = _setup(tmp_path, [first])
+    assert _receive(setup)["received"] == 1
+    second = _item("drive-b", CID_A, VID_B, b"# new note\n")
+    setup[3]._files = _Files([first, second], {"drive-a": first["_body"], "drive-b": second["_body"]})
+    result = _receive(setup, max_count=1)
+    assert result == {"received": 1, "updated": 0, "candidates": 0, "skipped": 1, "errors": 0}
+    assert (setup[0] / second["name"]).read_bytes() == second["_body"]
+
+
+def test_launcher_module_command_runs_in_subprocess_with_fake_environment(tmp_path):
+    repo = Path(__file__).resolve().parents[1]
+    launcher = (repo / "launchd/run-p03-obsidian-receive.sh.example").read_text()
+    assert "python3 -m scripts.obsidian_receive" in launcher
+    channels = tmp_path / "channels.csv"
+    channels.write_text("channel_id,obsidian\n", encoding="utf-8")
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    env = {"PATH": os.environ.get("PATH", ""), "P03_CHANNEL_CSV": str(channels), "OUTPUT_MD_PATH": str(vault),
+           "P03_STATE_DIR": str(tmp_path / "state")}
+    result = subprocess.run([sys.executable, "-m", "scripts.obsidian_receive"], cwd=repo, env=env,
+                            capture_output=True, text=True, timeout=10, check=False)
+    assert result.returncode == 2
+    assert "P03_DRIVE_TOKEN_FILE must point" in result.stderr
+    assert "No module named scripts" not in result.stderr
 
 
 def test_path_symlink_is_refused_and_does_not_touch_target(tmp_path):
