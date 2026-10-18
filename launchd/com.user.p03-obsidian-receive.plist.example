@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.user.p03-obsidian-receive</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/YOU/Library/Application Support/com.user.p03-obsidian-receive/run-p03-obsidian-receive.sh</string>
+    </array>
+    <key>WorkingDirectory</key>
+    <string>/path/to/Youtube-Script-Note</string>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>StartInterval</key>
+    <integer>3600</integer>
+    <key>StandardOutPath</key>
+    <string>/Users/YOU/Library/Logs/p03-obsidian-receive/launchd_stdout.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/YOU/Library/Logs/p03-obsidian-receive/launchd_stderr.log</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>P03_RECEIVE_ENV_FILE</key>
+        <string>/Users/YOU/.config/p03/obsidian-receive.env</string>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+        <key>PYTHONUNBUFFERED</key>
+        <string>1</string>
+    </dict>
+</dict>
+</plist>
