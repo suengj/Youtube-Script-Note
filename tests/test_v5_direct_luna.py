@@ -158,12 +158,10 @@ def test_benchmark_dry_run_writes_twelve_markdown_outputs(tmp_path):
     assert all("format_version: '4.1'" in p.read_text() for p in (out / "outputs").glob("*/*.md"))
 
 
-def test_mlx_loader_does_not_recurse(monkeypatch):
-    import sys, types
+def test_captions_only_stt_has_no_mlx_loader():
     import stt_function_v3 as stt_mod
-    monkeypatch.setattr(stt_mod, "mlx_whisper", None)
-    monkeypatch.setitem(sys.modules, "mlx_whisper", types.SimpleNamespace(transcribe=lambda *a, **k: None))
-    assert stt_mod._load_mlx_whisper() is sys.modules["mlx_whisper"]
+    assert not hasattr(stt_mod, "mlx_whisper")
+    assert not hasattr(stt_mod, "_load_mlx_whisper")
 
 
 def test_cache_write_tokens_not_double_billed():

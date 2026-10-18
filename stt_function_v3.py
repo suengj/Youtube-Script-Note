@@ -1,24 +1,10 @@
 # library
-import os, time, random, json, csv, re, html
+import os, sys, time, random, json, csv, re, html
 import threading
 from datetime import datetime
 import pandas as pd
 from tqdm import tqdm
 from openai import OpenAI
-# MLX initializes native runtime state and can abort on unsupported hosts. Load it
-# only when transcription is actually requested so API-only tools/tests can import STT.
-mlx_whisper = None
-
-
-def _load_mlx_whisper():
-    global mlx_whisper
-    if mlx_whisper is None:
-        try:
-            import mlx_whisper as _mlx_whisper
-            mlx_whisper = _mlx_whisper
-        except ImportError:
-            print("Warning: mlx_whisper 모듈이 설치되지 않았습니다. 'pip install mlx-whisper' 명령으로 설치해주세요.")
-    return mlx_whisper
 import subprocess
 import tiktoken
 from urllib.parse import urlparse, parse_qs
@@ -30,13 +16,6 @@ try:
     YT_DLP_AVAILABLE = True
 except ImportError:
     YT_DLP_AVAILABLE = False
-    try:
-        from pytubefix import YouTube
-        from pytubefix.cli import on_progress
-    except ImportError:
-        YouTube = None
-        on_progress = None
-import moviepy
 
 # Load environment variables from .env file (retry on OSError Errno 11 — often EDEADLK on macOS)
 for _ in range(3):
@@ -48,15 +27,6 @@ for _ in range(3):
             time.sleep(2 * (_ + 1))
             continue
         raise
-
-# Check for yt-dlp availability and warn if not available
-if not YT_DLP_AVAILABLE:
-    import warnings
-    warnings.warn(
-        "yt-dlp is not installed. For better reliability, install it: pip install yt-dlp\n"
-        "Falling back to pytubefix which may have compatibility issues.",
-        UserWarning
-    )
 
 # Last yt-dlp / downloader failure (legacy global; prefer thread-local via get_last_ytdlp_failure_reason)
 _LAST_YTDLP_FAILURE_REASON: str = ""
@@ -414,6 +384,11 @@ def _resolve_youtube_cookies_file(work_path=None):
     return None
 
 
+def _ytdlp_js_runtime_options():
+    runtime = (os.getenv("P03_YTDLP_JS_RUNTIME") or ("/opt/node-v22.23.3/bin/node" if sys.platform.startswith("linux") else "")).strip()
+    return {"js_runtimes": {"node": {"path": runtime}}} if runtime else {}
+
+
 def _clean_subtitle_content_line(line: str) -> str:
     """Clean one subtitle content line (keep spoken text, remove VTT markup/noise)."""
     if not line:
@@ -693,6 +668,7 @@ def _yt_download_subs_only(URL, video_id, subs_path, logger, subs_langs=None, vi
         "user_agent": user_agent,
         "referer": "https://www.youtube.com/",
     }
+    ydl_opts.update(_ytdlp_js_runtime_options())
     if proxy_config:
         proxy_url = proxy_config.get("http") or proxy_config.get("https")
         if proxy_url:
@@ -788,6 +764,7 @@ def _yt_download_auto_subs_only(URL, video_id, subs_path, logger, subs_langs=Non
         "user_agent": user_agent,
         "referer": "https://www.youtube.com/",
     }
+    ydl_opts.update(_ytdlp_js_runtime_options())
     if proxy_config:
         proxy_url = proxy_config.get("http") or proxy_config.get("https")
         if proxy_url:
@@ -841,40 +818,33 @@ def _yt_download_auto_subs_only(URL, video_id, subs_path, logger, subs_langs=Non
     return None
 
 
-# downloaded into m4a type (AUDIO ONLY - no video)
+# Caption-only entry point: audio downloads and ASR are intentionally unsupported.
 def yt_downloader(URL, DOWNLOAD_PATH, ONLY_AUDIO=True, ITAG=139, max_retries=3, config=None):
     """
-    Download YouTube video AUDIO ONLY (no video) with retry logic.
-    Uses yt-dlp if available (more reliable), falls back to pytubefix.
-    When config is provided and uploader subtitles exist, may skip video download
-    (YT_DOWNLOAD_IF_SUBS_Y=False) and return subs path as 7th element.
+    Retrieve YouTube captions only through yt-dlp; never download media or run ASR.
 
     Args:
         URL: YouTube video URL
         DOWNLOAD_PATH: Path to save the audio file
-        ONLY_AUDIO: Whether to download only audio (default: True, always True)
-        ITAG: Stream ITAG (default: 139, not used with yt-dlp)
+        ONLY_AUDIO: Legacy argument, ignored by the captions-only implementation.
+        ITAG: Legacy argument, ignored by the captions-only implementation.
         max_retries: Maximum number of retry attempts (default: 3)
-        config: Optional dict with BASE_PATH, WORK_PATH, YT_DOWNLOAD_IF_SUBS_Y, YOUTUBE_AUTO_SCRIPT, YOUTUBE_SUBS_LANGS for subs optimization
+        config: Optional caption language and workspace settings.
 
     Returns:
-        10-tuple: (audio_path, filename, video_id, video_len, channel_id, channel_url, subs_path, subs_source, subs_lang, channel_name) or None if failed.
+        Captions result tuple or None when no captions can be retrieved.
         subs_source: "uploader" | "auto" | None. subs_lang: language code of subs used (e.g. "en") or None. channel_name: from yt-dlp uploader/channel.
     """
     logger = logging.getLogger(__name__)
     video_id = extract_youtube_id(URL)
     if YT_DLP_AVAILABLE:
         return yt_downloader_ytdlp(URL, DOWNLOAD_PATH, video_id, max_retries, config=config)
-    else:
-        logger.warning("yt-dlp not available, using pytubefix (may have issues)")
-        result = yt_downloader_pytubefix(URL, DOWNLOAD_PATH, video_id, max_retries)
-        if result is not None:
-            return (*result, None, None, None, "", "")
-        return None
+    _set_last_ytdlp_failure("yt-dlp is required for automatic captions")
+    return None
 
 def yt_downloader_ytdlp(URL, DOWNLOAD_PATH, video_id, max_retries=3, config=None):
     """
-    Download AUDIO ONLY using yt-dlp (recommended).
+    Retrieve YouTube captions only using yt-dlp.
     Returns 10-tuple: (audio_path, filename, video_id, video_len, channel_id, channel_url, subs_path, subs_source, subs_lang, channel_name).
     subs_source: "uploader" | "auto" | None. subs_lang: language code or None. channel_name: from yt-dlp uploader/channel.
     """
@@ -882,7 +852,7 @@ def yt_downloader_ytdlp(URL, DOWNLOAD_PATH, video_id, max_retries=3, config=None
     base_path = config.get("BASE_PATH") if config else None
     work_path = config.get("WORK_PATH") if config else None
     yt_download_if_subs_y = config.get("YT_DOWNLOAD_IF_SUBS_Y", True) if config else True
-    use_auto_script = config.get("YOUTUBE_AUTO_SCRIPT", True) if config else True
+    use_auto_script = True if os.getenv("P03_DRIVE_BACKEND", "api" if sys.platform.startswith("linux") else "desktop").strip().lower() == "api" else (config.get("YOUTUBE_AUTO_SCRIPT", True) if config else True)
     subs_langs = _parse_subs_langs(config.get("YOUTUBE_SUBS_LANGS")) if config else _parse_subs_langs(None)
     _set_last_ytdlp_failure("")
     attempt = 0
@@ -895,41 +865,18 @@ def yt_downloader_ytdlp(URL, DOWNLOAD_PATH, video_id, max_retries=3, config=None
                 time.sleep(wait_time)
             proxy_config = get_proxy_config()
             user_agent = get_random_user_agent()
-            downloaded_filename = [None]
-            def progress_hook(d):
-                if d['status'] == 'finished':
-                    downloaded_filename[0] = d.get('filename')
-            files_before = set()
-            if os.path.exists(DOWNLOAD_PATH):
-                files_before = {f for f in os.listdir(DOWNLOAD_PATH)
-                               if os.path.isfile(os.path.join(DOWNLOAD_PATH, f))}
             ydl_opts = {
-                'format': 'bestaudio[abr<=128]/bestaudio[abr<=160]/bestaudio[ext=m4a]/bestaudio[ext=opus]/bestaudio/best',
-                'outtmpl': os.path.join(DOWNLOAD_PATH, '%(title)s.%(ext)s'),
-                'postprocessors': [{
-                    'key': 'FFmpegExtractAudio',
-                    'preferredcodec': 'm4a',
-                    'preferredquality': '128',
-                }],
                 'quiet': True,
                 'no_warnings': True,
                 'noprogress': True,
-                'extract_flat': False,
                 'noplaylist': True,
-                'progress_hooks': [progress_hook],
-                'writesubtitles': False,
-                'writeautomaticsub': False,
+                'skip_download': True,
+                'ignore_no_formats_error': True,
+                'writesubtitles': True,
+                'writeautomaticsub': True,
                 'writethumbnail': False,
-                'keepvideo': False,
-                'nopart': True,
                 'user_agent': user_agent,
                 'referer': 'https://www.youtube.com/',
-                'extractor_args': {
-                    'youtube': {
-                        'player_client': ['android', 'web'],
-                        'player_skip': ['webpage', 'configs'],
-                    }
-                },
                 'http_headers': {
                     'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
                     'Accept-Language': 'en-us,en;q=0.5',
@@ -938,6 +885,7 @@ def yt_downloader_ytdlp(URL, DOWNLOAD_PATH, video_id, max_retries=3, config=None
                     'Connection': 'keep-alive',
                 },
             }
+            ydl_opts.update(_ytdlp_js_runtime_options())
             if proxy_config:
                 proxy_url = proxy_config.get('http') or proxy_config.get('https')
                 if proxy_url:
@@ -958,12 +906,16 @@ def yt_downloader_ytdlp(URL, DOWNLOAD_PATH, video_id, max_retries=3, config=None
                 channel_url = info.get('channel_url', '')
                 channel_name = info.get('uploader') or info.get('channel') or ''
                 title = info.get('title', f'video_{video_id}')
-                has_uploader_subs = bool(info.get("subtitles"))
-                has_auto_captions = bool(info.get("automatic_captions"))
-                logger.info("UPLOADER SUBS FOUND: %s", has_uploader_subs)
+                auto_tracks = info.get("automatic_captions") or {}
+                accepted_langs = [str(lang).lower() for lang in subs_langs]
+                has_auto_captions = any(
+                    lang in auto_tracks or any(key.startswith(lang + "-") for key in auto_tracks)
+                    for lang in accepted_langs
+                )
+                allow_uploader_subs = (os.getenv("P03_ALLOW_UPLOADER_SUBS", "").strip() == "1")
                 # auto_subs_only channel: process only when 자막 OR 자동 자막 exists; skip if neither
                 auto_subs_only = bool(config.get("auto_subs_only")) if config else False
-                if auto_subs_only and not (has_uploader_subs or has_auto_captions):
+                if auto_subs_only and not has_auto_captions:
                     logger.info("Skipping (auto_subs_only channel, no subs): %s", URL)
                     return ("__SKIP_AUTO_SUBS_ONLY__", None, video_id, None, None, None, None, None, None, "", _format_upload_date(info))
                 subs_path_result = None
@@ -972,7 +924,7 @@ def yt_downloader_ytdlp(URL, DOWNLOAD_PATH, video_id, max_retries=3, config=None
                 prefer_lang = config.get("default_audio_lang") if config else None
                 vd_hint = float(video_len) if video_len else None
                 job_subs_dir = config.get("JOB_SUBS_DIR") if config else None
-                if has_uploader_subs and (base_path or work_path or job_subs_dir):
+                if allow_uploader_subs and info.get("subtitles") and (base_path or work_path or job_subs_dir):
                     if job_subs_dir:
                         subs_dir = job_subs_dir
                     else:
@@ -1006,85 +958,19 @@ def yt_downloader_ytdlp(URL, DOWNLOAD_PATH, video_id, max_retries=3, config=None
                         subs_path_result, subs_lang = result
                         subs_source = "auto"
                         logger.info("YOUTUBE_AUTO_CAPTIONS_USED: True (Whisper skipped)")
-                if subs_path_result is not None and subs_source == "uploader" and not yt_download_if_subs_y:
+                if subs_path_result is not None and subs_source == "uploader":
                     return (None, title or video_id, video_id, video_len, channel_id, channel_url, subs_path_result, subs_source, subs_lang, channel_name, _format_upload_date(info))
                 if subs_path_result is not None and subs_source == "auto":
                     return (None, title or video_id, video_id, video_len, channel_id, channel_url, subs_path_result, subs_source, subs_lang, channel_name, _format_upload_date(info))
-                # Download audio (when no subs, or subs + YT_DOWNLOAD_IF_SUBS_Y=True)
-                ydl.download([URL])
-                # Find the downloaded file
-                downloaded_file = None
-                filename = None
-                # Method 1: Use progress hook filename
-                if downloaded_filename[0]:
-                    downloaded_file = downloaded_filename[0]
-                    filename = os.path.basename(downloaded_file)
-                    # Postprocessor may change extension to m4a
-                    if not os.path.exists(downloaded_file):
-                        # Try with m4a extension
-                        base_name = os.path.splitext(downloaded_file)[0]
-                        m4a_file = base_name + '.m4a'
-                        if os.path.exists(m4a_file):
-                            downloaded_file = m4a_file
-                            filename = os.path.basename(m4a_file)
-                
-                # Method 2: Compare file lists
-                if not downloaded_file or not os.path.exists(downloaded_file):
-                    files_after = set()
-                    if os.path.exists(DOWNLOAD_PATH):
-                        files_after = {f for f in os.listdir(DOWNLOAD_PATH) 
-                                      if os.path.isfile(os.path.join(DOWNLOAD_PATH, f))}
-                    new_files = files_after - files_before
-                    
-                    if new_files:
-                        # Prefer m4a file (post-processed), then other audio formats
-                        # Priority: m4a > opus > mp3 > webm
-                        priority_extensions = ['.m4a', '.opus', '.mp3', '.webm']
-                        for ext in priority_extensions:
-                            for f in new_files:
-                                if f.lower().endswith(ext):
-                                    downloaded_file = os.path.join(DOWNLOAD_PATH, f)
-                                    filename = f
-                                    break
-                            if downloaded_file:
-                                break
-                        
-                        # Clean up: Remove non-m4a audio files (webm, opus, etc.) if m4a exists
-                        if downloaded_file and filename.lower().endswith('.m4a'):
-                            for f in new_files:
-                                if f != filename and any(f.lower().endswith(ext) for ext in ['.webm', '.opus', '.mp3']):
-                                    temp_file = os.path.join(DOWNLOAD_PATH, f)
-                                    try:
-                                        os.remove(temp_file)
-                                        logger.debug(f"Removed temporary audio file: {f}")
-                                    except Exception as e:
-                                        logger.warning(f"Failed to remove temporary file {f}: {str(e)}")
-                
-                # Method 3: Look for file with video_id or title (prefer m4a)
-                if not downloaded_file or not os.path.exists(downloaded_file):
-                    sanitized_title = sanitize_filename(title)
-                    priority_extensions = ['.m4a', '.opus', '.mp3', '.webm']
-                    for ext in priority_extensions:
-                        for file in os.listdir(DOWNLOAD_PATH):
-                            file_path = os.path.join(DOWNLOAD_PATH, file)
-                            if os.path.isfile(file_path):
-                                if (video_id in file or sanitized_title[:30] in file) and file.lower().endswith(ext):
-                                    downloaded_file = file_path
-                                    filename = file
-                                    break
-                        if downloaded_file:
-                            break
-                
-                if downloaded_file and os.path.exists(downloaded_file):
-                    logger.info(f"Download completed: {filename}")
-                    return (downloaded_file, filename, video_id, video_len, channel_id, channel_url, subs_path_result, subs_source, subs_lang, channel_name, _format_upload_date(info))
-                else:
-                    logger.error(f"Downloaded file not found for video: {video_id}")
-                    logger.error(f"Title: {title}")
-                    logger.error(f"Files before: {len(files_before)}, Files after: {len(files_after) if 'files_after' in locals() else 0}")
-                    _set_last_ytdlp_failure("Downloaded file not found after ydl.download (audio)")
-                    return None
-                
+                # Production is captions-only: never fall back to media/audio/ASR.
+                failure_detail = get_last_ytdlp_failure_reason().lower()
+                if any(marker in failure_detail for marker in ("sign in", "private", "forbidden", "http error 403", "source unavailable")):
+                    return ("__SOURCE_UNAVAILABLE__", None, video_id, video_len, channel_id, channel_url, None, None, None, channel_name, _format_upload_date(info))
+                if not has_auto_captions:
+                    _set_last_ytdlp_failure("NO_AUTO_CAPTION")
+                    return ("__NO_AUTO_CAPTION__", None, video_id, video_len, channel_id, channel_url, None, None, None, channel_name, _format_upload_date(info))
+                _set_last_ytdlp_failure("SOURCE_UNAVAILABLE: automatic caption track download failed")
+                return ("__SOURCE_UNAVAILABLE__", None, video_id, video_len, channel_id, channel_url, None, None, None, channel_name, _format_upload_date(info))
         except yt_dlp.utils.DownloadError as e:
             error_msg = str(e)
             _set_last_ytdlp_failure(error_msg)
@@ -1107,6 +993,9 @@ def yt_downloader_ytdlp(URL, DOWNLOAD_PATH, video_id, max_retries=3, config=None
             ):
                 logger.info("Video unavailable or private (skip, no retry): %s", URL)
                 return ("__VIDEO_UNAVAILABLE__", None, video_id, None, None, None, None, None, None, "", "")
+            if any(marker in err_lower for marker in ("sign in to confirm", "sign in to access", "http error 403", "403 forbidden", "forbidden")):
+                logger.info("Caption access refused; deferring bounded retry to next scheduled run: %s", video_id)
+                return ("__SOURCE_UNAVAILABLE__", None, video_id, None, None, None, None, None, None, "", "")
             # Live event error: only skip if NOT was_live/post_live (VOD may be processing)
             if "live event" in err_lower or "this live event will begin" in err_lower:
                 try:
@@ -1181,462 +1070,6 @@ def yt_downloader_ytdlp(URL, DOWNLOAD_PATH, video_id, max_retries=3, config=None
     
     _set_last_ytdlp_failure("yt-dlp: exhausted retries without success")
     return None
-
-def yt_downloader_pytubefix(URL, DOWNLOAD_PATH, video_id, max_retries=3):
-    """
-    Download AUDIO ONLY using pytubefix (fallback).
-    Uses PoToken automatically when 'WEB' client is specified (pytubefix 10.3.6+).
-    
-    This function downloads only the audio stream, not the video.
-    """
-    logger = logging.getLogger(__name__)
-    _set_last_ytdlp_failure("")
-    
-    if YouTube is None:
-        logger.error("Neither yt-dlp nor pytubefix is available. Please install: pip install yt-dlp")
-        _set_last_ytdlp_failure("Neither yt-dlp nor pytubefix is available")
-        return None
-    
-    # Import pytubefix exceptions
-    try:
-        from pytubefix.exceptions import RegexMatchError, VideoUnavailable, AgeRestrictedError
-    except ImportError:
-        RegexMatchError = Exception
-        VideoUnavailable = Exception
-        AgeRestrictedError = Exception
-    
-    # Check pytubefix version
-    try:
-        import pytubefix
-        pytubefix_version = getattr(pytubefix, '__version__', 'unknown')
-        logger.info(f"Using pytubefix version: {pytubefix_version}")
-        
-        # Recommend update if version is old
-        try:
-            version_parts = pytubefix_version.split('.')
-            major, minor = int(version_parts[0]), int(version_parts[1])
-            if major < 10 or (major == 10 and minor < 3):
-                logger.warning(f"pytubefix version {pytubefix_version} may be outdated. Consider updating: pip install --upgrade pytubefix")
-        except:
-            pass
-    except:
-        pytubefix_version = 'unknown'
-    
-    for attempt in range(max_retries):
-        try:
-            if attempt > 0:
-                wait_time = random.uniform(5, 15) * (attempt + 1)
-                logger.info(f"Waiting {wait_time:.1f} seconds before retry...")
-                time.sleep(wait_time)
-            
-            proxy_config = get_proxy_config()
-            user_agent = get_random_user_agent()
-            
-            # Use 'WEB' client which automatically generates PoToken (pytubefix 10.3.6+)
-            # According to pytubefix docs, 'WEB' client automatically handles PoToken
-            try:
-                if proxy_config:
-                    # Try with use_po_token=True first (explicit PoToken usage)
-                    try:
-                        yt = YouTube(URL, 'WEB', proxies=proxy_config, use_po_token=True)
-                        logger.debug("Using pytubefix with explicit PoToken")
-                    except:
-                        # Fallback to basic WEB client
-                        yt = YouTube(URL, 'WEB', proxies=proxy_config)
-                        logger.debug("Using pytubefix with WEB client (auto PoToken)")
-                else:
-                    try:
-                        yt = YouTube(URL, 'WEB', use_po_token=True)
-                        logger.debug("Using pytubefix with explicit PoToken")
-                    except:
-                        yt = YouTube(URL, 'WEB')
-                        logger.debug("Using pytubefix with WEB client (auto PoToken)")
-            except Exception as init_error:
-                logger.warning(f"Failed to initialize YouTube object: {str(init_error)}")
-                if attempt < max_retries - 1:
-                    continue
-                raise
-            
-            try:
-                yt.bypass_age_gate()
-            except:
-                pass
-
-            video_len = yt.length
-            channel_id = yt.channel_id
-            channel_url = yt.channel_url
-        
-            # Get ONLY audio stream (no video)
-            audio_stream = yt.streams.get_audio_only()
-            
-            if audio_stream is None:
-                logger.warning(f"No audio stream available for video: {URL} (attempt {attempt + 1}/{max_retries})")
-                if attempt < max_retries - 1:
-                    time.sleep(random.uniform(2, 5))
-                    continue
-                _set_last_ytdlp_failure("No audio stream available (pytubefix)")
-                return None
-        
-            filename = sanitize_filename(audio_stream.default_filename)
-            audio_stream.download(output_path=DOWNLOAD_PATH, filename=filename)
-        
-            full_saved_path = f'{DOWNLOAD_PATH}/{filename}'
-            logger.info(f"Download completed: {filename}")
-            return full_saved_path, filename, video_id, video_len, channel_id, channel_url
-
-        except (RegexMatchError, VideoUnavailable, AgeRestrictedError) as e:
-            error_type = type(e).__name__
-            logger.warning(f"YouTube API error ({error_type}) for video {URL} (attempt {attempt + 1}/{max_retries}): {str(e)}")
-            
-            if isinstance(e, RegexMatchError):
-                logger.warning("  This is a known pytubefix issue. Solutions:")
-                logger.warning("  1. Update pytubefix: pip install --upgrade pytubefix")
-                logger.warning("  2. Install yt-dlp (recommended): pip install yt-dlp")
-                logger.warning("  3. YouTube's JavaScript structure may have changed")
-            
-            if attempt < max_retries - 1:
-                wait_time = random.uniform(3, 8) * (attempt + 1)
-                logger.info(f"Retrying in {wait_time:.1f} seconds...")
-                time.sleep(wait_time)
-            else:
-                logger.error(f"Failed to download video after {max_retries} attempts: {URL}")
-                logger.error(f"Strongly recommend installing yt-dlp: pip install yt-dlp")
-                _set_last_ytdlp_failure(str(e))
-                return None
-                
-        except Exception as e:
-            error_type = type(e).__name__
-            _set_last_ytdlp_failure(str(e))
-            logger.error(f"Unexpected error ({error_type}) while downloading video: {URL}, Error: {str(e)}", exc_info=True)
-            if attempt < max_retries - 1:
-                wait_time = random.uniform(2, 5)
-                time.sleep(wait_time)
-            else:
-                logger.error(f"Failed to download video after {max_retries} attempts: {URL}")
-                return None
-    
-    _set_last_ytdlp_failure("pytubefix: exhausted retries without success")
-    return None
-
-
-# Global model cache to avoid reloading models
-_mlx_model_cache = {}
-
-# model selection
-def mlx_model_selection(mlx_model):
-    model_mapping = {
-        "large" : "whisper-large-v3-mlx",
-        "turbo" : "whisper-large-v3-turbo"
-    }
-
-    return model_mapping.get(mlx_model, f"Unknown model input: {mlx_model}")
-
-def get_mlx_model_path(hf_path, mlx_model="turbo"):
-    """
-    Get the full model path for MLX Whisper.
-    This function ensures HF_HOME is set and returns the model identifier.
-    
-    Args:
-        hf_path: Hugging Face cache path
-        mlx_model: Model type ("turbo" or "large")
-    
-    Returns:
-        Model path string (e.g., "mlx-community/whisper-large-v3-turbo")
-    """
-    os.environ["HF_HOME"] = hf_path
-    selected_model = mlx_model_selection(mlx_model)
-    model_path = f"mlx-community/{selected_model}"
-    return model_path
-
-def check_model_downloaded(hf_path, mlx_model="turbo"):
-    """
-    Check if MLX Whisper model files are actually downloaded.
-    
-    Args:
-        hf_path: Hugging Face cache path
-        mlx_model: Model type ("turbo" or "large")
-    
-    Returns:
-        Tuple of (bool, str): (True if model files exist, model file path if found)
-    """
-    selected_model = mlx_model_selection(mlx_model)
-    model_dir_name = f"models--mlx-community--{selected_model.replace('_', '-')}"
-    model_cache_path = os.path.join(hf_path, "hub", model_dir_name)
-    
-    if not os.path.exists(model_cache_path):
-        return False, None
-    
-    # Check for actual model files (not just metadata)
-    snapshots_dir = os.path.join(model_cache_path, "snapshots")
-    if os.path.exists(snapshots_dir):
-        # Look for model weight files
-        for root, dirs, files in os.walk(snapshots_dir):
-            for file in files:
-                if file.endswith(('.safetensors', '.bin', '.npz')) or 'weights' in file.lower():
-                    file_path = os.path.join(root, file)
-                    # Resolve symlink to actual file
-                    if os.path.islink(file_path):
-                        actual_path = os.path.realpath(file_path)
-                    else:
-                        actual_path = file_path
-                    
-                    # Check if file is substantial (not just a placeholder)
-                    if os.path.exists(actual_path) and os.path.getsize(actual_path) > 1024 * 1024:  # > 1MB
-                        return True, actual_path
-    
-    return False, None
-
-def load_mlx_model(hf_path, mlx_model="turbo"):
-    """
-    Load MLX Whisper model once and cache it for reuse.
-    This avoids reloading the model for each transcription.
-    
-    Args:
-        hf_path: Hugging Face cache path
-        mlx_model: Model type ("turbo" or "large")
-    
-    Returns:
-        Loaded MLX Whisper model object or model path string
-    """
-    logger = logging.getLogger(__name__)
-    
-    if _load_mlx_whisper() is None:
-        logger.error("mlx_whisper 모듈이 설치되지 않았습니다.")
-        return None
-    
-    # Create cache key
-    cache_key = f"{hf_path}:{mlx_model}"
-    
-    # Check if model is already loaded
-    if cache_key in _mlx_model_cache:
-        logger.debug(f"Using cached model: {cache_key}")
-        return _mlx_model_cache[cache_key]
-    
-    # Set HF_HOME environment variable
-    os.environ["HF_HOME"] = hf_path
-    
-    # Get model path
-    model_path = get_mlx_model_path(hf_path, mlx_model)
-    
-    # Check if model is actually downloaded
-    model_downloaded, model_file_path = check_model_downloaded(hf_path, mlx_model)
-    
-    try:
-        if not model_downloaded:
-            logger.warning(f"⚠️  모델 파일이 완전히 다운로드되지 않았습니다: {model_path}")
-            logger.warning("  모델을 다운로드하는 중입니다. 이는 시간이 걸릴 수 있습니다...")
-            logger.warning("  네트워크 연결을 확인하고 잠시 기다려주세요.")
-        else:
-            model_size = os.path.getsize(model_file_path) / (1024 * 1024 * 1024)  # GB
-            logger.info(f"✓ 모델 파일 확인됨: {model_path}")
-            logger.info(f"  모델 크기: {model_size:.2f} GB")
-            logger.info(f"  모델 경로: {model_file_path}")
-            logger.info("  모델이 이미 다운로드되어 있습니다. 'Fetching files' 메시지는 파일 검증 과정입니다.")
-        
-        logger.info(f"Loading MLX Whisper model: {model_path} (첫 번째 로드 시 시간이 걸릴 수 있습니다)")
-        
-        # Load model using mlx_whisper.load_model()
-        # Note: mlx_whisper.load_model() may not exist in all versions
-        # If it doesn't exist, we'll fall back to using transcribe() with caching
-        if hasattr(mlx_whisper, 'load_model'):
-            model = mlx_whisper.load_model(model_path)
-            _mlx_model_cache[cache_key] = model
-            logger.info(f"✓ Model loaded successfully: {model_path}")
-            return model
-        else:
-            # Fallback: Store model path in cache to track that we've "loaded" it
-            # The actual model will be loaded by transcribe() but we track it here
-            logger.info(f"Model path cached: {model_path} (will be loaded on first transcribe)")
-            _mlx_model_cache[cache_key] = model_path  # Store path instead of model object
-            return model_path
-            
-    except Exception as e:
-        logger.error(f"Failed to load MLX Whisper model: {str(e)}", exc_info=True)
-        logger.error("  모델 다운로드에 실패했습니다. 다음을 확인하세요:")
-        logger.error("  1. 네트워크 연결 상태")
-        logger.error("  2. Hugging Face 접근 가능 여부")
-        logger.error("  3. 디스크 공간 충분 여부")
-        return None
-
-# m4a into wav
-def convert_to_wav(input_file, output_file, check=False):
-
-    try:
-        command = [
-            "/opt/homebrew/bin/ffmpeg", "-y", "-i", input_file, "-ar", "16000", "-ac", "1", output_file, "-loglevel", "error"
-        ]
-        subprocess.run(command, check=check)
-
-    except subprocess.CalledProcessError as e:
-        print(f"FFmpeg error: {e.stderr}") # error output
-
-    
-# transcription
-# in your code, if None returns, then URL saved into missed file
-def transcribe_by_mlx(full_load_path, filename, save_path, hf_path, base_path, video_id, mlx_model="turbo", audio_size_threshold_bytes=0, temp_path=None, wav_path=None):
-    """
-    Transcribe audio file using MLX Whisper.
-    Model is loaded once and reused for subsequent calls (optimized).
-
-    Args:
-        full_load_path: Full path to the audio file
-        filename: Name of the audio file
-        save_path: Path to save the transcription
-        hf_path: Hugging Face model cache path
-        base_path: Base path (project root)
-        video_id: YouTube video ID
-        mlx_model: MLX model to use (default: "turbo")
-        audio_size_threshold_bytes: If > 0, skip Whisper when output.wav size >= this (OOM 방지). 0이면 검사 안 함.
-        temp_path: Legacy: directory for output.wav when wav_path is not set.
-        wav_path: Per-video WAV path (preferred). Replaces fixed output.wav.
-
-    Returns:
-        Tuple of (transcription, save_file_name), or (None, "size_threshold") when WAV size exceeds threshold, or None if error occurs
-    """
-    _load_mlx_whisper()
-    logger = logging.getLogger(__name__)
-
-    if mlx_whisper is None:
-        logger.error("mlx_whisper 모듈이 설치되지 않았습니다. 'pip install mlx-whisper' 명령으로 설치해주세요.")
-        return None
-
-    # Load or get cached model
-    model_or_path = load_mlx_model(hf_path, mlx_model)
-
-    if model_or_path is None:
-        logger.error("Failed to load MLX Whisper model")
-        return None
-
-    # Get model path for logging
-    model_path = get_mlx_model_path(hf_path, mlx_model)
-    selected_model = mlx_model_selection(mlx_model)
-
-    # Create cache key
-    cache_key = f"{hf_path}:{mlx_model}"
-    is_first_load = cache_key not in _mlx_model_cache or isinstance(_mlx_model_cache.get(cache_key), str)
-
-    if not wav_path:
-        wav_dir = temp_path if temp_path else base_path
-        wav_path = os.path.join(wav_dir, "output.wav")
-    try:
-        logger.info(f"Converting audio to WAV: {full_load_path}")
-        convert_to_wav(full_load_path, wav_path)
-
-        if audio_size_threshold_bytes > 0 and os.path.exists(wav_path):
-            try:
-                wav_size = os.path.getsize(wav_path)
-                if wav_size >= audio_size_threshold_bytes:
-                    logger.info(f"Output WAV size {wav_size / (1024*1024):.1f} MB >= threshold {audio_size_threshold_bytes / (1024*1024):.1f} MB. Skipping Whisper to avoid OOM.")
-                    os.remove(wav_path)
-                    return (None, "size_threshold")
-            except OSError:
-                pass
-
-        # transcribe audio
-        try:
-            start_time = time.time()
-            
-            if is_first_load:
-                logger.info(f"Starting transcription with model: {model_path}")
-                # Check if model needs to be downloaded
-                model_downloaded, model_file_path = check_model_downloaded(hf_path, mlx_model)
-                if not model_downloaded:
-                    logger.warning("⚠️  모델 파일이 없습니다. 다운로드를 시작합니다...")
-                    logger.warning("  'Fetching files' 메시지가 나타나면 정상입니다.")
-                    logger.info(f"모델 다운로드/로딩 중: {model_path} (첫 번째 실행 시 시간이 오래 걸릴 수 있습니다)")
-                else:
-                    model_size = os.path.getsize(model_file_path) / (1024 * 1024 * 1024)  # GB
-                    logger.info(f"✓ 모델이 이미 다운로드되어 있습니다 ({model_size:.2f} GB)")
-                    logger.info("  'Fetching 4 files' 메시지는 Hugging Face의 파일 검증 과정입니다.")
-                    logger.info("  실제 다운로드는 발생하지 않으며, 곧 전사가 시작됩니다.")
-            else:
-                logger.info(f"Using cached model: {model_path} (재사용 중, 빠른 처리)")
-
-            # Check if we have a model object or just a path
-            if isinstance(model_or_path, str) or not hasattr(model_or_path, 'transcribe'):
-                # Fallback: Use mlx_whisper.transcribe() directly
-                # MLX Whisper will use cached model files from Hugging Face
-                transcription = mlx_whisper.transcribe(
-                    wav_path,
-                    word_timestamps=False,
-                    path_or_hf_repo=model_path)['text']
-            else:
-                # Use loaded model object's transcribe method
-                result = model_or_path.transcribe(wav_path, word_timestamps=False)
-                transcription = result['text'] if isinstance(result, dict) else result 
-
-            elapsed_time = time.time() - start_time
-            logger.info(f'Transcription complete: {elapsed_time:.2f} sec')
-
-            transcription = transcription.strip()
-
-            #file save
-            save_file_path = f'{save_path}/{filename}+vid-{video_id}.txt'
-            save_file_name = f'{filename}+vid-{video_id}.txt'
-
-            with open(save_file_path, 'w', encoding='utf-8-sig') as f:
-                f.write(transcription)
-
-            # Remove temporary WAV file
-            if os.path.exists(wav_path):
-                os.remove(wav_path)
-
-            logger.info(f"Transcription saved: {save_file_path}")
-            return transcription, save_file_name
-
-        except Exception as e:
-            logger.error(f'Whisper transcription error: {str(e)}', exc_info=True)
-
-            # Clean up WAV file if exists
-            if os.path.exists(wav_path):
-                os.remove(wav_path)
-
-            return None
-
-    except Exception as e:
-        logger.error(f'Audio conversion error: {str(e)}', exc_info=True)
-        return None
-
-"""
-def transcribe_by_groq(full_load_path, filename, save_path, hf_path, mlx_model = "turbo"):
-    
-    os.environ["HF_HOME"] = hf_path # hugging face home directory
-
-    selected_model = mlx_model_selection(mlx_model) # selcting model
-
-    try:
-        convert_to_wav(full_load_path, "output.wav") # convert into wav file
-
-        # transcribe audio
-        try:
-            start_time = time.time(); print("transcription starts")
-
-            transcription = mlx_whisper.transcribe(
-                "output.wav",
-                word_timestamps=False,
-                path_or_hf_repo = f"mlx-community/{selected_model}")['text'] 
-
-            print('\nTranscription complete: '+f'{time.time()-start_time:.2f} sec')
-
-            #file save
-            save_file_path = f'{save_path}/{filename}.txt'
-            save_file_name = f'{filename}.txt'
-
-            with open(save_file_path, 'w', encoding='utf-8-sig') as f:
-                f.write(transcription)
-
-            return transcription, save_file_name
-
-        except Exception as e:
-            print(f'Whisper Error: {e}')
-
-            return None
-
-    except Exception as e:
-        print(f'converting Error: {e}')
-
-        return None
-"""   
 
 def _is_errno11_deadlock(exc: BaseException) -> bool:
     """macOS EDEADLK / Resource deadlock often surfaces as OSError errno 11."""

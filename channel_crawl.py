@@ -74,7 +74,7 @@ CRAWL_QUEUE_COLUMNS = [
 ]
 DONE_STATUSES = {"success", "already_existed", "oversized_file"}
 SKIPPED_AUTO_SUBS_ONLY_STATUS = "skipped_auto_subs_only"
-FAILED_STATUSES = {"error", "download_failed", "mlx_error", "api_error", "file_error"}
+FAILED_STATUSES = {"error", "download_failed", "mlx_error", "captions_error", "SOURCE_UNAVAILABLE", "source_unavailable", "api_error", "file_error"}
 SHORTS_STATUS = "passed_shorts"
 LIVE_SCHEDULED_STATUS = "live_scheduled"
 VIDEO_UNAVAILABLE_STATUS = "video_unavailable"

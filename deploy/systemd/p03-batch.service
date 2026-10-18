@@ -1,0 +1,18 @@
+[Unit]
+Description=P03 YouTube captions and Drive summary batch
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/work/youtube-script-note
+EnvironmentFile=%h/.config/p03/p03.env
+EnvironmentFile=%h/.config/p03/p03-locators.env
+Environment=SYSTEMD_SCHEDULED=1
+ExecStart=/bin/bash %h/work/youtube-script-note/deploy/run-p03-linux.sh
+Nice=15
+CPUQuota=100%
+MemoryHigh=1G
+MemoryMax=1536M
+IOWeight=20
+TimeoutStartSec=2h

@@ -1,6 +1,6 @@
 # Youtube Script Note (P03)
 
-YouTube discovery → subtitles or audio → Whisper MLX fallback → LLM transcript preprocessing → structured Markdown summarization → optional Google Drive Desktop synchronization.
+YouTube discovery → YouTube automatic captions → LLM transcript preprocessing → structured Markdown summary → verified Google Drive API upload (Linux) or optional Google Drive Desktop synchronization (macOS).
 
 **Version:** 4.2.0
 
@@ -9,15 +9,15 @@ YouTube discovery → subtitles or audio → Whisper MLX fallback → LLM transc
 P03 is a macOS / Apple Silicon pipeline that:
 
 1. Discovers videos via channel crawl (YouTube Data API) or a local input queue
-2. Downloads subtitles or audio (yt-dlp)
-3. Falls back to on-device Whisper MLX when subtitles are unavailable
+2. Downloads YouTube automatic captions only (yt-dlp)
+3. Records `NO_AUTO_CAPTION` when automatic captions are unavailable; it never falls back to audio/ASR
 4. Preprocesses transcripts with a lightweight LLM (GPT-5-nano)
 5. Summarizes into mobile-friendly Markdown (v5.0 adds an opt-in single-pass GPT-6 Luna Responses path; legacy Nano + Mini remains the code default for rollback)
 
 ## Version 5.0
 
 `LLM_PIPELINE_MODE=direct_luna` sends the raw transcript to one GPT-6 Luna Responses request. The default remains `legacy_two_stage` until owner approval. See [v5 migration notes](docs/MIGRATION_v5.md).
-6. Optionally syncs finalized Markdown to a Google Drive Desktop folder (`YT_summary`)
+6. Uploads summary, cleaned transcript, and metadata to Google Drive with readback verification on Linux
 
 ## Architecture
 
@@ -34,8 +34,7 @@ See [docs/PROJECT.md](docs/PROJECT.md) for full pipeline documentation.
 
 ## Platform support
 
-- **Supported:** macOS with Apple Silicon (MLX Whisper)
-- **Not supported:** Windows / Linux (MLX dependency)
+- **Supported:** macOS and Linux (automatic captions only)
 
 ## Quick start
 
@@ -58,7 +57,9 @@ Copy `.env.example` to `.env` and set:
 | `YOUTUBE_API_KEY` | Channel crawl (`CHANNEL_CRAWL=true`) |
 | `OUTPUT_MD_PATH` | Markdown output directory |
 | `HF_HOME` | Whisper MLX model cache |
-| `BASE_PATH` / `WORK_PATH` / `DATA_ROOT` | Runtime layout (default: repo root + `data/`) |
+| `BASE_PATH` / `WORK_PATH` / `DATA_ROOT` | Runtime layout (Linux default: `~/p03-run`) |
+| `P03_DRIVE_BACKEND` | `api` on Linux (default) or `desktop` on macOS |
+| `P03_DRIVE_TOKEN_FILE` | Google user OAuth token file locator for Drive API (Linux) |
 
 Optional: `OPENROUTER_API_KEY`, `YOUTUBE_COOKIES_FILE`, `P03_DRIVE_SYNC_ROOT`. See `.env.example`.
 
@@ -83,6 +84,12 @@ pytest tests/ -q
 ```
 
 Offline/unit tests do not require API keys or personal paths.
+
+## Drive API (Linux)
+
+The Linux runner defaults to `P03_DRIVE_BACKEND=api`. It writes the summary into the existing `YT_summary/source` folder, creates/uses `YT_summary/transcripts/` for the transcript and metadata JSON, and only marks a video successful after Drive metadata readback matches the uploaded bytes. VTT files stay in each job workspace and are removed when verified processing completes. The systemd user units are in `deploy/systemd/`; install is an operator action.
+
+Set `P03_DRIVE_TOKEN_FILE` to the user OAuth token file. The token is refreshed in memory and is not written back.
 
 ## Optional Drive Desktop sync
 

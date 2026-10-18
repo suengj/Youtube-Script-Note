@@ -5,8 +5,10 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import logging
 import os
+import stat
 import shutil
 import time
 from dataclasses import dataclass, field
@@ -17,6 +19,7 @@ logger = logging.getLogger(__name__)
 
 JOBS_SUBDIR = os.path.join("tmp", "jobs")
 ACTIVE_JOB_MAX_AGE_SEC = 6 * 3600  # do not delete jobs touched within 6h during cleanup
+GENERATION_CACHE_MAX_BYTES = 64 * 1024 * 1024
 
 
 @dataclass
@@ -48,6 +51,69 @@ class VideoJobWorkspace:
 
     def metadata_path(self) -> str:
         return os.path.join(self.root, "job_meta.json")
+
+    def generation_cache_path(self) -> str:
+        return os.path.join(self.root, "generation_result.json")
+
+    def load_generation_result(self, *, input_revision: str, model: str, prompt_sha256: str) -> Optional[str]:
+        """Load a bounded, revision-bound summary cache; malformed data fails closed."""
+        path = self.generation_cache_path()
+        try:
+            flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+            fd = os.open(path, flags)
+            try:
+                info = os.fstat(fd)
+                if not stat.S_ISREG(info.st_mode) or info.st_size > GENERATION_CACHE_MAX_BYTES:
+                    return None
+                with os.fdopen(fd, "r", encoding="utf-8") as stream:
+                    fd = -1
+                    record = json.load(stream)
+            finally:
+                if fd >= 0:
+                    os.close(fd)
+            summary = record.get("summary")
+            if (record.get("video_id") != self.video_id or
+                    record.get("input_revision") != input_revision or
+                    record.get("model") != model or
+                    record.get("prompt_sha256") != prompt_sha256 or
+                    not isinstance(summary, str) or not summary or
+                    len(summary.encode("utf-8")) > GENERATION_CACHE_MAX_BYTES or
+                    record.get("summary_sha256") != hashlib.sha256(summary.encode("utf-8")).hexdigest()):
+                return None
+            return summary
+        except (OSError, ValueError, TypeError, UnicodeError, AttributeError):
+            return None
+
+    def save_generation_result(self, *, input_revision: str, model: str, prompt_sha256: str, summary: str) -> None:
+        """Atomically persist the generated summary and its full binding identity."""
+        if not isinstance(summary, str) or not summary or len(summary.encode("utf-8")) > GENERATION_CACHE_MAX_BYTES:
+            raise ValueError("invalid generation result")
+        self.ensure()
+        encoded = summary.encode("utf-8")
+        record = {
+            "video_id": self.video_id,
+            "input_revision": input_revision,
+            "model": model,
+            "prompt_sha256": prompt_sha256,
+            "summary_sha256": hashlib.sha256(encoded).hexdigest(),
+            "summary": summary,
+        }
+        path = self.generation_cache_path()
+        tmp = path + f".{os.getpid()}.tmp"
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+        fd = os.open(tmp, flags, 0o600)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as stream:
+                json.dump(record, stream, ensure_ascii=False)
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(tmp, path)
+        except Exception:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
 
     def write_metadata(self, extra: Optional[Dict[str, Any]] = None) -> None:
         self.ensure()
