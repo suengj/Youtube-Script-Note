@@ -15,14 +15,15 @@ def _state(tmp_path):
     data = tmp_path / "data"
     base = tmp_path / "base"
     (data / "logs").mkdir(parents=True)
-    (base / "index").mkdir(parents=True)
+    (data / "index").mkdir(parents=True)
     (data / "channel_df.csv").write_text("channel\n", encoding="utf-8")
     (data / "logs" / "llm_usage.jsonl").write_text('{"tokens":1}\n', encoding="utf-8")
-    (base / "index" / "drive_yt_summary_sync_state.json").write_text("{}", encoding="utf-8")
+    (data / "index" / "drive_yt_summary_sync_state.json").write_text("{}", encoding="utf-8")
     return data, base
 
 
-def test_source_identity_uses_only_canonical_state_paths_and_manifest_hashes(tmp_path):
+def test_source_identity_uses_only_canonical_state_paths_and_manifest_hashes(tmp_path, monkeypatch):
+    monkeypatch.delenv("WORK_PATH", raising=False)
     data, base = _state(tmp_path)
     name, packed = backup.build_archive(str(data), str(base), now=datetime(2026, 1, 2, tzinfo=timezone.utc))
     assert name == "p03-state-20260102T000000Z.tar.gz"
@@ -30,6 +31,24 @@ def test_source_identity_uses_only_canonical_state_paths_and_manifest_hashes(tmp
     with tarfile.open(fileobj=io.BytesIO(packed), mode="r:gz") as archive:
         entries = {item.name: archive.extractfile(item).read() for item in archive.getmembers() if item.name != "manifest.json"}
     assert set(entries) == {"data/channel_df.csv", "data/logs/llm_usage.jsonl", "index/drive_yt_summary_sync_state.json"}
+
+
+def test_sync_index_uses_producer_work_path_and_missing_files_are_reported(tmp_path, monkeypatch, caplog):
+    data, base = _state(tmp_path)
+    work = tmp_path / "work"
+    (work / "index").mkdir(parents=True)
+    index = work / "index" / "drive_yt_summary_sync_state.json"
+    index.write_text('{"from":"work"}', encoding="utf-8")
+    monkeypatch.setenv("WORK_PATH", str(work))
+    # The expected crawl list is absent: it must be visible as incomplete state.
+    name, packed = backup.build_archive(str(data), str(base))
+    backup.validate_archive(packed)
+    with tarfile.open(fileobj=io.BytesIO(packed), mode="r:gz") as archive:
+        members = {m.name: archive.extractfile(m).read() for m in archive.getmembers()}
+    assert members["index/drive_yt_summary_sync_state.json"] == b'{"from":"work"}'
+    manifest = json.loads(members["manifest.json"])
+    assert manifest["missing"] == ["data/crawl_yt_list.csv", "data/output_df_new.csv"]
+    assert "P03_STATE_BACKUP_MISSING_FILE: data/crawl_yt_list.csv" in caplog.text
 
 
 def test_symlink_substitution_and_toctou_change_fail_closed(tmp_path, monkeypatch):
@@ -80,6 +99,18 @@ def test_nested_or_partial_manifest_member_fails(tmp_path):
         # Malformed gzip input also fails with the same typed error.
         backup.validate_archive(b"not a gzip archive")
 
+    bad_missing = json.loads(entries["manifest.json"])
+    bad_missing["missing"] = ["../outside"]
+    entries["manifest.json"] = json.dumps(bad_missing).encode()
+    malformed_missing = io.BytesIO()
+    with tarfile.open(fileobj=malformed_missing, mode="w:gz") as archive:
+        for name, content in entries.items():
+            info = tarfile.TarInfo(name)
+            info.size = len(content)
+            archive.addfile(info, io.BytesIO(content))
+    with pytest.raises(DriveUploadError, match="missing-file list is malformed"):
+        backup.validate_archive(malformed_missing.getvalue())
+
     entries["manifest.json"] = json.dumps({"schema_version": 1, "files": []}).encode()
     entries["../../outside"] = b"escaped"
     malformed = io.BytesIO()
@@ -95,7 +126,7 @@ def test_nested_or_partial_manifest_member_fails(tmp_path):
 def test_missing_and_oversized_state_fail_closed(tmp_path):
     data, base = _state(tmp_path)
     for relative, root in backup.STATE_FILES:
-        path = (data / relative.split("/", 1)[1]) if root == "data" else (base / relative)
+        path = (data / relative.split("/", 1)[1]) if root == "data" else (data / "index" / relative.rsplit("/", 1)[1])
         if path.exists():
             path.unlink()
     with pytest.raises(DriveUploadError, match="no P03 state"):
@@ -104,6 +135,8 @@ def test_missing_and_oversized_state_fail_closed(tmp_path):
     oversized.write_bytes(b"x" * (backup.MAX_FILE_BYTES + 1))
     with pytest.raises(DriveUploadError, match="bounded regular file"):
         backup.build_archive(str(data), str(base))
+    with pytest.raises(DriveUploadError, match="exceeds size limit"):
+        backup.validate_archive(b"x" * (backup.MAX_ARCHIVE_BYTES + 1))
 
 
 def test_backup_failure_does_not_mutate_local_state_or_prune(tmp_path):
