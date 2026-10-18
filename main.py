@@ -15,6 +15,7 @@ import logging
 import json
 import hashlib
 import glob
+import argparse
 from datetime import datetime
 from pathlib import Path
 from dataclasses import dataclass
@@ -241,7 +242,7 @@ def failure_needs_long_cooldown(status: str, error_msg: Optional[str]) -> bool:
         "age-restricted",
         "age restricted",
         "downloaded file not found after",  # post-download mismatch (not Errno 11)
-        "neither yt-dlp nor pytubefix",
+        "yt-dlp is required for automatic captions",
         "exhausted retries without success",
     )
     if any(m in err for m in short_markers):
@@ -484,11 +485,13 @@ def summarize_with_pipeline(mode: str, *, direct_client, main_llm, direct_transc
 
 def load_config() -> dict:
     """Load configuration from .env (secrets/paths) and config.py (threshold, rate limiting, channel crawl)."""
+    linux_run_root = str(Path.home() / "p03-run")
+    default_base = linux_run_root if sys.platform.startswith("linux") else LOCAL_BASE_PATH_DEFAULT
     config = {
-        'BASE_PATH': os.getenv('BASE_PATH', LOCAL_BASE_PATH_DEFAULT),
-        'WORK_PATH': os.getenv('WORK_PATH', '').strip() or None,
+        'BASE_PATH': os.getenv('BASE_PATH', default_base),
+        'WORK_PATH': os.getenv('WORK_PATH', '').strip() or (linux_run_root if sys.platform.startswith("linux") else None),
         'HF_HOME': os.getenv('HF_HOME', str(Path.home() / '.cache' / 'whisper')),
-        'OUTPUT_MD_PATH': os.getenv('OUTPUT_MD_PATH', ''),
+        'OUTPUT_MD_PATH': os.getenv('OUTPUT_MD_PATH', os.path.join(default_base, 'output_md')),
         'OUTPUT_MD_GIT': os.getenv('OUTPUT_MD_GIT', ''),
         'OPENAI_API_KEY': os.getenv('OPENAI_API_KEY'),
         'XAI_API_KEY': os.getenv('XAI_API_KEY'),
@@ -550,6 +553,8 @@ def load_config() -> dict:
     _use_job = os.getenv('USE_JOB_WORKSPACE', '').strip().lower()
     if _use_job:
         config['USE_JOB_WORKSPACE'] = _use_job in ('true', '1', 'yes')
+    if sys.platform.startswith("linux") and os.getenv("P03_DRIVE_BACKEND", "api").strip().lower() == "api":
+        config['USE_JOB_WORKSPACE'] = True
     _cache_en = os.getenv('TRANSCRIPT_CACHE_ENABLED', '').strip().lower()
     if _cache_en:
         config['TRANSCRIPT_CACHE_ENABLED'] = _cache_en in ('true', '1', 'yes')
@@ -1166,7 +1171,7 @@ def process_single_video(
         cache_hit: bool = False,
     ) -> VideoProcessResult:
         retryable = status in {
-            "download_failed", "api_error", "file_error", "mlx_error", "error",
+            "download_failed", "api_error", "file_error", "mlx_error", "captions_error", "SOURCE_UNAVAILABLE", "source_unavailable", "error",
         }
         return VideoProcessResult(
             video_id=vid or "unknown",
@@ -1195,6 +1200,7 @@ def process_single_video(
     subs_path = None
     subs_source = None
     subs_lang = None
+    api_sink = None
     set_pipeline_context(run_id=run_id, worker_id=worker_id, video_id="", stage="init")
     try:
         video_id = stt.extract_youtube_id(v_url)
@@ -1212,10 +1218,10 @@ def process_single_video(
     )
     _terminal_skip_statuses = frozenset({
         "passed_shorts", "live_scheduled", "video_unavailable",
-        "skipped_auto_subs_only", "oversized_file",
+        "skipped_auto_subs_only", "oversized_file", "NO_AUTO_CAPTION",
     })
     _retryable_statuses = frozenset({
-        "download_failed", "api_error", "file_error", "mlx_error", "error",
+        "download_failed", "api_error", "file_error", "mlx_error", "captions_error", "SOURCE_UNAVAILABLE", "source_unavailable", "error",
     })
     if 'v_id' in output_df.columns and len(output_df) > 0:
         prior = output_df[output_df['v_id'] == video_id]
@@ -1264,6 +1270,10 @@ def process_single_video(
         durable_full_path, reused_transcription = _read_durable_full_transcript(output_full_path, video_id or "")
         if durable_full_path and reused_transcription is None:
             return _vr("durable_transcript_unreadable", video_id, "durable full transcript exists but cannot be read as UTF-8", stage="transcript_reuse")
+        if os.getenv("P03_DRIVE_BACKEND", "api" if sys.platform.startswith("linux") else "desktop").strip().lower() == "api":
+            # API dedupe must use current auto-captions, but still fail closed when a durable
+            # transcript exists and cannot be read.
+            durable_full_path, reused_transcription = None, None
         if reused_transcription is not None:
             try:
                 from youtube_api_metadata import fetch_video_metadata_batch, get_api_key
@@ -1304,6 +1314,9 @@ def process_single_video(
                     error_category = "DOWNLOAD_FAILED"
                     detail = stt.get_last_ytdlp_failure_reason().strip()
                     error_msg = detail if detail else "Download failed after all retry attempts"
+                    if any(word in error_msg.lower() for word in ("sign in", "private", "forbidden", "http error 403", "source unavailable")):
+                        refusal = re.sub(r"[\r\n\t]+", " ", error_msg)[:240]
+                        return _vr("SOURCE_UNAVAILABLE", video_id, f"YouTube refused caption access ({refusal}); retry on a later run", stage="download")
                     logger.error(f"[ERROR] {error_category} - URL: {v_url}")
                     logger.error(f"  Details: YouTube downloader returned None after retries — {error_msg}")
                     logger.error(f"  Possible causes: Network issue, IP block, video unavailable, or YouTube API change")
@@ -1318,6 +1331,11 @@ def process_single_video(
                 if len(download_result) >= 7 and download_result[0] == "__SKIP_AUTO_SUBS_ONLY__":
                     logger.info("[STEP 1/5] Skipped (auto_subs_only channel, no subs): %s", v_url)
                     return _vr("skipped_auto_subs_only", download_result[2], None, stage="download")
+                if len(download_result) >= 7 and download_result[0] == "__NO_AUTO_CAPTION__":
+                    return _vr("NO_AUTO_CAPTION", download_result[2], "No YouTube automatic caption track was available", stage="download")
+                if len(download_result) >= 7 and download_result[0] == "__SOURCE_UNAVAILABLE__":
+                    refusal = re.sub(r"[\r\n\t]+", " ", stt.get_last_ytdlp_failure_reason())[:240]
+                    return _vr("SOURCE_UNAVAILABLE", download_result[2], f"YouTube refused caption access ({refusal}); retry on a later run", stage="download")
             
                 audio_path_file, audio_nm, video_id, video_len, channel_id, channel_url, subs_path, subs_source, subs_lang, channel_name_from_dl, upload_date = (
                     (*download_result, None, None, None, "", "")[:11]
@@ -1350,7 +1368,7 @@ def process_single_video(
             
                 # Check for specific error types
                 if "RegexMatchError" in error_type:
-                    logger.error(f"  Cause: YouTube JavaScript structure changed (pytubefix needs update)")
+                    logger.error("  Cause: YouTube JavaScript structure changed or yt-dlp needs an update")
                 elif "VideoUnavailable" in error_type:
                     logger.error(f"  Cause: Video is unavailable or private")
                 elif "AgeRestrictedError" in error_type:
@@ -1416,13 +1434,6 @@ def process_single_video(
                         transcript_source=subs_source or "subs",
                     )
                     logger.info("  Transcript cache written for %s", video_id)
-                if config.get('USE_JOB_WORKSPACE', True) and subs_path:
-                    if job_workspace is not None:
-                        job_workspace.remove_subtitle_files()
-                    else:
-                        delete_subtitle_file(subs_path)
-                    subs_path_for_cleanup = None
-                    logger.info("  Subtitle files removed after successful parse")
                 logger.info(f"[STEP 3/5] ✓ Transcription from subtitles completed")
                 logger.info(f"  Subtitle file: {subs_path}")
                 logger.info(f"  Transcription length: {transcription_length} characters")
@@ -1434,65 +1445,19 @@ def process_single_video(
                 if config.get('USE_JOB_WORKSPACE', True) and subs_path and video_id:
                     paths = job_workspace.list_subtitle_files() if job_workspace else [subs_path]
                     quarantine_job_subtitles(work_path, video_id, paths, reason=str(e)[:200])
-                return _vr("mlx_error", video_id, error_msg, stage="transcribe")
+                return _vr("captions_error", video_id, error_msg, stage="transcribe")
         else:
-            logger.info("WHISPER_USED: True")
-            logger.info(f"  Audio file path: {audio_path_file}")
-            logger.info(f"  Model path: {hf_path}")
-            try:
-                threshold_bytes = config['AUDIO_SIZE_THRESHOLD_MB'] * 1024 * 1024
-                per_video_wav = job_workspace.output_wav_path() if job_workspace else None
-                with device_compute_route(label="whisper_mlx"):
-                    rst = stt.transcribe_by_mlx(
-                    full_load_path=audio_path_file,
-                    filename=audio_nm,
-                    save_path=output_full_path,
-                    hf_path=hf_path,
-                    base_path=base_path,
-                    video_id=video_id,
-                    audio_size_threshold_bytes=threshold_bytes,
-                    temp_path=work_path,
-                    wav_path=per_video_wav,
-                )
-            
-                if rst is not None and isinstance(rst, tuple) and len(rst) == 2 and rst[0] is None and rst[1] == "size_threshold":
-                    logger.info(f"Output WAV size >= threshold. Skipping Whisper to avoid OOM.")
-                    return _vr("oversized_file", video_id, "Output WAV size exceeds threshold (oversized file)", stage="transcribe")
-                if rst is None:
-                    error_category = "TRANSCRIPTION_FAILED"
-                    error_msg = "MLX Whisper transcription returned None"
-                    logger.error(f"[ERROR] {error_category} - Video ID: {video_id}")
-                    logger.error(f"  Audio file: {audio_path_file}")
-                    logger.error(f"  Possible causes: Audio conversion failed, model loading failed, or transcription error")
-                    logger.error(f"  Check logs for detailed error messages from transcribe_by_mlx")
-                    return _vr("mlx_error", video_id, error_msg, stage="transcribe")
-                
-                transcription, txt_file_name = rst
-                transcription_length = len(transcription)
-                durable_full_path = os.path.join(output_full_path, txt_file_name)
-                logger.info(f"[STEP 3/5] ✓ Transcription completed")
-                logger.info(f"  Transcription file: {txt_file_name}")
-                logger.info(f"  Transcription length: {transcription_length} characters")
-                
-            except FileNotFoundError as e:
-                error_category = "TRANSCRIPTION_FILE_ERROR"
-                error_msg = f"FileNotFoundError: {str(e)}"
-                logger.error(f"[ERROR] {error_category} - Video ID: {video_id}")
-                logger.error(f"  Missing file: {str(e)}")
-                logger.error(f"  Audio file path: {audio_path_file}")
-                logger.error(f"  Check if audio file exists and is accessible")
-                return _vr("mlx_error", video_id, error_msg, stage="transcribe")
-            except Exception as e:
-                error_category = "TRANSCRIPTION_EXCEPTION"
-                error_type = type(e).__name__
-                error_msg = f"{error_type}: {str(e)}"
-                logger.error(f"[ERROR] {error_category} - Video ID: {video_id}")
-                logger.error(f"  Exception Type: {error_type}")
-                logger.error(f"  Error Message: {str(e)}")
-                logger.error(f"  Audio file: {audio_path_file}")
-                logger.error(f"  Stack trace:", exc_info=True)
-                return _vr("mlx_error", video_id, error_msg, stage="transcribe")
-        
+            logger.error("Captions-only policy refused audio/ASR fallback for %s", video_id)
+            return _vr("NO_AUTO_CAPTION", video_id, "No automatic captions; audio/ASR fallback is disabled", stage="transcribe")
+
+        if (video_id and os.getenv("P03_DRIVE_BACKEND", "api" if sys.platform.startswith("linux") else "desktop").strip().lower() == "api"):
+            from drive_api_sink import DriveApiSink
+            api_sink = config.get("DRIVE_API_SINK") or DriveApiSink()
+            caption_revision_bytes = (transcription.strip() + "\n").encode("utf-8")
+            if api_sink.already_uploaded(video_id=video_id, transcript=caption_revision_bytes):
+                logger.info("Verified Drive output already exists for current auto-caption revision: %s", video_id)
+                return _vr("already_existed", video_id, None, stage="drive_dedupe", transcript_source="auto")
+
         direct_mode = config.get("LLM_PIPELINE_MODE", "legacy_two_stage") == "direct_luna"
         if direct_mode:
             concise_transcription = transcription
@@ -1751,32 +1716,68 @@ def process_single_video(
             atomic_write_text_with_retry(
                 staging_file, content_to_write, encoding="utf-8-sig", log=logger
             )
-            pub = publish_final_md(
-                rel_path=rel_md,
-                content=content_to_write,
-                staging_path=staging_file,
-                md_root=output_md_path,
-                mirror=bool(config.get("obsidian_mirror", False)),
-                base_path=base_path,
-                work_path=work_path_cfg,
-                video_id=video_id or "",
-                title=title,
-                never_mirror=(str(ch_raw).strip().casefold() == "bromath"),
-            )
-            for err in pub.errors:
-                logger.error("Final markdown publish issue (%s): %s", rel_md, err)
-            if pub.mirror_action in ("mirrored", "unchanged"):
-                effective_md_path = pub.mirror_path
-            elif pub.drive_ok:
-                effective_md_path = pub.drive_path
-            elif os.path.isfile(staging_file):
-                logger.warning("Markdown kept in local staging only (Drive failed): %s", staging_file)
-                effective_md_path = staging_file
+            api_verified = False
+            if (os.getenv("P03_DRIVE_BACKEND", "api" if sys.platform.startswith("linux") else "desktop").strip().lower() == "api"):
+                transcript_bytes = (transcription.strip() + "\n").encode("utf-8")
+                summary_bytes = content_to_write.encode("utf-8-sig")
+                transcript_staging = staging_file + ".transcript.md"
+                atomic_write_text_with_retry(transcript_staging, transcript_bytes.decode("utf-8"), encoding="utf-8", log=logger)
+                profile_revision = config.get("DIRECT_PROMPT_SHA256", "") or globals().get("DIRECT_PROMPT_SHA256", "")
+                repo_commit = os.getenv("P03_REPO_COMMIT", "").strip()
+                if not repo_commit:
+                    try:
+                        commit_result = subprocess.run(["git", "rev-parse", "HEAD"], cwd=_PROJECT_ROOT,
+                            capture_output=True, text=True, timeout=3, check=True)
+                        repo_commit = commit_result.stdout.strip()
+                    except Exception:
+                        repo_commit = "unavailable"
+                metadata = {
+                    "url": source_url, "channel": ch_raw or channel_name_from_dl or "",
+                    "published_at": upload_date or "", "caption_track": {"lang": subs_lang or "", "kind": subs_source or "auto"},
+                    "model": config.get("DIRECT_LLM_MODEL") if direct_mode else config.get("MAIN_LLM_MODEL"),
+                    "provider": config.get("MAIN_LLM_PROVIDER", "openai"),
+                    "effort": config.get("DIRECT_LLM_REASONING_EFFORT", "") if direct_mode else "",
+                    "prompt_profile_revision": profile_revision, "repo_commit": repo_commit,
+                    "run_id": run_id, "host_label": os.getenv("P03_HOST_LABEL", os.uname().nodename if hasattr(os, "uname") else ""),
+                    "transcript_date": v_date, "created_at": datetime.now().astimezone().isoformat(),
+                }
+                sink = api_sink or config.get("DRIVE_API_SINK") or DriveApiSink()
+                sink.upload_video(summary_name=output_file, summary=summary_bytes,
+                                  transcript=transcript_bytes, metadata=metadata, video_id=video_id or "")
+                api_verified = True
+                if subs_path:
+                    delete_subtitle_file(subs_path)
+                    subs_path_for_cleanup = None
+                Path(staging_file).unlink(missing_ok=True)
+                Path(transcript_staging).unlink(missing_ok=True)
+                effective_md_path = "drive-api:" + output_file
             else:
-                raise RuntimeError("final markdown publish failed: " + "; ".join(pub.errors))
+                pub = publish_final_md(
+                    rel_path=rel_md,
+                    content=content_to_write,
+                    staging_path=staging_file,
+                    md_root=output_md_path,
+                    mirror=bool(config.get("obsidian_mirror", False)),
+                    base_path=base_path,
+                    work_path=work_path_cfg,
+                    video_id=video_id or "",
+                    title=title,
+                    never_mirror=(str(ch_raw).strip().casefold() == "bromath"),
+                )
+                for err in pub.errors:
+                    logger.error("Final markdown publish issue (%s): %s", rel_md, err)
+                if pub.mirror_action in ("mirrored", "unchanged"):
+                    effective_md_path = pub.mirror_path
+                elif pub.drive_ok:
+                    effective_md_path = pub.drive_path
+                elif os.path.isfile(staging_file):
+                    logger.warning("Markdown kept in local staging only (Drive failed): %s", staging_file)
+                    effective_md_path = staging_file
+                else:
+                    raise RuntimeError("final markdown publish failed: " + "; ".join(pub.errors))
 
             assert effective_md_path is not None
-            md_file_size = os.path.getsize(effective_md_path)
+            md_file_size = len(summary_bytes) if api_verified else os.path.getsize(effective_md_path)
             logger.info(f"[STEP 7/7] ✓ Markdown saved")
             logger.info(f"  File: {effective_md_path}")
             logger.info(f"  File size: {md_file_size} bytes")
@@ -1799,7 +1800,7 @@ def process_single_video(
             wp = (config.get("WORK_PATH") or "").strip()
             dr = config.get("DATA_ROOT") or resolve_data_root(base_path, wp or None)
             # Catalog indexes the vault; only mirrored notes exist there.
-            if pub.mirror_action in ("mirrored", "unchanged"):
+            if not api_verified and pub.mirror_action in ("mirrored", "unchanged"):
                 pending_catalog = {
                     "work_path": wp,
                     "data_root": dr,
@@ -2002,6 +2003,14 @@ def process_videos(config: dict):
         url_from_input_set = set(url_list) if url_list else set()
         direct_input_set = set(url_from_input_set)
     
+    wanted_video_id = config.get("VIDEO_ID_FILTER")
+    if wanted_video_id:
+        url_list = [u for u in url_list if stt.extract_youtube_id(u) == wanted_video_id]
+        if not url_list:
+            raise ValueError(f"Requested --video-id {wanted_video_id} is not queued")
+    max_videos = config.get("MAX_VIDEOS")
+    if max_videos is not None:
+        url_list = url_list[:int(max_videos)]
     if not url_list:
         logger.info("No videos to process. All videos have been processed.")
         return
@@ -2063,7 +2072,7 @@ def process_videos(config: dict):
     # When stdout is not a real TTY (launchd/cron redirect, or e.g. python main.py >> log),
     # tqdm may call flush() on that stream and raise OSError [Errno 11] on some macOS setups.
     # In scheduled/non-interactive runs, disable tqdm rendering entirely and never write to stdout.
-    scheduled = bool(os.environ.get("LAUNCHD_SCHEDULED") or os.environ.get("CRON_SCHEDULED"))
+    scheduled = bool(os.environ.get("LAUNCHD_SCHEDULED") or os.environ.get("CRON_SCHEDULED") or os.environ.get("SYSTEMD_SCHEDULED"))
     is_tty = bool(getattr(sys.stdout, "isatty", lambda: False)())
     disable_tqdm = scheduled or (not is_tty)
     tqdm_file = None
@@ -2108,7 +2117,7 @@ def process_videos(config: dict):
         prompt_log_path=prompt_log_path,
     )
 
-    video_workers = int(config.get('VIDEO_WORKERS', 2))
+    video_workers = 1 if os.getenv("P03_DRIVE_BACKEND", "api" if sys.platform.startswith("linux") else "desktop").strip().lower() == "api" else int(config.get('VIDEO_WORKERS', 2))
     logger.info("Video workers: %d (device concurrency=%s)", video_workers, config.get('DEVICE_COMPUTE_CONCURRENCY', 1))
 
     worker_openai_clients: List[OpenAI] = [openai_client]
@@ -2154,8 +2163,9 @@ def process_videos(config: dict):
                 claim_vid = ""
         return claim_vid
 
+    api_storage_failure = False
     def _finalize_result(result: VideoProcessResult, v_url: str, claim_vid: str, i: int, pbar) -> None:
-        nonlocal output_df, crawl_queue_df, consecutive_failures, counter, last_success_time
+        nonlocal output_df, crawl_queue_df, consecutive_failures, counter, last_success_time, api_storage_failure
         state_writer.apply(result)
         output_df = state_writer.get_output_df()
         crawl_queue_df = state_writer.get_crawl_queue_df()
@@ -2165,7 +2175,9 @@ def process_videos(config: dict):
             claim_mgr.release(result.video_id)
         status = result.status
         error_msg = result.error_message
-        if status in ["error", "download_failed", "mlx_error", "api_error", "file_error"]:
+        if "DriveUploadError" in (error_msg or ""):
+            api_storage_failure = True
+        if status in ["error", "download_failed", "mlx_error", "captions_error", "SOURCE_UNAVAILABLE", "source_unavailable", "api_error", "file_error"]:
             failed_urls.append((v_url, error_msg))
             consecutive_failures += 1
             download_limiter.record_failure(
@@ -2243,6 +2255,9 @@ def process_videos(config: dict):
                     continue
                 result = _worker_run(0, v_url, video_config, claim_vid)
                 _finalize_result(result, v_url, claim_vid, i, pbar)
+                if api_storage_failure:
+                    logger.error("Pausing batch after persistent Drive API failure; local staged result was retained")
+                    break
         else:
             from concurrent.futures import wait, FIRST_COMPLETED
             with ThreadPoolExecutor(max_workers=video_workers) as executor:
@@ -2254,7 +2269,7 @@ def process_videos(config: dict):
                     if consecutive_failures >= max_consecutive_failures:
                         download_limiter.set_extended_block(extended_duration * failure_multiplier)
                         consecutive_failures = 0
-                    while submitted < len(url_list) and len(in_flight) < video_workers:
+                    while submitted < len(url_list) and len(in_flight) < video_workers and not api_storage_failure:
                         try:
                             i, v_url = next(url_iter2)
                         except StopIteration:
@@ -2438,52 +2453,16 @@ def process_videos(config: dict):
         except Exception as e:
             logger.warning(f"Failed to save failed URLs file: {str(e)}")
 
-def initialize_mlx_model(config: dict, logger: logging.Logger) -> bool:
-    """
-    Initialize MLX Whisper model once at startup.
-    This pre-loads the model to avoid reloading for each video.
-    
-    Args:
-        config: Configuration dictionary
-        logger: Logger instance
-    
-    Returns:
-        True if model initialized successfully, False otherwise
-    """
-    try:
-        hf_path = config.get('HF_HOME')
-        if not hf_path:
-            logger.warning("HF_HOME not set, skipping model pre-load")
-            return False
-        
-        logger.info("=" * 60)
-        logger.info("Initializing MLX Whisper model (한 번만 로드하여 재사용)")
-        logger.info(f"  Model path: {hf_path}")
-        logger.info("  This may take a moment on first run...")
-        logger.info("=" * 60)
-        
-        # Pre-load the model (default: turbo)
-        model = stt.load_mlx_model(hf_path, mlx_model="turbo")
-        
-        if model is not None:
-            logger.info("✓ MLX Whisper model initialized successfully")
-            logger.info("  Model will be reused for all transcriptions (빠른 처리)")
-            logger.info("=" * 60)
-            return True
-        else:
-            logger.warning("Failed to pre-load model, will load on first transcription")
-            return False
-            
-    except Exception as e:
-        error_type = type(e).__name__
-        logger.warning(f"[WARNING] Failed to pre-load MLX Whisper model")
-        logger.warning(f"  Exception Type: {error_type}")
-        logger.warning(f"  Error: {str(e)}")
-        logger.warning("  Will load model on first transcription (slower)")
-        return False
-
-def main():
+def main(argv=None):
     """Main entry point."""
+    parser = argparse.ArgumentParser(description="P03 YouTube captions batch")
+    parser.add_argument("--max-videos", type=int, default=None, help="Process at most N videos")
+    parser.add_argument("--video-id", default=None, help="Process only the specified YouTube video ID")
+    args = parser.parse_args(argv)
+    if args.max_videos is not None and args.max_videos < 1:
+        parser.error("--max-videos must be positive")
+    if args.video_id and not re.fullmatch(r"[A-Za-z0-9_-]{11}", args.video_id):
+        parser.error("--video-id must be an 11-character YouTube ID")
     start_time = time.time()
     lock_handle = None
     
@@ -2494,9 +2473,11 @@ def main():
         logger.info("=" * 60)
         
         config = load_config()
+        config["MAX_VIDEOS"] = args.max_videos
+        config["VIDEO_ID_FILTER"] = args.video_id
         logger.info("Configuration loaded successfully")
 
-        run_source = "scheduled" if (os.environ.get("LAUNCHD_SCHEDULED") or os.environ.get("CRON_SCHEDULED")) else "manual"
+        run_source = "scheduled" if (os.environ.get("LAUNCHD_SCHEDULED") or os.environ.get("CRON_SCHEDULED") or os.environ.get("SYSTEMD_SCHEDULED")) else "manual"
         acquired, lock_handle, lock_message = run_lock.acquire_run_lock(
             config.get("BASE_PATH", "."),
             run_source,
@@ -2507,7 +2488,7 @@ def main():
             return
         logger.info("Run lock acquired (source=%s, channel_crawl=%s)", run_source, bool(config.get("CHANNEL_CRAWL")))
         
-        scheduled_env = bool(os.environ.get("LAUNCHD_SCHEDULED") or os.environ.get("CRON_SCHEDULED"))
+        scheduled_env = bool(os.environ.get("LAUNCHD_SCHEDULED") or os.environ.get("CRON_SCHEDULED") or os.environ.get("SYSTEMD_SCHEDULED"))
 
         # 스케줄로 실행된 경우: CHANNEL_CRAWL=false면 실행하지 않고 종료 (input_df 모드는 수동 실행만)
         if scheduled_env and not config.get("CHANNEL_CRAWL"):
@@ -2515,7 +2496,7 @@ def main():
             return
         
         # 수동 실행인데 launchd가 로드돼 있으면 경고 후 종료 (이중 프로세스 방지; 수동 실행은 launchd unload 후에만)
-        if not scheduled_env:
+        if not scheduled_env and sys.platform == "darwin":
             try:
                 r = subprocess.run(
                     ["launchctl", "list"],
@@ -2532,9 +2513,6 @@ def main():
                     sys.exit(0)
             except (FileNotFoundError, subprocess.TimeoutExpired, Exception):
                 pass
-        
-        # Initialize MLX Whisper model once at startup (optimization)
-        initialize_mlx_model(config, logger)
         
         process_videos(config)
         

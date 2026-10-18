@@ -1,0 +1,12 @@
+[Unit]
+Description=Run P03 at 03:00, 09:00, and 15:00 Asia/Seoul
+
+[Timer]
+OnCalendar=*-*-* 03:00:00 Asia/Seoul
+OnCalendar=*-*-* 09:00:00 Asia/Seoul
+OnCalendar=*-*-* 15:00:00 Asia/Seoul
+Persistent=true
+Unit=p03-batch.service
+
+[Install]
+WantedBy=timers.target

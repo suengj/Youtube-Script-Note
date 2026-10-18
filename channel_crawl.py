@@ -74,7 +74,7 @@ CRAWL_QUEUE_COLUMNS = [
 ]
 DONE_STATUSES = {"success", "already_existed", "oversized_file"}
 SKIPPED_AUTO_SUBS_ONLY_STATUS = "skipped_auto_subs_only"
-FAILED_STATUSES = {"error", "download_failed", "mlx_error", "api_error", "file_error"}
+FAILED_STATUSES = {"error", "download_failed", "mlx_error", "captions_error", "SOURCE_UNAVAILABLE", "source_unavailable", "api_error", "file_error"}
 SHORTS_STATUS = "passed_shorts"
 LIVE_SCHEDULED_STATUS = "live_scheduled"
 VIDEO_UNAVAILABLE_STATUS = "video_unavailable"
@@ -508,7 +508,7 @@ def reconcile_queue_with_output_df(
                 q.at[idx, "done_at"] = ""
                 q.at[idx, "last_error"] = ""
             continue
-        if st in DONE_STATUSES or st == SHORTS_STATUS or st == LIVE_SCHEDULED_STATUS or st == VIDEO_UNAVAILABLE_STATUS or st == SKIPPED_AUTO_SUBS_ONLY_STATUS:
+        if st in DONE_STATUSES or st in {"NO_AUTO_CAPTION", "no_auto_caption"} or st == SHORTS_STATUS or st == LIVE_SCHEDULED_STATUS or st == VIDEO_UNAVAILABLE_STATUS or st == SKIPPED_AUTO_SUBS_ONLY_STATUS:
             q.at[idx, "status"] = "done"
             if not str(q.at[idx, "done_at"]).strip():
                 q.at[idx, "done_at"] = now_iso
@@ -550,7 +550,7 @@ def apply_result_to_queue(queue_df, video_id: str, status: str, error_msg: Optio
     now_iso = _now_iso()
     q.at[idx, "last_attempted_at"] = now_iso
 
-    if status in DONE_STATUSES or status == SHORTS_STATUS or status == LIVE_SCHEDULED_STATUS or status == VIDEO_UNAVAILABLE_STATUS or status == SKIPPED_AUTO_SUBS_ONLY_STATUS:
+    if status in DONE_STATUSES or status in {"NO_AUTO_CAPTION", "no_auto_caption"} or status == SHORTS_STATUS or status == LIVE_SCHEDULED_STATUS or status == VIDEO_UNAVAILABLE_STATUS or status == SKIPPED_AUTO_SUBS_ONLY_STATUS:
         q.at[idx, "status"] = "done"
         q.at[idx, "done_at"] = now_iso
         q.at[idx, "last_error"] = ""
