@@ -1,0 +1,12 @@
+#!/bin/zsh
+set -eu
+
+if [[ -z "${P03_RECEIVE_ENV_FILE:-}" || ! -r "$P03_RECEIVE_ENV_FILE" ]]; then
+  print -u2 "P03_RECEIVE_ENV_FILE must name a readable owner-managed env file"
+  exit 2
+fi
+set -a
+source "$P03_RECEIVE_ENV_FILE"
+set +a
+
+exec /opt/homebrew/bin/python3 scripts/obsidian_receive.py
