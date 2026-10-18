@@ -61,6 +61,8 @@ class _FakeDrive:
             if self.bad_readback == "appProperties": meta["appProperties"]["p03_input_revision"] = "wrong"
             return meta
         return _Request(run)
+    def get_media(self, fileId):
+        return _Request(lambda: self.items[fileId].get("data", b""))
 
 
 def _install_fake_media():
@@ -92,6 +94,25 @@ class Sue1299DriveSinkTests(unittest.TestCase):
     self.assertEqual(second["summary"]["appProperties"]["p03_kind"], "summary")
     self.assertTrue(sink.already_uploaded(video_id=VIDEO_ID, transcript=b"# title\ntext"))
     self.assertFalse(sink.already_uploaded(video_id=VIDEO_ID, transcript=b"different revision"))
+
+  def test_dedupe_rejects_tagged_artifact_with_corrupt_bytes(self):
+    drive = _FakeDrive()
+    sink = DriveApiSink(drive)
+    sink.upload_video(summary_name=f"title_{VIDEO_ID}.md", summary=b"summary", transcript=b"caption", metadata={}, video_id=VIDEO_ID)
+    summary = next(item for item in drive.items.values() if item.get("appProperties", {}).get("p03_kind") == "summary")
+    summary["data"] = b"mutated bytes"
+    self.assertFalse(sink.already_uploaded(video_id=VIDEO_ID, transcript=b"caption"))
+
+  def test_dedupe_checks_all_three_inner_records_and_revision(self):
+    drive = _FakeDrive()
+    sink = DriveApiSink(drive)
+    sink.upload_video(summary_name=f"title_{VIDEO_ID}.md", summary=b"summary", transcript=b"caption", metadata={}, video_id=VIDEO_ID)
+    for kind in ("summary", "transcript", "metadata"):
+      with self.subTest(kind=kind):
+        item = next(item for item in drive.items.values() if item.get("appProperties", {}).get("p03_kind") == kind)
+        item["appProperties"]["p03_input_revision"] = "wrong"
+        self.assertFalse(sink.already_uploaded(video_id=VIDEO_ID, transcript=b"caption"))
+        item["appProperties"]["p03_input_revision"] = __import__("hashlib").sha256(b"caption").hexdigest()
 
 
   def test_source_identity_and_path_substitution_fail_closed(self):
@@ -203,6 +224,78 @@ class Sue1299DriveSinkTests(unittest.TestCase):
     self.assertTrue(captured["ignore_no_formats_error"])
     for forbidden in ("format", "postprocessors", "extractor_args", "outtmpl", "keepvideo", "progress_hooks"):
       self.assertNotIn(forbidden, captured)
+
+  def test_existing_caption_download_failure_is_retryable_not_no_caption(self):
+    import stt_function_v3 as stt
+    captured = {}
+    class FakeYoutubeDL:
+      def __init__(self, options): captured.update(options)
+      def __enter__(self): return self
+      def __exit__(self, *args): return False
+      def extract_info(self, url, download=False):
+        return {"id": VIDEO_ID, "automatic_captions": {"en": [{"url": "fake"}]}}
+      def download(self, urls):
+        raise stt.yt_dlp.utils.DownloadError("HTTP Error 429: Too Many Requests")
+    with tempfile.TemporaryDirectory() as temp_dir, patch.object(stt.yt_dlp, "YoutubeDL", FakeYoutubeDL), patch.object(stt.time, "sleep", return_value=None):
+      result = stt.yt_downloader_ytdlp(
+        f"https://www.youtube.com/watch?v={VIDEO_ID}", temp_dir, VIDEO_ID, max_retries=1,
+        config={"BASE_PATH": temp_dir, "WORK_PATH": temp_dir, "JOB_SUBS_DIR": temp_dir},
+      )
+    self.assertEqual(result[0], "__SOURCE_UNAVAILABLE__")
+    self.assertTrue(captured["skip_download"])
+
+  def test_generation_cache_binds_source_and_refuses_symlink_malformed_and_oversized(self):
+    from job_workspace import VideoJobWorkspace
+    with tempfile.TemporaryDirectory() as temp_dir:
+      workspace = VideoJobWorkspace(temp_dir, VIDEO_ID)
+      args = dict(input_revision="rev", model="model", prompt_sha256="prompt", summary="cached")
+      workspace.save_generation_result(**args)
+      self.assertEqual(workspace.load_generation_result(input_revision="rev", model="model", prompt_sha256="prompt"), "cached")
+      self.assertIsNone(workspace.load_generation_result(input_revision="other", model="model", prompt_sha256="prompt"))
+      self.assertIsNone(workspace.load_generation_result(input_revision="rev", model="other", prompt_sha256="prompt"))
+      self.assertIsNone(workspace.load_generation_result(input_revision="rev", model="model", prompt_sha256="other"))
+      path = Path(workspace.generation_cache_path())
+      import json
+      record = json.loads(path.read_text(encoding="utf-8"))
+      record["summary"] = "substituted"
+      path.write_text(json.dumps(record), encoding="utf-8")
+      self.assertIsNone(workspace.load_generation_result(input_revision="rev", model="model", prompt_sha256="prompt"))
+      path.unlink()
+      target = Path(temp_dir) / "outside.json"
+      target.write_text("{}", encoding="utf-8")
+      path.symlink_to(target)
+      self.assertIsNone(workspace.load_generation_result(input_revision="rev", model="model", prompt_sha256="prompt"))
+      path.unlink()
+      path.write_text("{", encoding="utf-8")
+      self.assertIsNone(workspace.load_generation_result(input_revision="rev", model="model", prompt_sha256="prompt"))
+      path.write_bytes(b" " * (64 * 1024 * 1024 + 1))
+      self.assertIsNone(workspace.load_generation_result(input_revision="rev", model="model", prompt_sha256="prompt"))
+
+  def test_failed_auto_caption_status_remains_selectable_for_retry(self):
+    import pandas as pd
+    import channel_crawl
+    queue = pd.DataFrame([{"video_id": VIDEO_ID, "status": "queued", "retry_count": 0, "last_attempted_at": "", "done_at": "", "last_error": "", "published_at": "", "discovered_at": ""}])
+    failed = channel_crawl.apply_result_to_queue(queue, VIDEO_ID, "SOURCE_UNAVAILABLE", "HTTP 429")
+    self.assertEqual(failed.iloc[0]["status"], "failed")
+    self.assertEqual(len(channel_crawl.select_process_candidates(failed, max_retries=3)), 1)
+
+  def test_retry_checks_persisted_summary_before_any_llm_stage(self):
+    source = (ROOT / "main.py").read_text(encoding="utf-8")
+    process = source[source.index("def process_single_video("):source.index("def process_videos(")]
+    cache_check = process.index("cached_response = (job_workspace.load_generation_result")
+    preprocess = process.index("# Step 4: Token minimization")
+    summarize = process.index("response, usage = summarize_with_pipeline(")
+    self.assertLess(cache_check, preprocess)
+    self.assertIn("if cached_response is not None:", process[cache_check:summarize])
+    self.assertIn("if cached_response is None and job_workspace is not None:", process)
+
+  def test_verified_dedupe_marks_success_and_removes_vtt_before_return(self):
+    source = (ROOT / "main.py").read_text(encoding="utf-8")
+    process = source[source.index("def process_single_video("):source.index("def process_videos(")]
+    dedupe = process[process.index("if api_sink.already_uploaded"):process.index("direct_mode =", process.index("if api_sink.already_uploaded"))]
+    self.assertIn("delete_subtitle_file(subs_path)", dedupe)
+    self.assertIn("job_workspace.remove_subtitle_files()", dedupe)
+    self.assertIn("pipeline_success = True", dedupe)
 
 
 if __name__ == "__main__":

@@ -1456,10 +1456,24 @@ def process_single_video(
             caption_revision_bytes = (transcription.strip() + "\n").encode("utf-8")
             if api_sink.already_uploaded(video_id=video_id, transcript=caption_revision_bytes):
                 logger.info("Verified Drive output already exists for current auto-caption revision: %s", video_id)
+                if subs_path:
+                    delete_subtitle_file(subs_path)
+                if job_workspace is not None:
+                    job_workspace.remove_subtitle_files()
+                pipeline_success = True
                 return _vr("already_existed", video_id, None, stage="drive_dedupe", transcript_source="auto")
 
         direct_mode = config.get("LLM_PIPELINE_MODE", "legacy_two_stage") == "direct_luna"
-        if direct_mode:
+        selected_model = (config.get("DIRECT_LLM_MODEL") or "gpt-6-luna") if direct_mode else main_llm.primary_model
+        prompt_material = (str(config.get("DIRECT_PROMPT_SHA256", "") or globals().get("DIRECT_PROMPT_SHA256", "")) + "\n" + str(INPUT_PROMPT))
+        generation_prompt_sha = hashlib.sha256(prompt_material.encode("utf-8")).hexdigest()
+        caption_revision = hashlib.sha256((transcription.strip() + "\n").encode("utf-8")).hexdigest()
+        cached_response = (job_workspace.load_generation_result(input_revision=caption_revision,
+            model=str(selected_model), prompt_sha256=generation_prompt_sha) if job_workspace is not None else None)
+        if cached_response is not None:
+            concise_transcription = transcription
+            concise_length = len(concise_transcription)
+        elif direct_mode:
             concise_transcription = transcription
             concise_length = len(concise_transcription)
         else:
@@ -1591,7 +1605,10 @@ def process_single_video(
         if provider_cooldown:
             provider_cooldown.wait_if_needed()
         try:
-            if direct_mode:
+            if cached_response is not None:
+                response = cached_response
+                logger.info("Resuming upload from revision-bound generated summary for %s", video_id)
+            elif direct_mode:
                 try:
                     response, usage = summarize_with_pipeline(
                         "direct_luna", direct_client=openai_client, main_llm=main_llm,
@@ -1610,6 +1627,9 @@ def process_single_video(
                     direct_transcription=transcription, legacy_transcription=concise_transcription,
                     filename=audio_nm, video_id=video_id, config=config, prompt=INPUT_PROMPT,
                 )
+            if cached_response is None and job_workspace is not None:
+                job_workspace.save_generation_result(input_revision=caption_revision,
+                    model=str(selected_model), prompt_sha256=generation_prompt_sha, summary=response)
             response_length = len(response)
             logger.info(f"[STEP 6/7] ✓ Full summary generated")
             logger.info(f"  Response length: {response_length} characters")

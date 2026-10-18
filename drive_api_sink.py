@@ -151,7 +151,60 @@ class DriveApiSink:
         except Exception as exc:
             raise DriveUploadError(f"Drive dedupe lookup failed: {type(exc).__name__}") from exc
         all_files = summaries + children
-        kinds = {f.get("appProperties", {}).get("p03_kind") for f in all_files
-                 if f.get("appProperties", {}).get("p03_video_id") == video_id
-                 and f.get("appProperties", {}).get("p03_input_revision") == input_revision}
-        return {"summary", "transcript", "metadata"}.issubset(kinds)
+        matched = {}
+        for item in all_files:
+            props = item.get("appProperties", {})
+            kind = props.get("p03_kind")
+            if (kind in {"summary", "transcript", "metadata"} and
+                    props.get("p03_video_id") == video_id and
+                    props.get("p03_input_revision") == input_revision):
+                matched.setdefault(kind, item)
+        if set(matched) != {"summary", "transcript", "metadata"}:
+            return False
+        expected_transcript_md5 = hashlib.md5(transcript).hexdigest()
+        try:
+            readbacks = {kind: self._drive.files().get(
+                fileId=item["id"], fields="id,parents,size,md5Checksum,appProperties",
+                supportsAllDrives=True).execute() for kind, item in matched.items()}
+            for kind, meta in readbacks.items():
+                parent = self.source_folder_id if kind == "summary" else transcript_folder
+                props = meta.get("appProperties", {})
+                if (meta.get("id") != matched[kind].get("id") or
+                        parent not in meta.get("parents", []) or
+                        int(meta.get("size", -1)) < 0 or
+                        not re.fullmatch(r"[0-9a-f]{32}", str(meta.get("md5Checksum", ""))) or
+                        props.get("p03_video_id") != video_id or
+                        props.get("p03_kind") != kind or
+                        props.get("p03_input_revision") != input_revision):
+                    return False
+            transcript_meta = readbacks["transcript"]
+            if (int(transcript_meta["size"]) != len(transcript) or
+                    transcript_meta["md5Checksum"] != expected_transcript_md5):
+                return False
+            # Metadata records the summary and transcript digests, which bind the
+            # summary bytes to this exact input revision.
+            metadata_content = self._drive.files().get_media(fileId=matched["metadata"]["id"]).execute()
+            if isinstance(metadata_content, str):
+                metadata_content = metadata_content.encode("utf-8")
+            metadata_meta = readbacks["metadata"]
+            if (len(metadata_content) != int(metadata_meta["size"]) or
+                    hashlib.md5(metadata_content).hexdigest() != metadata_meta["md5Checksum"]):
+                return False
+            metadata = json.loads(metadata_content.decode("utf-8"))
+            summary_meta = readbacks["summary"]
+            if (int(summary_meta["size"]) <= 0 or
+                    metadata.get("video_id") != video_id or
+                    metadata.get("transcript_sha256") != input_revision or
+                    not re.fullmatch(r"[0-9a-f]{64}", str(metadata.get("summary_sha256", ""))) or
+                    int(summary_meta["size"]) <= 0):
+                return False
+            # Drive's md5 is an independently read back checksum; metadata stores
+            # SHA-256. Fetch the summary bytes to compare both representations.
+            summary_content = self._drive.files().get_media(fileId=matched["summary"]["id"]).execute()
+            if isinstance(summary_content, str):
+                summary_content = summary_content.encode("utf-8")
+            return (_sha(summary_content) == metadata["summary_sha256"] and
+                    hashlib.md5(summary_content).hexdigest() == summary_meta["md5Checksum"] and
+                    len(summary_content) == int(summary_meta["size"]))
+        except Exception:
+            return False

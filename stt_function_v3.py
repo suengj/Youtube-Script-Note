@@ -906,7 +906,12 @@ def yt_downloader_ytdlp(URL, DOWNLOAD_PATH, video_id, max_retries=3, config=None
                 channel_url = info.get('channel_url', '')
                 channel_name = info.get('uploader') or info.get('channel') or ''
                 title = info.get('title', f'video_{video_id}')
-                has_auto_captions = bool(info.get("automatic_captions"))
+                auto_tracks = info.get("automatic_captions") or {}
+                accepted_langs = [str(lang).lower() for lang in subs_langs]
+                has_auto_captions = any(
+                    lang in auto_tracks or any(key.startswith(lang + "-") for key in auto_tracks)
+                    for lang in accepted_langs
+                )
                 allow_uploader_subs = (os.getenv("P03_ALLOW_UPLOADER_SUBS", "").strip() == "1")
                 # auto_subs_only channel: process only when 자막 OR 자동 자막 exists; skip if neither
                 auto_subs_only = bool(config.get("auto_subs_only")) if config else False
@@ -964,8 +969,8 @@ def yt_downloader_ytdlp(URL, DOWNLOAD_PATH, video_id, max_retries=3, config=None
                 if not has_auto_captions:
                     _set_last_ytdlp_failure("NO_AUTO_CAPTION")
                     return ("__NO_AUTO_CAPTION__", None, video_id, video_len, channel_id, channel_url, None, None, None, channel_name, _format_upload_date(info))
-                _set_last_ytdlp_failure("NO_AUTO_CAPTION")
-                return ("__NO_AUTO_CAPTION__", None, video_id, video_len, channel_id, channel_url, None, None, None, channel_name, _format_upload_date(info))
+                _set_last_ytdlp_failure("SOURCE_UNAVAILABLE: automatic caption track download failed")
+                return ("__SOURCE_UNAVAILABLE__", None, video_id, video_len, channel_id, channel_url, None, None, None, channel_name, _format_upload_date(info))
         except yt_dlp.utils.DownloadError as e:
             error_msg = str(e)
             _set_last_ytdlp_failure(error_msg)
