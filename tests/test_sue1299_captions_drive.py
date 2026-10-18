@@ -5,6 +5,7 @@ import sys
 import tempfile
 import types
 import unittest
+from contextlib import ExitStack
 from pathlib import Path
 from unittest.mock import patch
 
@@ -271,6 +272,40 @@ class Sue1299DriveSinkTests(unittest.TestCase):
       path.write_bytes(b" " * (64 * 1024 * 1024 + 1))
       self.assertIsNone(workspace.load_generation_result(input_revision="rev", model="model", prompt_sha256="prompt"))
 
+  def test_generation_cache_reads_open_file_when_path_is_replaced(self):
+    import hashlib
+    import json
+    import os
+    import job_workspace
+    from job_workspace import VideoJobWorkspace
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+      workspace = VideoJobWorkspace(temp_dir, VIDEO_ID)
+      args = dict(input_revision="rev", model="model", prompt_sha256="prompt")
+      workspace.save_generation_result(**args, summary="canonical cached summary")
+      cache_path = Path(workspace.generation_cache_path())
+      replacement_path = cache_path.with_suffix(".replacement")
+      replacement = json.loads(cache_path.read_text(encoding="utf-8"))
+      replacement["summary"] = "substituted after open"
+      replacement["summary_sha256"] = hashlib.sha256(replacement["summary"].encode("utf-8")).hexdigest()
+      replacement_path.write_text(json.dumps(replacement), encoding="utf-8")
+      real_open = os.open
+      replaced = False
+
+      def open_then_replace(path, flags, *open_args, **open_kwargs):
+        nonlocal replaced
+        fd = real_open(path, flags, *open_args, **open_kwargs)
+        if os.fspath(path) == str(cache_path) and not replaced:
+          replaced = True
+          os.replace(replacement_path, cache_path)
+        return fd
+
+      with patch.object(job_workspace.os, "open", side_effect=open_then_replace):
+        result = workspace.load_generation_result(**args)
+
+      self.assertTrue(replaced)
+      self.assertEqual(result, "canonical cached summary")
+
   def test_failed_auto_caption_status_remains_selectable_for_retry(self):
     import pandas as pd
     import channel_crawl
@@ -280,22 +315,119 @@ class Sue1299DriveSinkTests(unittest.TestCase):
     self.assertEqual(len(channel_crawl.select_process_candidates(failed, max_retries=3)), 1)
 
   def test_retry_checks_persisted_summary_before_any_llm_stage(self):
-    source = (ROOT / "main.py").read_text(encoding="utf-8")
-    process = source[source.index("def process_single_video("):source.index("def process_videos(")]
-    cache_check = process.index("cached_response = (job_workspace.load_generation_result")
-    preprocess = process.index("# Step 4: Token minimization")
-    summarize = process.index("response, usage = summarize_with_pipeline(")
-    self.assertLess(cache_check, preprocess)
-    self.assertIn("if cached_response is not None:", process[cache_check:summarize])
-    self.assertIn("if cached_response is None and job_workspace is not None:", process)
+    import pandas as pd
+    import main
+
+    class UploadOnceThenSucceed:
+      def __init__(self): self.uploads = []
+      def already_uploaded(self, **kwargs): return False
+      def upload_video(self, **kwargs):
+        self.uploads.append(kwargs)
+        if len(self.uploads) == 1:
+          raise RuntimeError("synthetic first upload failure")
+        return {"verified": True}
+
+    class Preprocessor:
+      def minimize(self, role, query, text, **kwargs): return "concise transcript"
+
+    class Usage:
+      def to_dict(self): return {"total_tokens": 1}
+
+    for mode in ("legacy_two_stage", "direct_luna"):
+      with self.subTest(mode=mode), tempfile.TemporaryDirectory() as temp_dir:
+        root = Path(temp_dir)
+        for name in ("audio", "full", "smm", "md", "logs", "hf"):
+          (root / name).mkdir()
+        sink = UploadOnceThenSucceed()
+        calls = []
+
+        def download(**kwargs):
+          subs_dir = Path(kwargs["config"]["JOB_SUBS_DIR"])
+          subs_dir.mkdir(parents=True, exist_ok=True)
+          subs = subs_dir / f"{VIDEO_ID}.en.vtt"
+          subs.write_text("WEBVTT\n\n00:00:00.000 --> 00:00:01.000\ncaption text\n", encoding="utf-8")
+          return (None, "title", VIDEO_ID, 0, "", "", str(subs), "auto", "en", "channel", "20240101")
+
+        config = {
+          "WORK_PATH": temp_dir, "DATA_ROOT": temp_dir, "USE_JOB_WORKSPACE": True,
+          "TRANSCRIPT_CACHE_ENABLED": False, "SAVE_FULL_WHEN_AUTO_SUBS": False,
+          "LLM_PIPELINE_MODE": mode, "DRIVE_API_SINK": sink,
+          "DIRECT_LLM_MODEL": "fake-direct", "MAIN_LLM_OUTPUT_SUFFIX": "5-mini",
+        }
+        args = (
+          f"https://www.youtube.com/watch?v={VIDEO_ID}", config, None,
+          types.SimpleNamespace(primary_model="fake-legacy", primary_provider="fake", has_fallback=False),
+          pd.DataFrame(), temp_dir, str(root / "audio"), str(root / "full"),
+          str(root / "smm"), str(root / "md"), str(root / "logs"), str(root / "hf"),
+        )
+        with ExitStack() as stack:
+          stack.enter_context(patch.dict("os.environ", {"P03_DRIVE_BACKEND": "api", "P03_REPO_COMMIT": "synthetic-test-revision"}))
+          stack.enter_context(patch.object(main.stt, "extract_youtube_id", return_value=VIDEO_ID))
+          stack.enter_context(patch.object(main.stt, "clear_last_ytdlp_failure"))
+          stack.enter_context(patch.object(main.stt, "yt_downloader", side_effect=download))
+          stack.enter_context(patch.object(main.stt, "subtitle_file_to_plain_text", return_value="caption text"))
+          stack.enter_context(patch.object(main.stt, "sanitize_filename", side_effect=lambda value, **kwargs: value))
+          stack.enter_context(patch.object(main.stt, "count_tokens", return_value=1))
+          stack.enter_context(patch.object(main, "_build_transcript_cache", return_value=types.SimpleNamespace(put=lambda *a, **k: None)))
+          stack.enter_context(patch.object(main, "summarize_with_pipeline", side_effect=lambda *a, **k: (calls.append(mode) or "# Title\nsummary", Usage())))
+          stack.enter_context(patch.object(main, "_append_llm_usage"))
+          stack.enter_context(patch.object(main, "_find_exact_durable_full_transcript", return_value=None))
+          stack.enter_context(patch.object(main, "_read_durable_full_transcript", return_value=(None, None)))
+          stack.enter_context(patch.object(main, "atomic_write_text_with_retry"))
+          first = main.process_single_video(*args, preprocessor=Preprocessor())
+          self.assertEqual(first.status, "file_error", first.error_message)
+          self.assertTrue((root / "tmp/jobs" / VIDEO_ID / f"{VIDEO_ID}.en.vtt").is_file())
+          second = main.process_single_video(*args, preprocessor=Preprocessor())
+
+        self.assertEqual(second.status, "success")
+        self.assertEqual(len(calls), 1, "cached retry must not make another summary LLM call")
+        self.assertEqual(len(sink.uploads), 2, "upload should be attempted again from cached summary")
+        self.assertFalse((root / "tmp/jobs" / VIDEO_ID / f"{VIDEO_ID}.en.vtt").exists(), "verified upload deletes the subtitle VTT")
+        self.assertFalse((root / "tmp/jobs" / VIDEO_ID).exists(), "verified success cleans the job workspace")
 
   def test_verified_dedupe_marks_success_and_removes_vtt_before_return(self):
-    source = (ROOT / "main.py").read_text(encoding="utf-8")
-    process = source[source.index("def process_single_video("):source.index("def process_videos(")]
-    dedupe = process[process.index("if api_sink.already_uploaded"):process.index("direct_mode =", process.index("if api_sink.already_uploaded"))]
-    self.assertIn("delete_subtitle_file(subs_path)", dedupe)
-    self.assertIn("job_workspace.remove_subtitle_files()", dedupe)
-    self.assertIn("pipeline_success = True", dedupe)
+    import pandas as pd
+    import main
+
+    class VerifiedDedupeSink:
+      def already_uploaded(self, **kwargs): return True
+      def upload_video(self, **kwargs): raise AssertionError("dedupe must not upload")
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+      root = Path(temp_dir)
+      for name in ("audio", "full", "smm", "md", "logs", "hf"):
+        (root / name).mkdir()
+      sink = VerifiedDedupeSink()
+
+      def download(**kwargs):
+        subs_dir = Path(kwargs["config"]["JOB_SUBS_DIR"])
+        subs_dir.mkdir(parents=True, exist_ok=True)
+        subs = subs_dir / f"{VIDEO_ID}.en.vtt"
+        subs.write_text("WEBVTT\ncaption text\n", encoding="utf-8")
+        return (None, "title", VIDEO_ID, 0, "", "", str(subs), "auto", "en", "channel", "20240101")
+
+      config = {"WORK_PATH": temp_dir, "DATA_ROOT": temp_dir, "USE_JOB_WORKSPACE": True,
+                "TRANSCRIPT_CACHE_ENABLED": False, "SAVE_FULL_WHEN_AUTO_SUBS": False,
+                "DRIVE_API_SINK": sink}
+      args = (f"https://www.youtube.com/watch?v={VIDEO_ID}", config, None, None,
+              pd.DataFrame(), temp_dir, str(root / "audio"), str(root / "full"),
+              str(root / "smm"), str(root / "md"), str(root / "logs"), str(root / "hf"))
+      with ExitStack() as stack:
+        stack.enter_context(patch.dict("os.environ", {"P03_DRIVE_BACKEND": "api", "P03_REPO_COMMIT": "synthetic-test-revision"}))
+        stack.enter_context(patch.object(main.stt, "extract_youtube_id", return_value=VIDEO_ID))
+        stack.enter_context(patch.object(main.stt, "clear_last_ytdlp_failure"))
+        stack.enter_context(patch.object(main.stt, "yt_downloader", side_effect=download))
+        stack.enter_context(patch.object(main.stt, "subtitle_file_to_plain_text", return_value="caption text"))
+        stack.enter_context(patch.object(main.stt, "sanitize_filename", side_effect=lambda value, **kwargs: value))
+        stack.enter_context(patch.object(main, "_build_transcript_cache", return_value=types.SimpleNamespace(put=lambda *a, **k: None)))
+        stack.enter_context(patch.object(main, "_find_exact_durable_full_transcript", return_value=None))
+        stack.enter_context(patch.object(main, "_read_durable_full_transcript", return_value=(None, None)))
+        result = main.process_single_video(*args)
+
+      self.assertEqual(result.status, "already_existed")
+      self.assertEqual(result.stage, "drive_dedupe")
+      self.assertFalse((root / "tmp/jobs" / VIDEO_ID / f"{VIDEO_ID}.en.vtt").exists(), "verified dedupe deletes the subtitle VTT")
+      self.assertFalse((root / "tmp/jobs" / VIDEO_ID).exists(), "verified dedupe cleans the job workspace")
 
 
 if __name__ == "__main__":

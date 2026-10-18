@@ -1470,6 +1470,11 @@ def process_single_video(
         caption_revision = hashlib.sha256((transcription.strip() + "\n").encode("utf-8")).hexdigest()
         cached_response = (job_workspace.load_generation_result(input_revision=caption_revision,
             model=str(selected_model), prompt_sha256=generation_prompt_sha) if job_workspace is not None else None)
+        # The cached-summary path skips legacy preprocessing, but the shared upload
+        # path still needs the deterministic output name for its prompt metadata.
+        output_file = derive_output_name(
+            txt_file_name, config.get('MAIN_LLM_OUTPUT_SUFFIX', '5-mini'), video_id
+        )
         if cached_response is not None:
             concise_transcription = transcription
             concise_length = len(concise_transcription)
@@ -1540,9 +1545,6 @@ def process_single_video(
             # Step 5: Save concise transcription
             logger.info(f"[STEP 5/5] Saving concise transcription")
             try:
-                output_file = derive_output_name(
-                    txt_file_name, config.get('MAIN_LLM_OUTPUT_SUFFIX', '5-mini'), video_id
-                )
                 concise_file_path = os.path.join(output_smm_path, output_file)
 
                 with open(concise_file_path, 'w', encoding='utf-8-sig') as f:
