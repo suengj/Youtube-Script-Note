@@ -76,8 +76,13 @@ from admission_limiter import DownloadAdmissionLimiter, ProviderCooldown
 from preprocess_backend import create_transcript_preprocessor, TranscriptPreprocessor
 from llm_responses import call_responses, ResponsesCallError
 from runtime_resources import device_compute_route, get_device_semaphore
+from p03_state_backup import backup_state
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
+
+
+class VideoNotQueuedError(ValueError):
+    """Explicit --video-id is absent from the selected queue."""
 
 # Configure logging
 def setup_logging(log_dir: Optional[str] = None) -> logging.Logger:
@@ -2029,7 +2034,7 @@ def process_videos(config: dict):
     if wanted_video_id:
         url_list = [u for u in url_list if stt.extract_youtube_id(u) == wanted_video_id]
         if not url_list:
-            raise ValueError(f"Requested --video-id {wanted_video_id} is not queued")
+            raise VideoNotQueuedError(f"Requested --video-id {wanted_video_id} is not queued")
     max_videos = config.get("MAX_VIDEOS")
     if max_videos is not None:
         url_list = url_list[:int(max_videos)]
@@ -2537,6 +2542,16 @@ def main(argv=None):
                 pass
         
         process_videos(config)
+        backup_enabled = os.getenv("P03_STATE_BACKUP", "1" if (sys.platform.startswith("linux") and
+                                    os.getenv("P03_DRIVE_BACKEND", "api").strip().lower() == "api") else "0").strip().lower()
+        if backup_enabled in {"1", "true", "yes", "on"}:
+            try:
+                from drive_api_sink import DriveApiSink
+                backup_id = backup_state(DriveApiSink(), config.get("DATA_ROOT", config.get("BASE_PATH", ".")),
+                                         config.get("BASE_PATH", "."))
+                logger.info("P03 state backup verified in Drive (id=%s)", backup_id)
+            except Exception as exc:
+                logger.warning("P03_STATE_BACKUP_FAILED: %s: %s", type(exc).__name__, exc)
         
         elapsed_time = time.time() - start_time
         logger.info("=" * 60)
@@ -2564,6 +2579,11 @@ def main(argv=None):
         logger.error("=" * 60)
         sys.exit(1)
         
+    except VideoNotQueuedError as e:
+        logger.error("VIDEO_NOT_QUEUED %s: %s", args.video_id or "unknown", e)
+        print(f"VIDEO_NOT_QUEUED {args.video_id or 'unknown'}: already done or unknown", file=sys.stderr, flush=True)
+        sys.exit(2)
+
     except ValueError as e:
         logger.error("")
         logger.error("=" * 60)

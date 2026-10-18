@@ -112,6 +112,69 @@ class DriveApiSink:
             self._transcripts_id = result["id"]
         return self._transcripts_id
 
+    def _state_backup_folder(self):
+        """Find or create the dedicated state-backup folder under YT_summary."""
+        files = self._drive.files()
+        resp = files.list(
+            q=f"'{self.summary_folder_id}' in parents and name='state-backup' and mimeType='application/vnd.google-apps.folder' and trashed=false",
+            pageSize=100, fields="files(id,name,mimeType,parents)", supportsAllDrives=True,
+            includeItemsFromAllDrives=True,
+        ).execute()
+        matches = [f for f in resp.get("files", []) if f.get("name") == "state-backup" and
+                   f.get("mimeType") == "application/vnd.google-apps.folder" and
+                   self.summary_folder_id in f.get("parents", [])]
+        if matches:
+            return matches[0]["id"]
+        return files.create(body={"name": "state-backup", "mimeType": "application/vnd.google-apps.folder",
+                                 "parents": [self.summary_folder_id]}, fields="id", supportsAllDrives=True).execute()["id"]
+
+    def _upload_state_backup(self, parent: str, name: str, data: bytes):
+        from googleapiclient.http import MediaIoBaseUpload
+        if not re.fullmatch(r"p03-state-\d{8}T\d{6}Z\.tar\.gz", name) or len(data) > 64 * 1024 * 1024:
+            raise DriveUploadError("invalid state archive name or size")
+        files = self._drive.files()
+        body = {"name": name, "appProperties": {"p03_kind": "state_backup"}}
+        result = files.create(body={**body, "parents": [parent]},
+            media_body=MediaIoBaseUpload(io.BytesIO(data), mimetype="application/gzip", resumable=False),
+            fields="id", supportsAllDrives=True).execute()
+        fid = result["id"]
+        meta = files.get(fileId=fid, fields="id,name,parents,size,md5Checksum,appProperties", supportsAllDrives=True).execute()
+        failures = []
+        if meta.get("id") != fid: failures.append("id")
+        if meta.get("name") != name: failures.append("name")
+        if parent not in meta.get("parents", []): failures.append("parent")
+        if int(meta.get("size", -1)) != len(data): failures.append("size")
+        if meta.get("md5Checksum") != hashlib.md5(data).hexdigest(): failures.append("md5")
+        if meta.get("appProperties", {}).get("p03_kind") != "state_backup": failures.append("kind")
+        if failures:
+            raise DriveUploadError("Drive readback verification failed for state backup: " + ",".join(failures))
+        return meta
+
+    def _prune_state_backups(self, parent: str, *, keep: int, newest_id: str):
+        files = self._drive.files()
+        listed = []
+        page_token = None
+        while True:
+            kwargs = {"q": f"'{parent}' in parents and trashed=false", "pageSize": 1000,
+                "fields": "nextPageToken,files(id,name,parents,appProperties,createdTime)", "supportsAllDrives": True,
+                "includeItemsFromAllDrives": True}
+            if page_token:
+                kwargs["pageToken"] = page_token
+            resp = files.list(**kwargs).execute()
+            listed.extend(resp.get("files", []))
+            page_token = resp.get("nextPageToken")
+            if not page_token:
+                break
+        owned = [f for f in listed if f.get("appProperties", {}).get("p03_kind") == "state_backup"
+                 and parent in f.get("parents", []) and re.fullmatch(r"p03-state-\d{8}T\d{6}Z\.tar\.gz", str(f.get("name", "")))]
+        owned.sort(key=lambda f: (f.get("name", ""), f.get("createdTime", "")), reverse=True)
+        # Include a just-uploaded file even when the API's list is briefly stale.
+        if not any(f.get("id") == newest_id for f in owned):
+            return
+        for old in owned[keep:]:
+            if old.get("id") != newest_id and old.get("appProperties", {}).get("p03_kind") == "state_backup":
+                files.delete(fileId=old["id"], supportsAllDrives=True).execute()
+
     def upload_video(self, *, summary_name: str, summary: bytes, transcript: bytes, metadata: dict, video_id: str):
         if not re.fullmatch(r"[A-Za-z0-9_-]{11}", str(video_id or "")):
             raise DriveUploadError("invalid or missing YouTube video id")
