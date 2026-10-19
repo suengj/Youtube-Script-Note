@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import hashlib
+import gzip
 import io
 import json
 import logging
@@ -109,6 +110,16 @@ def validate_archive(data: bytes) -> None:
     if not isinstance(data, bytes) or len(data) > MAX_ARCHIVE_BYTES:
         raise DriveUploadError("P03 state archive is invalid or exceeds size limit")
     try:
+        # tarfile's r:gz reader can return all tar members even when the gzip
+        # trailer (CRC32/ISIZE) is truncated. Validate the gzip stream itself
+        # before trusting the tar member and manifest checks below.
+        with gzip.GzipFile(fileobj=io.BytesIO(data), mode="rb") as compressed:
+            expanded = 0
+            max_expanded = len(STATE_FILES) * MAX_FILE_BYTES + 1024 * 1024
+            while chunk := compressed.read(1024 * 1024):
+                expanded += len(chunk)
+                if expanded > max_expanded:
+                    raise DriveUploadError("P03 state archive exceeds expanded size limit")
         with tarfile.open(fileobj=io.BytesIO(data), mode="r:gz") as archive:
             members = archive.getmembers()
             names = [item.name for item in members]

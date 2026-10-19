@@ -99,6 +99,10 @@ def test_nested_or_partial_manifest_member_fails(tmp_path):
         # Malformed gzip input also fails with the same typed error.
         backup.validate_archive(b"not a gzip archive")
 
+    # tarfile can accept intact tar members when only the gzip trailer is cut.
+    with pytest.raises(DriveUploadError, match="malformed state archive"):
+        backup.validate_archive(packed[:-7])
+
     bad_missing = json.loads(entries["manifest.json"])
     bad_missing["missing"] = ["../outside"]
     entries["manifest.json"] = json.dumps(bad_missing).encode()
