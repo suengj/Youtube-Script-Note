@@ -186,7 +186,14 @@ def test_drive_failure_and_missing_markdown_never_become_success(tmp_path):
     assert mvi.ledger_outcome("success", "", str(md), md_exists=True, drive_verified=True)[0] == "success"
 
 
-def test_process_videos_runs_unregistered_manual_video_through_existing_path(tmp_path, monkeypatch):
+@pytest.mark.parametrize(("sheet_enabled", "key_present", "importer_raises", "expected_import_calls"), [
+    (False, False, False, 0),
+    (True, False, False, 0),
+    (True, True, True, 1),
+    (True, True, False, 1),
+])
+def test_process_videos_runs_unregistered_manual_video_through_existing_path(
+        tmp_path, monkeypatch, sheet_enabled, key_present, importer_raises, expected_import_calls):
     import main
     from pipeline_models import VideoProcessResult
 
@@ -198,6 +205,7 @@ def test_process_videos_runs_unregistered_manual_video_through_existing_path(tmp
     md.mkdir()
     seen = []
     registry_roots = []
+    import_roots = []
 
     class Writer:
         def __init__(self, **kwargs):
@@ -222,6 +230,11 @@ def test_process_videos_runs_unregistered_manual_video_through_existing_path(tmp
         return VideoProcessResult(video_id="abcdefghijk", source_url=kwargs["v_url"],
                                   status="download_failed", retryable=True, error_message="temporary network failure")
 
+    def fake_import(data_root):
+        import_roots.append(data_root)
+        if importer_raises:
+            raise RuntimeError("sheet unavailable")
+
     monkeypatch.setattr(main, "initialize_clients", lambda config: (None, None, None))
     monkeypatch.setattr(main.channel_crawl, "load_channel_df",
                         lambda root: registry_roots.append(root) or [])
@@ -229,10 +242,21 @@ def test_process_videos_runs_unregistered_manual_video_through_existing_path(tmp
     monkeypatch.setattr(main, "SharedStateWriter", Writer)
     monkeypatch.setattr(main, "ClaimManager", Claims)
     monkeypatch.setattr(main, "process_single_video", fake_process)
+    monkeypatch.setattr(main.import_manual_urls_from_sheet, "import_from_sheet", fake_import)
     monkeypatch.setattr(main, "_run_batch_cleanup", lambda *args, **kwargs: None)
     monkeypatch.setattr(main.time, "sleep", lambda *_: None)
     monkeypatch.setenv("P03_DRIVE_BACKEND", "desktop")
     monkeypatch.setenv("P03_DRIVE_SYNC_ENABLED", "0")
+    if sheet_enabled:
+        monkeypatch.setenv("P03_SHEET_IMPORT_ENABLED", "1")
+    else:
+        monkeypatch.delenv("P03_SHEET_IMPORT_ENABLED", raising=False)
+    if key_present:
+        key_path = tmp_path / "service-account.json"
+        key_path.write_text("{}", encoding="utf-8")
+        monkeypatch.setenv("P03_GOOGLE_SA_JSON", str(key_path))
+    else:
+        monkeypatch.setenv("P03_GOOGLE_SA_JSON", str(tmp_path / "missing-service-account.json"))
     config = {
         "BASE_PATH": str(base), "DATA_ROOT": str(data), "WORK_PATH": str(base),
         "HF_HOME": str(tmp_path / "hf"), "OUTPUT_MD_PATH": str(md),
@@ -243,6 +267,9 @@ def test_process_videos_runs_unregistered_manual_video_through_existing_path(tmp
         "CRAWL_QUEUE_MAX_RETRIES": 2,
     }
     main.process_videos(config)
+    assert len(import_roots) == expected_import_calls
+    if expected_import_calls:
+        assert import_roots == [str(data)]
     assert registry_roots == [str(data)]
     assert seen == [("https://www.youtube.com/watch?v=abcdefghijk", True)]
     assert len(pd.read_csv(data / "input_df.csv", encoding="cp949")) == 1
