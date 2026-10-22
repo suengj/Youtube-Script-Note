@@ -12,7 +12,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 from manual_video_input import (SHEET_ID, SHEET_TAB, normalize_youtube_url, read_ledger,
-                                build_sheets_service, read_sheet_rows)  # noqa: E402
+                                build_sheets_service, read_sheet_rows, VIDEO_ID_RE)  # noqa: E402
 
 def _read_sheet_rows(spreadsheet_id: str = SHEET_ID, tab: str = SHEET_TAB):
     service = build_sheets_service()
@@ -101,23 +101,24 @@ def import_rows(rows, input_path: Path, data_root: Path, *, since: str | None = 
     output_ids = set()
     output_success = set()
     for _, row in out.iterrows():
-        vid = ""
+        row_ids = set()
         for name in ("v_id", "video_id", "id"):
             if name in out.columns and str(row.get(name, "")).strip():
+                value = str(row[name]).strip()
+                candidate = normalize_youtube_url(value)
+                if candidate["kind"] == "video":
+                    row_ids.add(candidate["video_id"])
+                elif VIDEO_ID_RE.fullmatch(value):
+                    row_ids.add(value)
+        for name in ("url", "video_url", "source_url"):
+            if name in out.columns and str(row.get(name, "")).strip():
                 candidate = normalize_youtube_url(str(row[name]).strip())
-                vid = candidate["video_id"] if candidate["kind"] == "video" else str(row[name]).strip()
-                break
-        if not vid:
-            for name in ("url", "video_url", "source_url"):
-                if name in out.columns and str(row.get(name, "")).strip():
-                    candidate = normalize_youtube_url(str(row[name]).strip())
-                    if candidate["kind"] == "video":
-                        vid = candidate["video_id"]
-                        break
-        if vid:
-            output_ids.add(vid)
+                if candidate["kind"] == "video":
+                    row_ids.add(candidate["video_id"])
+        if row_ids:
+            output_ids.update(row_ids)
             if str(row.get("status", "")).strip().lower() == "success":
-                output_success.add(vid)
+                output_success.update(row_ids)
     sheet_downloaded_ids = {
         rec["norm"]["video_id"] for rec in records
         if rec["norm"]["kind"] == "video" and rec["downloaded"]

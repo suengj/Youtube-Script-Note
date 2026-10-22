@@ -151,6 +151,20 @@ def test_importer_matches_any_output_record_using_normalized_url(tmp_path):
     assert result["new"] == 1 and result["already_processed"] == 1
 
 
+def test_importer_uses_output_url_when_v_id_is_invalid(tmp_path):
+    data = tmp_path / "data"
+    data.mkdir()
+    (data / "input_df.csv").write_text("date,url\n", encoding="cp949")
+    pd.DataFrame([{"v_id": "unknown", "url": "https://youtu.be/outmatch001",
+                   "status": "download_failed"}]).to_csv(data / "output_df_new.csv", index=False)
+    rows = [["URL", "Source", "Download 여부"], ["https://youtu.be/outmatch001", "", ""]]
+
+    result = import_rows(rows, data / "input_df.csv", data, dry_run=True)
+
+    assert result["new"] == 0
+    assert result["already_processed"] == 1
+
+
 def test_importer_caps_newest_eligible_rows_and_reports_deferred(tmp_path, capsys):
     data = tmp_path / "data"
     data.mkdir()
