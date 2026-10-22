@@ -484,6 +484,31 @@ def reconcile_queue_with_output_df(
         if not vid or vid not in status_map:
             continue
         st = status_map[vid]
+        replay_state = str(row.get("last_error", "")).strip()
+        # A replay rediscovered as a short is terminal even if the only output
+        # row still says live_scheduled (the duplicate output row may be omitted).
+        if replay_state == SHORTS_STATUS:
+            q.at[idx, "status"] = "done"
+            if not str(row.get("done_at", "")).strip():
+                q.at[idx, "done_at"] = now_iso
+            continue
+        # Probe failures while waiting for a live replay are observations about this
+        # attempt, not a replacement for the bounded replay-wait state.
+        if replay_state == "live_no_replay":
+            q.at[idx, "status"] = "done"
+            continue
+        if replay_state == LIVE_SCHEDULED_STATUS and st in FAILED_STATUSES:
+            q.at[idx, "status"] = "queued"
+            q.at[idx, "done_at"] = ""
+            continue
+        # A live_scheduled output row is an observation, not a completed video.
+        # Keep old queues recoverable too, unless the bounded replay window expired.
+        if st == LIVE_SCHEDULED_STATUS:
+            if str(row.get("last_error", "")).strip() != "live_no_replay":
+                q.at[idx, "status"] = "queued"
+                q.at[idx, "done_at"] = ""
+                q.at[idx, "last_error"] = LIVE_SCHEDULED_STATUS
+            continue
         channel_id = str(row.get("channel_id", "")).strip()
         if (
             channel_id in (channel_requeue_unpublished or set())
@@ -508,7 +533,7 @@ def reconcile_queue_with_output_df(
                 q.at[idx, "done_at"] = ""
                 q.at[idx, "last_error"] = ""
             continue
-        if st in DONE_STATUSES or st == SHORTS_STATUS or st == LIVE_SCHEDULED_STATUS or st == VIDEO_UNAVAILABLE_STATUS or st == SKIPPED_AUTO_SUBS_ONLY_STATUS:
+        if st in DONE_STATUSES or st == SHORTS_STATUS or st == VIDEO_UNAVAILABLE_STATUS or st == SKIPPED_AUTO_SUBS_ONLY_STATUS:
             q.at[idx, "status"] = "done"
             if not str(q.at[idx, "done_at"]).strip():
                 q.at[idx, "done_at"] = now_iso
@@ -522,13 +547,48 @@ def reconcile_queue_with_output_df(
     return q
 
 
-def select_process_candidates(queue_df, max_retries: int):
+def expire_live_replay_rows(queue_df, wait_hours: float = 72, now: Optional[datetime] = None):
+    """Mark deferred live rows terminal after their bounded replay wait window."""
+    if queue_df is None or len(queue_df) == 0:
+        return queue_df
+    q = queue_df.copy()
+    now = now or datetime.utcnow()
+    wait_seconds = max(0.0, float(wait_hours)) * 3600
+    for idx, row in q.iterrows():
+        if str(row.get("status", "")).strip() != "queued":
+            continue
+        if str(row.get("last_error", "")).strip() != LIVE_SCHEDULED_STATUS:
+            continue
+        discovered = _parse_iso_date(str(row.get("discovered_at", "") or ""))
+        published = _parse_iso_date(str(row.get("published_at", "") or ""))
+        since = discovered or published
+        if since is None or (now - since).total_seconds() < wait_seconds:
+            continue
+        q.at[idx, "status"] = "done"
+        q.at[idx, "last_error"] = "live_no_replay"
+        q.at[idx, "done_at"] = now.strftime("%Y-%m-%dT%H:%M:%SZ")
+    return q
+
+
+def select_process_candidates(
+    queue_df, max_retries: int, live_retry_min_interval_min: float = 60,
+    now: Optional[datetime] = None,
+):
     if queue_df is None or len(queue_df) == 0:
         return queue_df
     q = queue_df.copy()
     q["status"] = q["status"].astype(str).str.strip()
     q["retry_count"] = q["retry_count"].fillna(0).astype(int)
     cand = q[(q["status"] == "queued") | ((q["status"] == "failed") & (q["retry_count"] < max_retries))].copy()
+    if len(cand) == 0:
+        return cand
+    now = now or datetime.utcnow()
+    min_interval = max(0.0, float(live_retry_min_interval_min)) * 60
+    if min_interval:
+        is_live_retry = cand["last_error"].astype(str).str.strip() == LIVE_SCHEDULED_STATUS
+        attempted = cand["last_attempted_at"].astype(str).map(_parse_iso_date)
+        recent = attempted.map(lambda dt: bool(dt and (now - dt).total_seconds() < min_interval))
+        cand = cand[~(is_live_retry & recent)]
     if len(cand) == 0:
         return cand
     # deterministic order: oldest published first, then discovery time
@@ -548,13 +608,23 @@ def apply_result_to_queue(queue_df, video_id: str, status: str, error_msg: Optio
         return q
     idx = idx_list[-1]
     now_iso = _now_iso()
+    was_waiting_for_replay = str(q.at[idx, "last_error"] or "").strip() == LIVE_SCHEDULED_STATUS
     q.at[idx, "last_attempted_at"] = now_iso
 
-    if status in DONE_STATUSES or status == SHORTS_STATUS or status == LIVE_SCHEDULED_STATUS or status == VIDEO_UNAVAILABLE_STATUS or status == SKIPPED_AUTO_SUBS_ONLY_STATUS:
+    if status == LIVE_SCHEDULED_STATUS:
+        q.at[idx, "status"] = "queued"
+        q.at[idx, "done_at"] = ""
+        q.at[idx, "last_error"] = LIVE_SCHEDULED_STATUS
+    elif status in DONE_STATUSES or status == SHORTS_STATUS or status == VIDEO_UNAVAILABLE_STATUS or status == SKIPPED_AUTO_SUBS_ONLY_STATUS:
         q.at[idx, "status"] = "done"
         q.at[idx, "done_at"] = now_iso
         q.at[idx, "last_error"] = ""
     else:
+        if was_waiting_for_replay:
+            q.at[idx, "status"] = "queued"
+            q.at[idx, "done_at"] = ""
+            q.at[idx, "last_error"] = LIVE_SCHEDULED_STATUS
+            return q
         q.at[idx, "status"] = "failed"
         try:
             rc = int(q.at[idx, "retry_count"] or 0)
@@ -828,8 +898,12 @@ def build_queue_and_get_candidates(
             q, output_df, channel_requeue_unpublished, has_drive_canonical,
             int(config.get("CRAWL_QUEUE_MAX_RETRIES", 3) or 3),
         )
+        q = expire_live_replay_rows(q, config.get("LIVE_REPLAY_WAIT_HOURS", 72))
         save_crawl_queue_df(base_path, q)
-        return q, select_process_candidates(q, int(config.get("CRAWL_QUEUE_MAX_RETRIES", 3))), []
+        return q, select_process_candidates(
+            q, int(config.get("CRAWL_QUEUE_MAX_RETRIES", 3)),
+            config.get("LIVE_RETRY_MIN_INTERVAL_MIN", 60),
+        ), []
 
     logger.info("channel_crawl: loaded %d channels from channel_df.csv", len(channels))
     queue_df = load_crawl_queue_df(base_path)
@@ -837,6 +911,7 @@ def build_queue_and_get_candidates(
     queue_df = reconcile_queue_with_output_df(
         queue_df, output_df, channel_requeue_unpublished, has_drive_canonical, max_retries
     )
+    queue_df = expire_live_replay_rows(queue_df, config.get("LIVE_REPLAY_WAIT_HOURS", 72))
 
     backfill = bool(config.get("CHANNEL_BACKFILL") or False)
     start_date_s = (config.get("CHANNEL_START_DATE") or "").strip()
@@ -923,6 +998,7 @@ def build_queue_and_get_candidates(
             ch_name = feed_title
 
         filtered_entries: List[Dict[str, Any]] = []
+        seen_discovery_ids: set[str] = set()
         discovered_dt_max: Optional[datetime] = cursor_dt
 
         for e in entries:
@@ -950,6 +1026,9 @@ def build_queue_and_get_candidates(
             vid = str(e.get("video_id") or "").strip()
             if not vid:
                 continue
+            if vid in seen_discovery_ids:
+                continue
+            seen_discovery_ids.add(vid)
             if vid in done_v_ids:
                 retry_unpublished = (
                     cid in channel_requeue_unpublished
@@ -957,7 +1036,8 @@ def build_queue_and_get_candidates(
                     and has_drive_canonical is not None
                     and not has_drive_canonical(vid)
                 )
-                if not retry_unpublished:
+                retry_live_replay = output_status_by_vid.get(vid, "") == LIVE_SCHEDULED_STATUS
+                if not retry_unpublished and not retry_live_replay:
                     continue
             if vid in queue_video_ids:
                 continue
@@ -988,7 +1068,14 @@ def build_queue_and_get_candidates(
             is_shorts = False
             if shorts_seconds_threshold > 0 and duration_iso:
                 sec = _parse_duration_to_seconds(duration_iso)
-                is_shorts = bool(sec is not None and sec <= shorts_seconds_threshold)
+                # YouTube can report PT0S while processing a live replay. Keep that
+                # deferred item eligible until metadata contains a real duration.
+                replay_pending = output_status_by_vid.get(vid, "") == LIVE_SCHEDULED_STATUS
+                is_shorts = bool(
+                    sec is not None
+                    and sec <= shorts_seconds_threshold
+                    and not (replay_pending and sec <= 0)
+                )
             if is_shorts:
                 shorts_skipped += 1
                 # Persist shorts as done in queue and also mark output_df with passed_shorts.
@@ -1030,7 +1117,11 @@ def build_queue_and_get_candidates(
                 "published_at": pub_s,
                 "status": "queued",
                 "retry_count": 0,
-                "last_error": "",
+                "last_error": (
+                    LIVE_SCHEDULED_STATUS
+                    if output_status_by_vid.get(vid, "") == LIVE_SCHEDULED_STATUS
+                    else ""
+                ),
                 "discovered_at": now_iso,
                 "last_attempted_at": "",
                 "done_at": "",
@@ -1090,7 +1181,9 @@ def build_queue_and_get_candidates(
 
     save_crawl_queue_df(base_path, queue_df)
 
-    candidates_df = select_process_candidates(queue_df, max_retries)
+    candidates_df = select_process_candidates(
+        queue_df, max_retries, config.get("LIVE_RETRY_MIN_INTERVAL_MIN", 60)
+    )
     logger.info(
         "channel_crawl: queue persisted. total=%d, candidates=%d",
         len(queue_df),

@@ -85,6 +85,38 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 class VideoNotQueuedError(ValueError):
     """Explicit --video-id is absent from the selected queue."""
 
+
+def _apply_channel_video_metadata(
+    video_config: dict, v_url: str, direct_input_set: set,
+    url_to_obsidian_mirror: dict, url_to_default_audio_lang: dict,
+    url_to_auto_subs_only: dict, url_to_usage_channel: dict, url_to_channel_id: dict,
+    manual_video_ids: Optional[set] = None,
+    manual_auto_subs_only_ids: Optional[set] = None,
+) -> dict:
+    """Apply per-video channel crawl metadata to the processing config."""
+    video_config["obsidian_mirror"] = resolve_obsidian_mirror(
+        v_url, direct_input_set, url_to_obsidian_mirror
+    )
+    if url_to_default_audio_lang and v_url in url_to_default_audio_lang:
+        video_config["default_audio_lang"] = url_to_default_audio_lang[v_url]
+    if url_to_auto_subs_only and v_url in url_to_auto_subs_only:
+        video_config["auto_subs_only"] = True
+    if url_to_usage_channel and v_url in url_to_usage_channel:
+        video_config["usage_channel"] = url_to_usage_channel[v_url]
+    if url_to_channel_id and v_url in url_to_channel_id:
+        video_config["channel_id"] = url_to_channel_id[v_url]
+    if v_url in direct_input_set:
+        video_config["from_input"] = True
+    try:
+        video_id = stt.extract_youtube_id(v_url) or ""
+    except (ValueError, TypeError):
+        video_id = ""
+    if video_id and manual_video_ids and video_id in manual_video_ids:
+        video_config["manual_retry_no_auto_caption"] = True
+    if video_id and manual_auto_subs_only_ids and video_id in manual_auto_subs_only_ids:
+        video_config["auto_subs_only"] = True
+    return video_config
+
 # Configure logging
 def setup_logging(log_dir: Optional[str] = None) -> logging.Logger:
     """Setup logging configuration."""
@@ -538,11 +570,19 @@ def load_config() -> dict:
             'CHANNEL_END_DATE': '',
             'FILTERING_SHORTS_MINUTES': 3,
             'CRAWL_QUEUE_MAX_RETRIES': 3,
+            'LIVE_REPLAY_WAIT_HOURS': 72,
+            'LIVE_RETRY_MIN_INTERVAL_MIN': 60,
             'YOUTUBE_AUTO_SCRIPT': True,
             'YOUTUBE_SUBS_LANGS': 'en,ko,jp,en-US,en-GB',
         })
     
     # Env overrides for YouTube subs ( .env takes precedence )
+    for _name, _default in (("LIVE_REPLAY_WAIT_HOURS", 72), ("LIVE_RETRY_MIN_INTERVAL_MIN", 60)):
+        _value = os.getenv(_name, "").strip()
+        if _value:
+            config[_name] = float(_value)
+        else:
+            config.setdefault(_name, _default)
     _auto = os.getenv('YOUTUBE_AUTO_SCRIPT', '').strip().lower()
     if _auto:
         config['YOUTUBE_AUTO_SCRIPT'] = _auto in ('true', '1', 'yes')
@@ -1143,7 +1183,7 @@ def atomic_write_text_with_retry(
 
 
 def _is_terminal_video_status(status: str, *, manual_retry_no_auto_caption: bool = False) -> bool:
-    terminal = {"passed_shorts", "live_scheduled", "video_unavailable",
+    terminal = {"passed_shorts", "video_unavailable",
                 "skipped_auto_subs_only", "oversized_file", "NO_AUTO_CAPTION"}
     if manual_retry_no_auto_caption:
         terminal.discard("NO_AUTO_CAPTION")
@@ -2261,28 +2301,12 @@ def process_videos(config: dict):
         # (unknown channel => off). Direct input_df.csv URLs are specific videos the owner
         # asked for, so they always mirror to Obsidian (Drive is written for every video).
         # Decided by input source, never by channel lookup.
-        video_config["obsidian_mirror"] = resolve_obsidian_mirror(
-            v_url, direct_input_set, url_to_obsidian_mirror
+        return _apply_channel_video_metadata(
+            video_config, v_url, direct_input_set, url_to_obsidian_mirror,
+            url_to_default_audio_lang, url_to_auto_subs_only,
+            url_to_usage_channel, url_to_channel_id,
+            {vid for vid, _, _ in manual_urls}, manual_auto_subs_only_ids,
         )
-        if url_to_default_audio_lang and v_url in url_to_default_audio_lang:
-            video_config["default_audio_lang"] = url_to_default_audio_lang[v_url]
-        if url_to_auto_subs_only and v_url in url_to_auto_subs_only:
-            video_config["auto_subs_only"] = True
-        if url_to_usage_channel and v_url in url_to_usage_channel:
-            video_config["usage_channel"] = url_to_usage_channel[v_url]
-        if url_to_channel_id and v_url in url_to_channel_id:
-            video_config["channel_id"] = url_to_channel_id[v_url]
-        if v_url in url_from_input_set:
-            video_config["from_input"] = True
-        try:
-            vid = stt.extract_youtube_id(v_url) or ""
-        except (ValueError, TypeError):
-            vid = ""
-        if vid in {manual_vid for manual_vid, _, _ in manual_urls}:
-            video_config["manual_retry_no_auto_caption"] = True
-        if vid in manual_auto_subs_only_ids:
-            video_config["auto_subs_only"] = True
-        return video_config
 
     def _claim_vid_for_url(v_url: str) -> str:
         claim_vid = queue_url_to_video_id.get(v_url, "")
