@@ -484,6 +484,16 @@ def reconcile_queue_with_output_df(
         if not vid or vid not in status_map:
             continue
         st = status_map[vid]
+        replay_state = str(row.get("last_error", "")).strip()
+        # Probe failures while waiting for a live replay are observations about this
+        # attempt, not a replacement for the bounded replay-wait state.
+        if replay_state == "live_no_replay":
+            q.at[idx, "status"] = "done"
+            continue
+        if replay_state == LIVE_SCHEDULED_STATUS and st in FAILED_STATUSES:
+            q.at[idx, "status"] = "queued"
+            q.at[idx, "done_at"] = ""
+            continue
         # A live_scheduled output row is an observation, not a completed video.
         # Keep old queues recoverable too, unless the bounded replay window expired.
         if st == LIVE_SCHEDULED_STATUS:
@@ -591,6 +601,7 @@ def apply_result_to_queue(queue_df, video_id: str, status: str, error_msg: Optio
         return q
     idx = idx_list[-1]
     now_iso = _now_iso()
+    was_waiting_for_replay = str(q.at[idx, "last_error"] or "").strip() == LIVE_SCHEDULED_STATUS
     q.at[idx, "last_attempted_at"] = now_iso
 
     if status == LIVE_SCHEDULED_STATUS:
@@ -602,6 +613,11 @@ def apply_result_to_queue(queue_df, video_id: str, status: str, error_msg: Optio
         q.at[idx, "done_at"] = now_iso
         q.at[idx, "last_error"] = ""
     else:
+        if was_waiting_for_replay:
+            q.at[idx, "status"] = "queued"
+            q.at[idx, "done_at"] = ""
+            q.at[idx, "last_error"] = LIVE_SCHEDULED_STATUS
+            return q
         q.at[idx, "status"] = "failed"
         try:
             rc = int(q.at[idx, "retry_count"] or 0)
@@ -975,6 +991,7 @@ def build_queue_and_get_candidates(
             ch_name = feed_title
 
         filtered_entries: List[Dict[str, Any]] = []
+        seen_discovery_ids: set[str] = set()
         discovered_dt_max: Optional[datetime] = cursor_dt
 
         for e in entries:
@@ -1002,6 +1019,9 @@ def build_queue_and_get_candidates(
             vid = str(e.get("video_id") or "").strip()
             if not vid:
                 continue
+            if vid in seen_discovery_ids:
+                continue
+            seen_discovery_ids.add(vid)
             if vid in done_v_ids:
                 retry_unpublished = (
                     cid in channel_requeue_unpublished
@@ -1041,7 +1061,14 @@ def build_queue_and_get_candidates(
             is_shorts = False
             if shorts_seconds_threshold > 0 and duration_iso:
                 sec = _parse_duration_to_seconds(duration_iso)
-                is_shorts = bool(sec is not None and sec <= shorts_seconds_threshold)
+                # YouTube can report PT0S while processing a live replay. Keep that
+                # deferred item eligible until metadata contains a real duration.
+                replay_pending = output_status_by_vid.get(vid, "") == LIVE_SCHEDULED_STATUS
+                is_shorts = bool(
+                    sec is not None
+                    and sec <= shorts_seconds_threshold
+                    and not (replay_pending and sec <= 0)
+                )
             if is_shorts:
                 shorts_skipped += 1
                 # Persist shorts as done in queue and also mark output_df with passed_shorts.

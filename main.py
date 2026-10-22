@@ -84,6 +84,28 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 class VideoNotQueuedError(ValueError):
     """Explicit --video-id is absent from the selected queue."""
 
+
+def _apply_channel_video_metadata(
+    video_config: dict, v_url: str, direct_input_set: set,
+    url_to_obsidian_mirror: dict, url_to_default_audio_lang: dict,
+    url_to_auto_subs_only: dict, url_to_usage_channel: dict, url_to_channel_id: dict,
+) -> dict:
+    """Apply per-video channel crawl metadata to the processing config."""
+    video_config["obsidian_mirror"] = resolve_obsidian_mirror(
+        v_url, direct_input_set, url_to_obsidian_mirror
+    )
+    if url_to_default_audio_lang and v_url in url_to_default_audio_lang:
+        video_config["default_audio_lang"] = url_to_default_audio_lang[v_url]
+    if url_to_auto_subs_only and v_url in url_to_auto_subs_only:
+        video_config["auto_subs_only"] = True
+    if url_to_usage_channel and v_url in url_to_usage_channel:
+        video_config["usage_channel"] = url_to_usage_channel[v_url]
+    if url_to_channel_id and v_url in url_to_channel_id:
+        video_config["channel_id"] = url_to_channel_id[v_url]
+    if v_url in direct_input_set:
+        video_config["from_input"] = True
+    return video_config
+
 # Configure logging
 def setup_logging(log_dir: Optional[str] = None) -> logging.Logger:
     """Setup logging configuration."""
@@ -2174,20 +2196,11 @@ def process_videos(config: dict):
         # (unknown channel => off). Direct input_df.csv URLs are specific videos the owner
         # asked for, so they always mirror to Obsidian (Drive is written for every video).
         # Decided by input source, never by channel lookup.
-        video_config["obsidian_mirror"] = resolve_obsidian_mirror(
-            v_url, direct_input_set, url_to_obsidian_mirror
+        return _apply_channel_video_metadata(
+            video_config, v_url, direct_input_set, url_to_obsidian_mirror,
+            url_to_default_audio_lang, url_to_auto_subs_only,
+            url_to_usage_channel, url_to_channel_id,
         )
-        if url_to_default_audio_lang and v_url in url_to_default_audio_lang:
-            video_config["default_audio_lang"] = url_to_default_audio_lang[v_url]
-        if url_to_auto_subs_only and v_url in url_to_auto_subs_only:
-            video_config["auto_subs_only"] = True
-        if url_to_usage_channel and v_url in url_to_usage_channel:
-            video_config["usage_channel"] = url_to_usage_channel[v_url]
-        if url_to_channel_id and v_url in url_to_channel_id:
-            video_config["channel_id"] = url_to_channel_id[v_url]
-        if v_url in url_from_input_set:
-            video_config["from_input"] = True
-        return video_config
 
     def _claim_vid_for_url(v_url: str) -> str:
         claim_vid = queue_url_to_video_id.get(v_url, "")
