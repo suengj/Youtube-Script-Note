@@ -1142,6 +1142,14 @@ def atomic_write_text_with_retry(
         raise last_exc
 
 
+def _is_terminal_video_status(status: str, *, manual_retry_no_auto_caption: bool = False) -> bool:
+    terminal = {"passed_shorts", "live_scheduled", "video_unavailable",
+                "skipped_auto_subs_only", "oversized_file", "NO_AUTO_CAPTION"}
+    if manual_retry_no_auto_caption:
+        terminal.discard("NO_AUTO_CAPTION")
+    return status in terminal
+
+
 def process_single_video(
     v_url: str,
     config: dict,
@@ -1225,10 +1233,6 @@ def process_single_video(
     durable_full_path: Optional[str] = (
         _find_exact_durable_full_transcript(output_full_path, video_id) if video_id else None
     )
-    _terminal_skip_statuses = frozenset({
-        "passed_shorts", "live_scheduled", "video_unavailable",
-        "skipped_auto_subs_only", "oversized_file", "NO_AUTO_CAPTION",
-    })
     _retryable_statuses = frozenset({
         "download_failed", "api_error", "file_error", "mlx_error", "captions_error", "SOURCE_UNAVAILABLE", "source_unavailable", "error",
     })
@@ -1244,7 +1248,7 @@ def process_single_video(
                 logger.info(f"[STEP 2/5] Retrying prior failed video (status: {latest_status})")
             elif latest_status == "already_existed" and (prior['status'] == 'download_failed').any():
                 logger.info("[STEP 2/5] Retrying video previously skipped after download_failed")
-            elif latest_status in _terminal_skip_statuses or latest_status in (
+            elif _is_terminal_video_status(latest_status, manual_retry_no_auto_caption=bool(config.get("manual_retry_no_auto_caption"))) or latest_status in (
                 "already_existed", "unknown"
             ):
                 if (
@@ -1880,7 +1884,8 @@ def process_single_video(
             catalog_updates=pending_catalog,
             prompt_entries=pending_prompt_entries,
             metadata_updates={**pending_metadata, "model": actual_models[0],
-                              "drive_verified": bool(api_verified or (not api_verified and pub.drive_ok))},
+                              "drive_verified": bool(api_verified or (not api_verified and pub.drive_ok and
+                                  manual_video_input.verified_file_readback(pub.drive_path, content_to_write)))},
         )
         
     except KeyboardInterrupt:
@@ -2066,12 +2071,43 @@ def process_videos(config: dict):
         except Exception as exc:
             logger.warning("Could not load manual input URLs: %s", exc)
     max_manual_retries = int(config.get("CRAWL_QUEUE_MAX_RETRIES", 3) or 3)
+    manual_duration_map = {}
+    manual_video_channel_ids = {}
+    manual_channel_auto_sub_only = {}
+    try:
+        registered_channels = channel_crawl.load_channel_df(base_path)
+        manual_channel_auto_sub_only = {
+            str(row.get("channel_id", "")).strip(): str(row.get("auto_sub_only", "")).strip().casefold() in {"1", "true", "yes", "y"}
+            for row in registered_channels if str(row.get("channel_id", "")).strip()
+        }
+        manual_ids = [manual_video_input.normalize_youtube_url(u)["video_id"] for u in manual_rows
+                      if manual_video_input.normalize_youtube_url(u)["kind"] == "video"]
+        api_key = str(config.get("YOUTUBE_API_KEY") or "").strip()
+        if api_key and manual_ids:
+            details = channel_crawl._api_request(api_key, "videos", {
+                "part": "contentDetails,snippet", "id": ",".join(sorted(set(manual_ids))), "maxResults": "50"}) or {}
+            for video in details.get("items", []):
+                vid = str(video.get("id", ""))
+                detail = video.get("contentDetails") or {}
+                snippet = video.get("snippet") or {}
+                if detail.get("duration"):
+                    manual_duration_map[vid] = str(detail["duration"])
+                if snippet.get("channelId"):
+                    manual_video_channel_ids[vid] = str(snippet["channelId"])
+    except Exception as policy_exc:
+        logger.warning("Manual video policy metadata unavailable; applying available metadata only: %s", policy_exc)
+    shorts_threshold = int(float(config.get("FILTERING_SHORTS_MINUTES", 3) or 0) * 60)
     manual_urls, manual_ledger = manual_video_input.prepare_manual_queue(
-        manual_rows, url_list, output_df, manual_ledger, max_manual_retries)
+        manual_rows, url_list, output_df, manual_ledger, max_manual_retries,
+        duration_map=manual_duration_map, shorts_threshold_seconds=shorts_threshold,
+        channel_auto_sub_only=manual_channel_auto_sub_only,
+        video_channel_ids=manual_video_channel_ids)
     # Persist the ledger before processing so failed writes cannot start duplicate work.
     manual_video_input.save_ledger(manual_ledger, manual_ledger_path)
     if manual_urls:
-        url_list.extend(url for _, url, _ in manual_urls)
+        channel_video_ids = {manual_video_input.normalize_youtube_url(u)["video_id"]
+                             for u in url_list if manual_video_input.normalize_youtube_url(u)["kind"] == "video"}
+        url_list.extend(url for vid, url, _ in manual_urls if vid not in channel_video_ids)
         direct_input_set = {url for _, url, _ in manual_urls}
         url_from_input_set = set(direct_input_set)
         logger.info("Added %d canonical manual video URL(s) by video ID", len(manual_urls))
@@ -2226,6 +2262,12 @@ def process_videos(config: dict):
             video_config["channel_id"] = url_to_channel_id[v_url]
         if v_url in url_from_input_set:
             video_config["from_input"] = True
+        try:
+            vid = stt.extract_youtube_id(v_url) or ""
+        except (ValueError, TypeError):
+            vid = ""
+        if vid in {manual_vid for manual_vid, _, _ in manual_urls}:
+            video_config["manual_retry_no_auto_caption"] = True
         return video_config
 
     def _claim_vid_for_url(v_url: str) -> str:
@@ -2262,7 +2304,9 @@ def process_videos(config: dict):
                     canonical_url=next((u for vid, u, _ in manual_urls if vid == result.video_id), v_url),
                     source_url=next((src for vid, _, src in manual_urls if vid == result.video_id), v_url),
                     status=status, reason=reason, md_path=md_path, drive_verified=drive_state,
-                    model=str(result.metadata_updates.get("model", "")))
+                    model=str(result.metadata_updates.get("model", "")),
+                    md_sha256=(hashlib.sha256(Path(md_path).read_text(encoding="utf-8-sig").encode("utf-8")).hexdigest()
+                               if md_path and os.path.isfile(md_path) else ""))
                 manual_video_input.save_ledger(manual_ledger, manual_ledger_path)
             except Exception as ledger_exc:
                 # output_df is already durable; its success row remains the dedupe guard.
@@ -2471,12 +2515,25 @@ def process_videos(config: dict):
             from scripts.drive_yt_summary.publish import flush_staging
             from scripts.drive_yt_summary.sync import run_sync_safe
 
+            before_flush_ledger = manual_video_input.read_ledger(manual_ledger_path)
+            expected_staged_contents = {}
+            pending_staged = before_flush_ledger[(before_flush_ledger.status == "retryable_failed") &
+                before_flush_ledger.reason.astype(str).str.startswith("pending_drive:")]
+            for _, pending_item in pending_staged.iterrows():
+                staged_path = str(pending_item.md_path or "")
+                try:
+                    expected_staged_contents[os.path.basename(staged_path)] = Path(staged_path).read_text(encoding="utf-8-sig")
+                except (OSError, UnicodeError):
+                    pass
             retried = flush_staging(
                 md_root=config["OUTPUT_MD_PATH"],
                 base_path=base_path,
                 work_path=(config.get("WORK_PATH") or "").strip(),
             )
             if retried:
+                before_flush_ledger = manual_video_input.reconcile_staging_flush(
+                    before_flush_ledger, retried, expected_staged_contents)
+                manual_video_input.save_ledger(before_flush_ledger, manual_ledger_path)
                 logger.info(
                     "Drive staging retry: %s/%s published",
                     sum(1 for r in retried if r.drive_ok),

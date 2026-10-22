@@ -86,9 +86,13 @@ def import_rows(rows, input_path: Path, data_root: Path, *, since: str | None = 
     out_path = data_root / "output_df_new.csv"
     out = _read_frame(out_path)[0] if out_path.exists() else pd.DataFrame(columns=["v_id", "url", "status"])
     success = set(out.loc[out.get("status", pd.Series(dtype=str)).astype(str).str.lower() == "success", "v_id"].astype(str)) if "v_id" in out.columns and "status" in out.columns else set()
-    queued = existing_ids | (set(out.get("v_id", pd.Series(dtype=str)).astype(str)) - success)
     ledger = read_ledger(data_root / "manual_input_status.csv")
     ledger_success = set(ledger.loc[ledger.status == "success", "video_id"].astype(str))
+    # Only URLs physically present in input_df (or retained Drive-only work) are
+    # queued. output_df also contains historical failures that were never manual.
+    queued = existing_ids | set(ledger.loc[
+        (ledger.status == "retryable_failed") &
+        ledger.reason.astype(str).str.startswith("pending_drive:"), "video_id"].astype(str))
     new = []
     seen = set()
     already_success = already_queued = 0

@@ -6,12 +6,13 @@ import hashlib
 import os
 import re
 import tempfile
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
 VIDEO_ID_RE = re.compile(r"^[A-Za-z0-9_-]{11}$")
-LEDGER_COLUMNS = ["video_id", "canonical_url", "source_urls", "first_seen_at", "status", "reason", "attempts", "last_attempt_at", "done_at", "md_path", "drive_verified", "model", "sheet_synced"]
+LEDGER_COLUMNS = ["video_id", "canonical_url", "source_urls", "first_seen_at", "status", "reason", "attempts", "last_attempt_at", "done_at", "md_path", "md_sha256", "drive_verified", "model", "sheet_synced"]
 LEDGER_STATUSES = {"new", "processing", "success", "retryable_failed", "unsupported", "skipped_policy"}
 SHEET_ID = "1iRtWdbbJGM8EY1K0jDXkt36IImQM-BmhDoufsFOjRKI"
 SHEET_TAB = "YT Link"
@@ -91,7 +92,7 @@ def save_ledger(df, path: str | Path) -> None:
 
 def upsert_ledger(df, *, video_id: str, canonical_url: str = "", source_url: str = "", status: str,
                   reason: str = "", md_path: str = "", drive_verified: str = "", model: str = "",
-                  sheet_synced: str = "", attempted: bool = False):
+                  sheet_synced: str = "", md_sha256: str = "", attempted: bool = False):
     if status not in LEDGER_STATUSES:
         raise ValueError(f"invalid manual ledger status: {status}")
     now = _now()
@@ -104,6 +105,7 @@ def upsert_ledger(df, *, video_id: str, canonical_url: str = "", source_url: str
             sources.append(source_url)
         row.update({"canonical_url": canonical_url or row.get("canonical_url", ""), "source_urls": " | ".join(sources),
                     "status": status, "reason": reason, "md_path": md_path or row.get("md_path", ""),
+                    "md_sha256": md_sha256 or row.get("md_sha256", ""),
                     "drive_verified": drive_verified or row.get("drive_verified", ""),
                     "model": model or row.get("model", ""),
                     "sheet_synced": sheet_synced if sheet_synced != "" else row.get("sheet_synced", "false")})
@@ -118,12 +120,14 @@ def upsert_ledger(df, *, video_id: str, canonical_url: str = "", source_url: str
                            "source_urls": source_url, "first_seen_at": now, "status": status,
                            "reason": reason, "attempts": 1 if attempted else 0,
                            "last_attempt_at": now if attempted else "", "done_at": now if status == "success" else "",
-                           "md_path": md_path, "drive_verified": drive_verified, "model": model,
+                           "md_path": md_path, "md_sha256": md_sha256, "drive_verified": drive_verified, "model": model,
                            "sheet_synced": sheet_synced or "false"}
     return df
 
 
-def prepare_manual_queue(manual_rows, channel_urls, output_df, ledger, max_retries: int = 3):
+def prepare_manual_queue(manual_rows, channel_urls, output_df, ledger, max_retries: int = 3,
+                         *, duration_map=None, shorts_threshold_seconds: int = 0,
+                         channel_auto_sub_only=None, video_channel_ids=None):
     """Return unique canonical manual items and the ledger with pre-run decisions recorded."""
     channel_ids = set()
     for url in channel_urls:
@@ -156,6 +160,21 @@ def prepare_manual_queue(manual_rows, channel_urls, output_df, ledger, max_retri
                                    reason=str(prior.iloc[-1].get("reason") or "previously classified unsupported"))
             continue
         output_status = output_statuses.get(vid, [""])[-1]
+        duration_iso = (duration_map or {}).get(vid, "")
+        if shorts_threshold_seconds > 0 and duration_iso:
+            from channel_crawl import _parse_duration_to_seconds
+            seconds = _parse_duration_to_seconds(str(duration_iso))
+            if seconds is not None and seconds <= shorts_threshold_seconds:
+                ledger = upsert_ledger(ledger, video_id=vid, canonical_url=item["canonical_url"],
+                                       source_url=source_url, status="skipped_policy",
+                                       reason=f"Shorts duration policy: {seconds}s <= {shorts_threshold_seconds}s")
+                continue
+        channel_id = (video_channel_ids or {}).get(vid, "")
+        if channel_id and bool((channel_auto_sub_only or {}).get(str(channel_id).strip(), False)):
+            ledger = upsert_ledger(ledger, video_id=vid, canonical_url=item["canonical_url"],
+                                   source_url=source_url, status="skipped_policy",
+                                   reason=f"registered channel auto_sub_only policy: {channel_id}")
+            continue
         if prior_status == "success":
             ledger = upsert_ledger(ledger, video_id=vid, canonical_url=item["canonical_url"],
                                    source_url=source_url, status="success",
@@ -167,9 +186,17 @@ def prepare_manual_queue(manual_rows, channel_urls, output_df, ledger, max_retri
                                    reason="already has an output success without manual Drive verification evidence")
             continue
         if vid in channel_ids:
-            ledger = upsert_ledger(ledger, video_id=vid, canonical_url=item["canonical_url"],
-                                   source_url=source_url, status="skipped_policy",
-                                   reason="video already selected as a channel candidate; channel metadata takes precedence")
+            # Preserve manual ownership so channel processing can also finalize the
+            # manual ledger. The caller merges this ID with its channel URL and only
+            # processes it once; do not overwrite an in-flight Drive retry reason.
+            if prior_status == "retryable_failed" and str(prior.iloc[-1].get("reason") or "").startswith("pending_drive:"):
+                continue
+            if vid not in seen:
+                seen.add(vid)
+                queued.append((vid, item["canonical_url"], source_url))
+                ledger = upsert_ledger(ledger, video_id=vid, canonical_url=item["canonical_url"],
+                                       source_url=source_url, status="processing",
+                                       reason="manual ownership retained; selected channel candidate will process once")
             continue
         if output_status in {"passed_shorts", "live_scheduled", "video_unavailable", "skipped_auto_subs_only", "oversized_file"}:
             ledger = upsert_ledger(ledger, video_id=vid, canonical_url=item["canonical_url"],
@@ -262,52 +289,118 @@ def writeback_success_rows(ledger, service, *, spreadsheet_id: str = SHEET_ID, t
             n, rem = divmod(n - 1, 26)
             result = chr(65 + rem) + result
         return result
-    headers, values = read_sheet_rows(service, spreadsheet_id, tab)
-    columns = {name: headers.index(name) + 1 for name in SHEET_HEADERS}
-    url_col, source_col, model_col = (columns[k] for k in SHEET_HEADERS)
     wanted = ledger[(ledger.status == "success") &
                     (ledger.drive_verified.astype(str) == "verified") &
                     (ledger.sheet_synced.astype(str).str.lower() != "true")]
-    batch = []
-    pending = {}
     for _, item in wanted.iterrows():
         vid = str(item.video_id)
         model = str(item.get("model", "") or "").strip()
         if not model:
             continue
-        matches = []
-        for row_no, row in enumerate(values[1:], start=2):
-            url = row[url_col - 1] if len(row) >= url_col else ""
-            normalized = normalize_youtube_url(url)
-            if normalized["kind"] == "video" and normalized["video_id"] == vid:
-                matches.append((row_no, row))
-        if not matches:
+        synced = False
+        for _attempt in range(3):
+            headers, values = read_sheet_rows(service, spreadsheet_id, tab)
+            columns = {name: headers.index(name) + 1 for name in SHEET_HEADERS}
+            url_col, source_col, model_col = (columns[k] for k in SHEET_HEADERS)
+            matches = []
+            for row_no, row in enumerate(values[1:], start=2):
+                url = row[url_col - 1] if len(row) >= url_col else ""
+                normalized = normalize_youtube_url(url)
+                if normalized["kind"] == "video" and normalized["video_id"] == vid:
+                    source = row[source_col - 1] if len(row) >= source_col else ""
+                    model_value = row[model_col - 1] if len(row) >= model_col else ""
+                    matches.append((row_no, str(url), str(source), not str(source).strip(), str(model_value)))
+            if not matches:
+                break
+            batch = []
+            for row_no, _url, _source, blank, _old_model in matches:
+                batch.append({"range": f"{_quoted_tab(tab)}!{col_letter(model_col)}{row_no}", "values": [[model]]})
+                if blank:
+                    batch.append({"range": f"{_quoted_tab(tab)}!{col_letter(source_col)}{row_no}", "values": [["own"]]})
+            # Re-read the exact rows immediately before writing. If rows moved since
+            # discovery, discard these coordinates and locate them again.
+            _, before = read_sheet_rows(service, spreadsheet_id, tab)
+            stable = True
+            for row_no, url, source, blank, _old_model in matches:
+                row = before[row_no - 1] if row_no - 1 < len(before) else []
+                actual_url = row[url_col - 1] if len(row) >= url_col else ""
+                actual_source = row[source_col - 1] if len(row) >= source_col else ""
+                norm = normalize_youtube_url(actual_url)
+                if norm["kind"] != "video" or norm["video_id"] != vid or str(actual_url) != url or (not blank and str(actual_source) != source) or (blank and str(actual_source).strip()):
+                    stable = False
+                    break
+            if not stable:
+                time.sleep(0.01)
+                continue
+            service.spreadsheets().values().batchUpdate(
+                spreadsheetId=spreadsheet_id,
+                body={"valueInputOption": "RAW", "data": batch},
+            ).execute()
+            _, after = read_sheet_rows(service, spreadsheet_id, tab)
+            synced = True
+            rollback = []
+            for row_no, _url, _source, blank, old_model in matches:
+                row = after[row_no - 1] if row_no - 1 < len(after) else []
+                actual_url = row[url_col - 1] if len(row) >= url_col else ""
+                norm = normalize_youtube_url(actual_url)
+                actual_source = row[source_col - 1] if len(row) >= source_col else ""
+                actual_model = row[model_col - 1] if len(row) >= model_col else ""
+                expected_source = "own" if blank else _source
+                if norm["kind"] != "video" or norm["video_id"] != vid or str(actual_model) != model or str(actual_source) != expected_source:
+                    synced = False
+                    # If row movement redirected our write, restore cells that
+                    # still contain our values on the now different row.
+                    if norm["kind"] != "video" or norm["video_id"] != vid:
+                        model_range = f"{_quoted_tab(tab)}!{col_letter(model_col)}{row_no}"
+                        if str(actual_model) == model:
+                            rollback.append({"range": model_range, "values": [[old_model]]})
+                        if blank and str(actual_source) == "own":
+                            rollback.append({"range": f"{_quoted_tab(tab)}!{col_letter(source_col)}{row_no}", "values": [[""]]})
+                    break
+            if synced:
+                break
+            if rollback:
+                service.spreadsheets().values().batchUpdate(
+                    spreadsheetId=spreadsheet_id,
+                    body={"valueInputOption": "RAW", "data": rollback},
+                ).execute()
+            time.sleep(0.01)
+        ledger.loc[ledger.video_id.astype(str) == vid, "sheet_synced"] = "true" if synced else "false"
+    return ledger
+
+
+def verified_file_readback(path: str, expected_content: str) -> bool:
+    """Confirm the destination bytes represent the content just published."""
+    try:
+        return Path(path).read_text(encoding="utf-8-sig") == expected_content
+    except (OSError, UnicodeError, TypeError):
+        return False
+
+
+def reconcile_staging_flush(ledger, results, expected_contents=None):
+    """Reconcile manual pending-drive rows with verified files published by flush_staging."""
+    pending = ledger[(ledger.status == "retryable_failed") &
+                     ledger.reason.astype(str).str.startswith("pending_drive:")]
+    for _, item in pending.iterrows():
+        staged_name = Path(str(item.md_path or "")).name
+        if not staged_name:
             continue
-        # All duplicate URL rows for the same normalized video are updated safely.
-        pending[vid] = []
-        for row_no, row in matches:
-            model_range = f"{_quoted_tab(tab)}!{col_letter(model_col)}{row_no}"
-            batch.append({"range": model_range, "values": [[model]]})
-            pending[vid].append((model_range, model))
-            source = row[source_col - 1] if len(row) >= source_col else ""
-            if not str(source).strip():
-                source_range = f"{_quoted_tab(tab)}!{col_letter(source_col)}{row_no}"
-                batch.append({"range": source_range, "values": [["own"]]})
-                pending[vid].append((source_range, "own"))
-    if not batch:
-        return ledger
-    service.spreadsheets().values().batchUpdate(
-        spreadsheetId=spreadsheet_id,
-        body={"valueInputOption": "RAW", "data": batch},
-    ).execute()
-    for vid, cells in pending.items():
-        matches = True
-        for cell_range, expected in cells:
-            actual = service.spreadsheets().values().get(spreadsheetId=spreadsheet_id, range=cell_range).execute().get("values", [])
-            observed = actual[0][0] if actual and actual[0] else ""
-            if observed != expected:
-                matches = False
-        ledger.loc[ledger.video_id.astype(str) == vid, "sheet_synced"] = "true" if matches else "false"
+        for result in results or []:
+            if not getattr(result, "drive_ok", False) or Path(str(getattr(result, "drive_path", ""))).name != staged_name:
+                continue
+            dest = str(result.drive_path)
+            try:
+                content = Path(dest).read_text(encoding="utf-8-sig")
+            except (OSError, UnicodeError):
+                continue
+            # Flush results do not carry a video ID. The exact retained note must
+            # identify the ledger video before it can complete that manual row.
+            expected = (expected_contents or {}).get(staged_name)
+            if (expected is not None and content != expected) or str(item.video_id) not in content:
+                continue
+            ledger = upsert_ledger(ledger, video_id=str(item.video_id), status="success",
+                                   reason="", md_path=dest, drive_verified="verified")
+            break
     return ledger
 
 
@@ -322,6 +415,20 @@ def retry_pending_drive(ledger, *, base_path: str, work_path: str | None, md_roo
     for _, item in pending.iterrows():
         staged = Path(str(item.md_path or ""))
         if not staged.is_file():
+            # A previous batch flush may have removed staging after a verified
+            # publish but before ledger reconciliation. Recover only from a
+            # matching destination note that identifies this video.
+            root = os.getenv("P03_DRIVE_SYNC_ROOT", "").strip()
+            dest = Path(root) / "source" / staged.name if root and staged.name else Path()
+            try:
+                content = dest.read_text(encoding="utf-8-sig") if dest.is_file() else ""
+            except (OSError, UnicodeError):
+                content = ""
+            expected_hash = str(item.get("md_sha256", "") or "")
+            observed_hash = hashlib.sha256(content.encode("utf-8")).hexdigest() if content else ""
+            if content and expected_hash and observed_hash == expected_hash and str(item.video_id) in content:
+                ledger = upsert_ledger(ledger, video_id=str(item.video_id), status="success",
+                                       reason="", md_path=str(dest), drive_verified="verified")
             continue
         try:
             content = staged.read_text(encoding="utf-8-sig")
@@ -329,7 +436,7 @@ def retry_pending_drive(ledger, *, base_path: str, work_path: str | None, md_roo
             result = publish(rel_path=rel, content=content, staging_path=str(staged),
                              md_root=md_root, mirror=False, base_path=base_path,
                              work_path=work_path, video_id=str(item.video_id))
-            if result.drive_ok:
+            if result.drive_ok and verified_file_readback(result.drive_path, content):
                 ledger = upsert_ledger(ledger, video_id=str(item.video_id), status="success",
                                        reason="", md_path=result.drive_path, drive_verified="verified")
         except Exception:
