@@ -2096,6 +2096,7 @@ def process_videos(config: dict):
     manual_ledger = manual_video_input.read_ledger(manual_ledger_path)
 
     def _writeback_manual_sheet() -> None:
+        current = None
         try:
             current = manual_video_input.read_ledger(manual_ledger_path)
             pending = current[(current.status == "success") &
@@ -2110,9 +2111,14 @@ def process_videos(config: dict):
                 spreadsheet_id=os.getenv("P03_GOOGLE_SHEET_ID", manual_video_input.SHEET_ID),
                 tab=os.getenv("P03_GOOGLE_SHEET_TAB", manual_video_input.SHEET_TAB),
             )
-            manual_video_input.save_ledger(current, manual_ledger_path)
         except Exception as sheet_exc:
             logger.warning("Manual Google Sheet writeback skipped; ledger remains pending: %s", sheet_exc)
+        finally:
+            if current is not None:
+                try:
+                    manual_video_input.save_ledger(current, manual_ledger_path)
+                except Exception as save_exc:
+                    logger.error("Manual Google Sheet ledger persistence failed: %s", save_exc)
     # A manual final Markdown retained in staging has already completed generation.
     # Retry only its Drive publish before putting that ID back on the LLM queue.
     try:
@@ -2569,11 +2575,16 @@ def process_videos(config: dict):
             before_flush_ledger = manual_video_input.read_ledger(manual_ledger_path)
             expected_staged_contents = {}
             manual_staging_hashes = {}
+            for _, item in before_flush_ledger.iterrows():
+                staged_path = str(item.md_path or "")
+                expected_hash = str(item.get("md_sha256", "") or "")
+                if staged_path:
+                    manual_staging_hashes[staged_path] = expected_hash
             pending_staged = before_flush_ledger[(before_flush_ledger.status == "retryable_failed") &
                 before_flush_ledger.reason.astype(str).str.startswith("pending_drive:")]
+            quarantine_staged = before_flush_ledger[before_flush_ledger.status == "pending_quarantine"]
             for _, pending_item in pending_staged.iterrows():
                 staged_path = str(pending_item.md_path or "")
-                manual_staging_hashes[staged_path] = str(pending_item.get("md_sha256", "") or "")
                 try:
                     staged_content = Path(staged_path).read_text(encoding="utf-8-sig")
                     staged_hash = hashlib.sha256(staged_content.encode("utf-8")).hexdigest()
@@ -2587,6 +2598,7 @@ def process_videos(config: dict):
                 work_path=(config.get("WORK_PATH") or "").strip(),
                 retain_staging_paths={str(item.md_path) for _, item in pending_staged.iterrows()},
                 manual_expected_hashes=manual_staging_hashes,
+                blocked_staging_paths={str(item.md_path) for _, item in quarantine_staged.iterrows()},
             )
             if retried:
                 before_flush_ledger = manual_video_input.reconcile_staging_flush(

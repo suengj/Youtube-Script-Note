@@ -379,6 +379,48 @@ def test_writeback_sets_own_only_for_blank_source_and_uses_raw_two_cells():
     assert {x["range"] for x in service.writes} == {"'YT Link'!B2", "'YT Link'!C2"}
 
 
+def test_writeback_skips_write_when_snapshot_already_matches_expected_values():
+    service = FakeSheets(["URL", "Source", "Download 여부"], [
+        ["https://youtu.be/abcdefghijk", "own", "gpt-6-luna"]])
+    ledger = mvi.writeback_success_rows(success_ledger(), service)
+    assert ledger.iloc[0].sheet_synced == "true"
+    assert pd.isna(ledger.iloc[0].needs_manual_check)
+    assert service.write_calls == []
+
+
+def test_writeback_holds_on_added_video_id_even_if_row_write_succeeds():
+    class InsertBeforeWriteSheets(FakeSheets):
+        def batchUpdate(self, spreadsheetId, body):
+            self.rows.insert(0, ["https://youtu.be/insert00001", "New", "keep-this"])
+            return super().batchUpdate(spreadsheetId, body)
+
+    service = InsertBeforeWriteSheets(["URL", "Source", "Download 여부"], [
+        ["https://youtu.be/abcdefghijk", "Pocket", ""]])
+    ledger = mvi.writeback_success_rows(success_ledger(), service)
+    assert service.rows[0][2] == "gpt-6-luna"
+    assert ledger.iloc[0].sheet_synced == "false"
+    assert ledger.iloc[0].needs_manual_check == "true"
+    assert "sequence or URL text changed" in ledger.iloc[0].reason
+
+
+def test_writeback_timeout_after_send_sets_owner_hold():
+    class TimeoutAfterWrite(FakeSheets):
+        def batchUpdate(self, spreadsheetId, body):
+            request = super().batchUpdate(spreadsheetId, body)
+            class TimeoutRequest:
+                def execute(self):
+                    request.execute()
+                    raise TimeoutError("readback timeout")
+            return TimeoutRequest()
+
+    service = TimeoutAfterWrite(["URL", "Source", "Download 여부"], [
+        ["https://youtu.be/abcdefghijk", "", ""]])
+    ledger = mvi.writeback_success_rows(success_ledger(), service)
+    assert ledger.iloc[0].sheet_synced == "false"
+    assert ledger.iloc[0].needs_manual_check == "true"
+    assert "uncertain sheet write/readback outcome" in ledger.iloc[0].reason
+
+
 def test_writeback_double_move_repairs_by_video_id_and_requires_manual_check():
     service = MovingFakeSheets(["URL", "Source", "Download 여부"], [
         ["https://youtu.be/victim00001", "Pocket", "old-model"],
@@ -480,6 +522,51 @@ def test_hash_mismatch_manual_staging_is_quarantined_and_never_published(tmp_pat
     assert int(updated.iloc[0].regen_attempts) == 1
 
 
+def test_failed_quarantine_keeps_blocked_identity_and_flush_skips_it(tmp_path, monkeypatch):
+    from scripts.drive_yt_summary import publish
+    staged = tmp_path / "work" / "output_md_staging" / "2026" / "summary.md"
+    staged.parent.mkdir(parents=True)
+    staged.write_text("corrupt", encoding="utf-8")
+    expected_hash = __import__("hashlib").sha256(b"expected").hexdigest()
+    ledger = mvi.upsert_ledger(mvi.read_ledger("/missing/manual.csv"), video_id="abcdefghijk",
+        status="retryable_failed", reason="pending_drive: waiting", md_path=str(staged), md_sha256=expected_hash)
+    real_replace = Path.replace
+
+    def fail_quarantine(path, target):
+        if path == staged:
+            raise OSError("injected move failure")
+        return real_replace(path, target)
+
+    monkeypatch.setattr(Path, "replace", fail_quarantine)
+    updated = mvi.retry_pending_drive(ledger, base_path=str(tmp_path), work_path=str(tmp_path / "work"),
+        md_root=str(tmp_path / "md"), publisher=lambda **_: pytest.fail("must not publish"))
+    assert staged.exists()
+    assert updated.iloc[0].status == "pending_quarantine"
+    assert updated.iloc[0].md_path == str(staged) and updated.iloc[0].md_sha256 == expected_hash
+    queued, updated = mvi.prepare_manual_queue(["https://youtu.be/abcdefghijk"], [], pd.DataFrame(), updated, 5)
+    assert queued == [] and updated.iloc[0].status == "pending_quarantine"
+
+    calls = []
+    monkeypatch.setattr(publish, "publish_final_md", lambda **kwargs: calls.append(kwargs))
+    results = publish.flush_staging(md_root=str(tmp_path / "md"), base_path=str(tmp_path),
+        work_path=str(tmp_path / "work"), blocked_staging_paths={str(staged)})
+    assert results == [] and calls == []
+
+
+def test_pending_quarantine_retries_move_on_next_run(tmp_path, monkeypatch):
+    staged = tmp_path / "work" / "output_md_staging" / "2026" / "summary.md"
+    staged.parent.mkdir(parents=True)
+    staged.write_text("corrupt", encoding="utf-8")
+    ledger = mvi.upsert_ledger(mvi.read_ledger("/missing/manual.csv"), video_id="abcdefghijk",
+        status="pending_quarantine", reason="quarantine failed", md_path=str(staged),
+        md_sha256=__import__("hashlib").sha256(b"expected").hexdigest())
+    updated = mvi.retry_pending_drive(ledger, base_path=str(tmp_path), work_path=str(tmp_path / "work"),
+        md_root=str(tmp_path / "md"), publisher=lambda **_: pytest.fail("must not publish"))
+    assert not staged.exists()
+    assert updated.iloc[0].status == "retryable_failed"
+    assert "reprocessing required" in updated.iloc[0].reason
+
+
 def test_regeneration_counter_is_independent_at_retry_limit_and_capped(tmp_path):
     ledger = mvi.upsert_ledger(mvi.read_ledger("/missing/manual.csv"), video_id="abcdefghijk",
         status="retryable_failed", reason="staged Markdown missing or hash mismatch; reprocessing required",
@@ -495,6 +582,24 @@ def test_regeneration_counter_is_independent_at_retry_limit_and_capped(tmp_path)
     ledger = mvi.upsert_ledger(ledger, video_id="abcdefghijk", status="retryable_failed", reason="NO_AUTO_CAPTION")
     queued, ledger = mvi.prepare_manual_queue(["https://youtu.be/abcdefghijk"], [], pd.DataFrame(), ledger, 5)
     assert queued == [] and ledger.iloc[0].reason == "regen cap reached"
+
+
+@pytest.mark.parametrize(("reason", "attempts", "regen_attempts", "expected_reason"), [
+    ("ordinary failure", 5, 0, "retry limit reached (5)"),
+    ("regen cap reached", 5, 2, "regen cap reached"),
+])
+def test_channel_overlap_does_not_bypass_retry_or_regen_caps(
+        reason, attempts, regen_attempts, expected_reason):
+    ledger = mvi.upsert_ledger(mvi.read_ledger("/missing/manual.csv"),
+        video_id="abcdefghijk", status="retryable_failed", reason=reason)
+    ledger.loc[0, "attempts"] = attempts
+    ledger.loc[0, "regen_attempts"] = regen_attempts
+    queued, ledger = mvi.prepare_manual_queue(
+        ["https://youtu.be/abcdefghijk"], ["https://youtu.be/abcdefghijk"],
+        pd.DataFrame(), ledger, 5)
+    assert queued == []
+    assert ledger.iloc[0].status == "retryable_failed"
+    assert ledger.iloc[0].reason == expected_reason
 
 
 def test_drive_ok_without_verified_content_readback_does_not_complete_manual_ledger(tmp_path):
@@ -646,6 +751,19 @@ def test_batch_flush_refuses_manual_staging_with_ledger_hash_mismatch(tmp_path, 
     publish.flush_staging(md_root=str(tmp_path / "md"), base_path=str(tmp_path),
         work_path=str(tmp_path / "work"), retain_staging_paths={str(manual)},
         manual_expected_hashes={str(manual): __import__("hashlib").sha256(b"expected").hexdigest()})
+    assert calls == []
+
+
+def test_batch_flush_refuses_hash_mismatch_even_without_retain_flag(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    from scripts.drive_yt_summary import publish
+    staged = tmp_path / "work" / "output_md_staging" / "2026" / "summary.md"
+    staged.parent.mkdir(parents=True)
+    staged.write_text("corrupt", encoding="utf-8")
+    calls = []
+    monkeypatch.setattr(publish, "publish_final_md", lambda **kwargs: calls.append(kwargs) or SimpleNamespace())
+    publish.flush_staging(md_root=str(tmp_path / "md"), base_path=str(tmp_path),
+        work_path=str(tmp_path / "work"), manual_expected_hashes={str(staged): "expected-hash"})
     assert calls == []
 
 
