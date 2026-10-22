@@ -13,8 +13,9 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
 VIDEO_ID_RE = re.compile(r"^[A-Za-z0-9_-]{11}$")
-LEDGER_COLUMNS = ["video_id", "canonical_url", "source_urls", "first_seen_at", "status", "reason", "attempts", "last_attempt_at", "done_at", "md_path", "md_sha256", "drive_verified", "model", "sheet_synced", "needs_manual_check"]
+LEDGER_COLUMNS = ["video_id", "canonical_url", "source_urls", "first_seen_at", "status", "reason", "attempts", "regen_attempts", "last_attempt_at", "done_at", "md_path", "md_sha256", "drive_verified", "model", "sheet_synced", "needs_manual_check"]
 LEDGER_STATUSES = {"new", "processing", "success", "retryable_failed", "unsupported", "skipped_policy"}
+MAX_REGEN_ATTEMPTS = 2
 SHEET_ID = "1iRtWdbbJGM8EY1K0jDXkt36IImQM-BmhDoufsFOjRKI"
 SHEET_TAB = "YT Link"
 SHEET_HEADERS = ("URL", "Source", "Download 여부")
@@ -205,6 +206,26 @@ def prepare_manual_queue(manual_rows, channel_urls, output_df, ledger, max_retri
             # retry_pending_drive either publishes the exact staged artifact or
             # clears this marker when it is missing/stale, allowing regeneration.
             continue
+        reason = str(prior.iloc[-1].get("reason") or "") if len(prior) else ""
+        regen_attempts = _attempt_count(prior.iloc[-1].get("regen_attempts")) if len(prior) else 0
+        if prior_status == "retryable_failed" and reason == "regen cap reached":
+            continue
+        regen_pending = ("staged Markdown missing or hash mismatch" in reason or
+                         reason.startswith("regen attempt") or regen_attempts > 0)
+        if prior_status == "retryable_failed" and regen_pending:
+            if regen_attempts >= MAX_REGEN_ATTEMPTS:
+                ledger = upsert_ledger(ledger, video_id=vid, canonical_url=item["canonical_url"],
+                                       source_url=source_url, status="retryable_failed",
+                                       reason="regen cap reached")
+                continue
+            if vid not in seen:
+                seen.add(vid)
+                queued.append((vid, item["canonical_url"], source_url))
+                mask = ledger.video_id.astype(str) == vid
+                ledger.loc[mask, "regen_attempts"] = regen_attempts + 1
+                ledger.loc[mask, "status"] = "processing"
+                ledger.loc[mask, "reason"] = f"regen attempt {regen_attempts + 1}/{MAX_REGEN_ATTEMPTS}"
+            continue
         if prior_status == "retryable_failed" and attempts >= max_retries:
             ledger = upsert_ledger(ledger, video_id=vid, canonical_url=item["canonical_url"],
                                    source_url=source_url, status="retryable_failed",
@@ -288,12 +309,25 @@ def writeback_success_rows(ledger, service, *, spreadsheet_id: str = SHEET_ID, t
         return result
     wanted = ledger[(ledger.status == "success") &
                     (ledger.drive_verified.astype(str) == "verified") &
-                    (ledger.sheet_synced.astype(str).str.lower() != "true")]
+                    (ledger.sheet_synced.astype(str).str.lower() != "true") &
+                    (ledger.needs_manual_check.astype(str).str.lower() != "true")]
     def read_columns(columns):
         ranges = [f"{_quoted_tab(tab)}!{col_letter(col)}2:{col_letter(col)}" for col in columns]
         response = service.spreadsheets().values().batchGet(
             spreadsheetId=spreadsheet_id, ranges=ranges).execute()
         return [entry.get("values", []) for entry in response.get("valueRanges", [])]
+
+    def map_rows(columns):
+        urls, sources, downloads = columns
+        mapped = {}
+        for offset, url_cell in enumerate(urls):
+            normalized = normalize_youtube_url(str((url_cell or [""])[0] or ""))
+            if normalized["kind"] != "video":
+                continue
+            source = str((sources[offset] or [""])[0] or "") if offset < len(sources) else ""
+            download = str((downloads[offset] or [""])[0] or "") if offset < len(downloads) else ""
+            mapped[normalized["video_id"]] = (offset + 2, source, download)
+        return mapped
 
     for _, item in wanted.iterrows():
         vid = str(item.video_id)
@@ -303,26 +337,14 @@ def writeback_success_rows(ledger, service, *, spreadsheet_id: str = SHEET_ID, t
         headers = validate_sheet(service, spreadsheet_id, tab)
         columns = {name: headers.index(name) + 1 for name in SHEET_HEADERS}
         url_col, source_col, model_col = (columns[k] for k in SHEET_HEADERS)
+        quoted = _quoted_tab(tab)
+        snapshot = map_rows(read_columns((url_col, source_col, model_col)))
+        target_before = snapshot.get(vid)
         synced = False
-        for attempt in range(2):
-            snapshot_columns = read_columns((url_col, source_col, model_col))
-            urls, sources, downloads = snapshot_columns
-            snapshot = {}
-            for offset, url_cell in enumerate(urls):
-                url = str((url_cell or [""])[0] or "")
-                normalized = normalize_youtube_url(url)
-                if normalized["kind"] != "video":
-                    continue
-                row_no = offset + 2
-                source = str((sources[offset] or [""])[0] or "") if offset < len(sources) else ""
-                download = str((downloads[offset] or [""])[0] or "") if offset < len(downloads) else ""
-                snapshot[normalized["video_id"]] = (row_no, source, download)
-            target_before = snapshot.get(vid)
-            if not target_before:
-                break
-            target_row, old_source, old_download = target_before
+        manual_reason = ""
+        if target_before:
+            target_row, old_source, _ = target_before
             expected_source = old_source if old_source.strip() else "own"
-            quoted = _quoted_tab(tab)
             writes = [{"range": f"{quoted}!{col_letter(model_col)}{target_row}", "values": [[model]]}]
             if not old_source.strip():
                 writes.append({"range": f"{quoted}!{col_letter(source_col)}{target_row}", "values": [["own"]]})
@@ -330,48 +352,53 @@ def writeback_success_rows(ledger, service, *, spreadsheet_id: str = SHEET_ID, t
                 spreadsheetId=spreadsheet_id,
                 body={"valueInputOption": "RAW", "data": writes},
             ).execute()
+            post = map_rows(read_columns((url_col, source_col, model_col)))
 
-            post_columns = read_columns((url_col, source_col, model_col))
-            post_urls, post_sources, post_downloads = post_columns
-            post = {}
-            for offset, url_cell in enumerate(post_urls):
-                url = str((url_cell or [""])[0] or "")
-                normalized = normalize_youtube_url(url)
-                if normalized["kind"] != "video":
-                    continue
-                row_no = offset + 2
-                source = str((post_sources[offset] or [""])[0] or "") if offset < len(post_sources) else ""
-                download = str((post_downloads[offset] or [""])[0] or "") if offset < len(post_downloads) else ""
-                post[normalized["video_id"]] = (row_no, source, download)
-
-            # A stale row write may have changed a different video's cells. Restore
-            # by current identity and the one pre-write whole-column snapshot.
+            # Detect every pre-existing non-target video that moved or changed.
+            changed_others = []
             repairs = []
-            for other_vid, (current_row, current_source, current_download) in post.items():
-                if other_vid == vid or other_vid not in snapshot:
+            for other_vid, (_, original_source, original_download) in snapshot.items():
+                if other_vid == vid:
                     continue
-                _, original_source, original_download = snapshot[other_vid]
-                if (current_source, current_download) != (original_source, original_download):
-                    repairs.extend([
-                        {"range": f"{quoted}!{col_letter(source_col)}{current_row}", "values": [[original_source]]},
-                        {"range": f"{quoted}!{col_letter(model_col)}{current_row}", "values": [[original_download]]},
-                    ])
+                current = post.get(other_vid)
+                if current is None or current[1:] != (original_source, original_download):
+                    changed_others.append(other_vid)
+                    if current is not None:
+                        repairs.extend([
+                            {"range": f"{quoted}!{col_letter(source_col)}{current[0]}", "values": [[original_source]]},
+                            {"range": f"{quoted}!{col_letter(model_col)}{current[0]}", "values": [[original_download]]},
+                        ])
             if repairs:
-                service.spreadsheets().values().batchUpdate(
-                    spreadsheetId=spreadsheet_id,
-                    body={"valueInputOption": "RAW", "data": repairs},
-                ).execute()
+                try:
+                    service.spreadsheets().values().batchUpdate(
+                        spreadsheetId=spreadsheet_id,
+                        body={"valueInputOption": "RAW", "data": repairs},
+                    ).execute()
+                except Exception as exc:
+                    manual_reason = f"other-video repair write failed: {exc}"
+                try:
+                    post = map_rows(read_columns((url_col, source_col, model_col)))
+                except Exception as exc:
+                    manual_reason = f"post-repair readback failed: {exc}"
 
             target_after = post.get(vid)
             others_unchanged = all(
                 other_vid == vid or (other_vid in post and post[other_vid][1:] == original[1:])
                 for other_vid, original in snapshot.items()
             )
-            if target_after and target_after[1:] == (expected_source, model) and not repairs and others_unchanged:
+            if changed_others:
+                repair_detail = "other sheet videos changed during write; repaired by video_id: " + ", ".join(changed_others)
+                manual_reason = f"{manual_reason}; {repair_detail}" if manual_reason else repair_detail
+            if target_after and target_after[1:] == (expected_source, model) and not changed_others and others_unchanged:
                 synced = True
-                break
+            elif not manual_reason:
+                manual_reason = "sheet write readback did not match target or snapshot"
+        else:
+            manual_reason = "target video missing from sheet snapshot"
         if not synced:
             ledger.loc[ledger.video_id.astype(str) == vid, "needs_manual_check"] = "true"
+            ledger.loc[ledger.video_id.astype(str) == vid, "reason"] = manual_reason
+            logging.getLogger(__name__).error("Manual sheet write requires owner check for %s: %s", vid, manual_reason)
         ledger.loc[ledger.video_id.astype(str) == vid, "sheet_synced"] = "true" if synced else "false"
     return ledger
 
@@ -438,10 +465,24 @@ def retry_pending_drive(ledger, *, base_path: str, work_path: str | None, md_roo
         except (OSError, UnicodeError):
             content, observed_hash = "", ""
         if not in_staging or not staged.is_file() or not expected_hash or observed_hash != expected_hash:
+            if in_staging and staged.is_file():
+                try:
+                    quarantine = Path(work_path or base_path) / "quarantine" / "manual_staging"
+                    quarantine.mkdir(parents=True, exist_ok=True)
+                    destination = quarantine / f"{item.video_id}--{staged.name}"
+                    suffix = 1
+                    while destination.exists():
+                        destination = quarantine / f"{item.video_id}--{suffix}--{staged.name}"
+                        suffix += 1
+                    staged.replace(destination)
+                except OSError:
+                    logging.getLogger(__name__).exception("Could not quarantine invalid manual staging for %s", item.video_id)
             mask = ledger.video_id.astype(str) == str(item.video_id)
             ledger.loc[mask, "reason"] = "staged Markdown missing or hash mismatch; reprocessing required"
             ledger.loc[mask, ["md_path", "md_sha256"]] = ""
             ledger.loc[mask, "drive_verified"] = "false"
+            if _attempt_count(item.get("regen_attempts")) >= MAX_REGEN_ATTEMPTS:
+                ledger.loc[mask, "reason"] = "regen cap reached"
             continue
         try:
             try:

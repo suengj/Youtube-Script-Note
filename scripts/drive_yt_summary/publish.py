@@ -226,6 +226,7 @@ def publish_final_md(
 def flush_staging(
     *, md_root: str, base_path: str, work_path: Optional[str] = None, sync_root: Optional[str] = None,
     retain_staging_paths: Optional[set[str]] = None,
+    manual_expected_hashes: Optional[dict[str, str]] = None,
 ) -> List[PublishResult]:
     """Retry Drive publish for files left in staging (Drive only; mirror was attempted already)."""
     out: List[PublishResult] = []
@@ -233,13 +234,18 @@ def flush_staging(
     if not root.is_dir():
         return out
     for path in sorted(root.glob("*/*.md")):
+        is_retained_manual = str(path) in (retain_staging_paths or set())
         try:
             content = path.read_text(encoding="utf-8-sig")
         except OSError:
             continue
+        if is_retained_manual:
+            expected_hash = (manual_expected_hashes or {}).get(str(path), "")
+            observed_hash = hashlib.sha256(content.encode("utf-8")).hexdigest()
+            if not expected_hash or observed_hash != expected_hash:
+                continue
         rel = path.relative_to(root).as_posix()
         never_mirror = _never_mirror_marker(path).is_file() or _is_bromath_note(content)
-        is_retained_manual = str(path) in (retain_staging_paths or set())
         result = publish_final_md(
             rel_path=rel, content=content, staging_path=str(path), md_root=md_root,
             mirror=False, base_path=base_path, work_path=work_path, sync_root=sync_root,

@@ -2100,7 +2100,8 @@ def process_videos(config: dict):
             current = manual_video_input.read_ledger(manual_ledger_path)
             pending = current[(current.status == "success") &
                               (current.drive_verified.astype(str) == "verified") &
-                              (current.sheet_synced.astype(str).str.lower() != "true")]
+                              (current.sheet_synced.astype(str).str.lower() != "true") &
+                              (current.needs_manual_check.astype(str).str.lower() != "true")]
             if pending.empty:
                 return
             service = manual_video_input.build_sheets_service()
@@ -2567,10 +2568,12 @@ def process_videos(config: dict):
 
             before_flush_ledger = manual_video_input.read_ledger(manual_ledger_path)
             expected_staged_contents = {}
+            manual_staging_hashes = {}
             pending_staged = before_flush_ledger[(before_flush_ledger.status == "retryable_failed") &
                 before_flush_ledger.reason.astype(str).str.startswith("pending_drive:")]
             for _, pending_item in pending_staged.iterrows():
                 staged_path = str(pending_item.md_path or "")
+                manual_staging_hashes[staged_path] = str(pending_item.get("md_sha256", "") or "")
                 try:
                     staged_content = Path(staged_path).read_text(encoding="utf-8-sig")
                     staged_hash = hashlib.sha256(staged_content.encode("utf-8")).hexdigest()
@@ -2583,6 +2586,7 @@ def process_videos(config: dict):
                 base_path=base_path,
                 work_path=(config.get("WORK_PATH") or "").strip(),
                 retain_staging_paths={str(item.md_path) for _, item in pending_staged.iterrows()},
+                manual_expected_hashes=manual_staging_hashes,
             )
             if retried:
                 before_flush_ledger = manual_video_input.reconcile_staging_flush(
