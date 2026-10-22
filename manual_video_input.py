@@ -214,9 +214,18 @@ def prepare_manual_queue(manual_rows, channel_urls, output_df, ledger, max_retri
             if vid not in seen:
                 seen.add(vid)
                 queued.append((vid, item["canonical_url"], source_url))
-                ledger = upsert_ledger(ledger, video_id=vid, canonical_url=item["canonical_url"],
-                                       source_url=source_url, status="processing",
-                                       reason="manual ownership retained; selected channel candidate will process once")
+                if prior_status == "retryable_failed" and regen_pending:
+                    mask = ledger.video_id.astype(str) == vid
+                    ledger.loc[mask, "regen_attempts"] = regen_attempts + 1
+                    ledger.loc[mask, "last_attempt_at"] = _now()
+                    ledger = upsert_ledger(ledger, video_id=vid, canonical_url=item["canonical_url"],
+                                           source_url=source_url, status="processing",
+                                           reason=f"regen attempt {regen_attempts + 1}/{MAX_REGEN_ATTEMPTS}")
+                else:
+                    ledger = upsert_ledger(ledger, video_id=vid, canonical_url=item["canonical_url"],
+                                           source_url=source_url, status="processing",
+                                           reason="manual ownership retained; selected channel candidate will process once",
+                                           attempted=True)
             continue
         if output_status in {"passed_shorts", "live_scheduled", "video_unavailable", "skipped_auto_subs_only", "oversized_file"}:
             ledger = upsert_ledger(ledger, video_id=vid, canonical_url=item["canonical_url"],
@@ -320,20 +329,34 @@ def writeback_success_rows(ledger, service, *, spreadsheet_id: str = SHEET_ID, t
 
     def map_rows(columns):
         urls, sources, downloads = columns
-        mapped = {}
-        sequence = []
+        rows = []
         for offset in range(max(len(urls), len(sources), len(downloads))):
             url_cell = urls[offset] if offset < len(urls) else []
             url_text = str((url_cell or [""])[0] or "")
             normalized = normalize_youtube_url(url_text)
             video_id = normalized["video_id"] if normalized["kind"] == "video" else ""
-            sequence.append((offset + 2, video_id, url_text))
-            if normalized["kind"] != "video":
-                continue
             source = str((sources[offset] or [""])[0] or "") if offset < len(sources) else ""
             download = str((downloads[offset] or [""])[0] or "") if offset < len(downloads) else ""
-            mapped[normalized["video_id"]] = (offset + 2, source, download)
-        return mapped, sequence
+            rows.append({"row": offset + 2, "url": url_text, "video_id": video_id,
+                         "source": source, "download": download})
+        return rows
+
+    def row_sequence(rows):
+        return [(row["row"], row["url"], row["video_id"]) for row in rows]
+
+    def by_video_id(rows):
+        result = {}
+        for row in rows:
+            if row["video_id"]:
+                result.setdefault(row["video_id"], []).append(row)
+        return result
+
+    def updates_for(row, row_number=None):
+        row_number = row["row"] if row_number is None else row_number
+        return [
+            {"range": f"{quoted}!{col_letter(source_col)}{row_number}", "values": [[row["source"]]]},
+            {"range": f"{quoted}!{col_letter(model_col)}{row_number}", "values": [[row["download"]]]},
+        ]
 
     for _, item in wanted.iterrows():
         vid = str(item.video_id)
@@ -345,12 +368,11 @@ def writeback_success_rows(ledger, service, *, spreadsheet_id: str = SHEET_ID, t
         url_col, source_col, model_col = (columns[k] for k in SHEET_HEADERS)
         quoted = _quoted_tab(tab)
         try:
-            snapshot, before_sequence = map_rows(read_columns((url_col, source_col, model_col)))
-            target_before = snapshot.get(vid)
-            if target_before:
-                target_row, old_source, old_download = target_before
-                expected_source = old_source if old_source.strip() else "own"
-                if old_source == expected_source and old_download == model:
+            snapshot = map_rows(read_columns((url_col, source_col, model_col)))
+            targets_before = [row for row in snapshot if row["video_id"] == vid]
+            if targets_before:
+                if all((row["source"] if row["source"].strip() else "own") == row["source"]
+                       and row["download"] == model for row in targets_before):
                     # The sheet already contains the requested state. No API write
                     # means there is no stale-row race to reconcile.
                     ledger.loc[ledger.video_id.astype(str) == vid, "sheet_synced"] = "true"
@@ -362,12 +384,15 @@ def writeback_success_rows(ledger, service, *, spreadsheet_id: str = SHEET_ID, t
             continue
         synced = False
         manual_reason = ""
-        if target_before:
-            target_row, old_source, _ = target_before
-            expected_source = old_source if old_source.strip() else "own"
-            writes = [{"range": f"{quoted}!{col_letter(model_col)}{target_row}", "values": [[model]]}]
-            if not old_source.strip():
-                writes.append({"range": f"{quoted}!{col_letter(source_col)}{target_row}", "values": [["own"]]})
+        if targets_before:
+            expected_targets = {}
+            writes = []
+            for target in targets_before:
+                expected_source = target["source"] if target["source"].strip() else "own"
+                expected_targets[target["row"]] = (expected_source, model)
+                writes.append({"range": f"{quoted}!{col_letter(model_col)}{target['row']}", "values": [[model]]})
+                if not target["source"].strip():
+                    writes.append({"range": f"{quoted}!{col_letter(source_col)}{target['row']}", "values": [["own"]]})
             sent = False
             try:
                 request = service.spreadsheets().values().batchUpdate(
@@ -376,43 +401,62 @@ def writeback_success_rows(ledger, service, *, spreadsheet_id: str = SHEET_ID, t
                 )
                 sent = True
                 request.execute()
-                post, after_sequence = map_rows(read_columns((url_col, source_col, model_col)))
+                post = map_rows(read_columns((url_col, source_col, model_col)))
 
                 # Compare every row and exact URL text; a newly inserted or moved
                 # row invalidates the snapshot even if the target now looks right.
-                sequence_unchanged = before_sequence == after_sequence
+                sequence_unchanged = row_sequence(snapshot) == row_sequence(post)
+                snapshot_by_id, post_by_id = by_video_id(snapshot), by_video_id(post)
                 changed_others = []
                 repairs = []
-                for other_vid, (_, original_source, original_download) in snapshot.items():
-                    if other_vid == vid:
-                        continue
-                    current = post.get(other_vid)
-                    if current is None or current[1:] != (original_source, original_download):
-                        changed_others.append(other_vid)
-                        if current is not None:
-                            repairs.extend([
-                                {"range": f"{quoted}!{col_letter(source_col)}{current[0]}", "values": [[original_source]]},
-                                {"range": f"{quoted}!{col_letter(model_col)}{current[0]}", "values": [[original_download]]},
-                            ])
-                new_ids = [row[1] for row in after_sequence if row[1] and row[1] not in snapshot]
-                changed_others.extend(v for v in new_ids if v not in changed_others)
+                if sequence_unchanged:
+                    post_by_row = {row["row"]: row for row in post}
+                    for original in snapshot:
+                        if original["video_id"] == vid:
+                            continue
+                        current = post_by_row.get(original["row"])
+                        if current is None or (current["source"], current["download"]) != (original["source"], original["download"]):
+                            changed_others.append(original["video_id"] or f"row {original['row']}")
+                            repairs.extend(updates_for(original))
+                else:
+                    for other_vid, originals in snapshot_by_id.items():
+                        if other_vid == vid:
+                            continue
+                        currents = post_by_id.get(other_vid, [])
+                        if len(originals) == len(currents) == 1:
+                            original, current = originals[0], currents[0]
+                            if (current["source"], current["download"]) != (original["source"], original["download"]):
+                                changed_others.append(other_vid)
+                                repairs.extend(updates_for(original, current["row"]))
+                    for other_vid in post_by_id:
+                        if other_vid != vid and other_vid not in snapshot_by_id:
+                            changed_others.append(other_vid)
                 if repairs:
                     service.spreadsheets().values().batchUpdate(
                         spreadsheetId=spreadsheet_id,
                         body={"valueInputOption": "RAW", "data": repairs},
                     ).execute()
-                    post, after_sequence = map_rows(read_columns((url_col, source_col, model_col)))
-                    sequence_unchanged = before_sequence == after_sequence
-                target_after = post.get(vid)
-                others_unchanged = all(
-                    other_vid == vid or (other_vid in post and post[other_vid][1:] == original[1:])
-                    for other_vid, original in snapshot.items()
-                )
+                    post = map_rows(read_columns((url_col, source_col, model_col)))
+                    sequence_unchanged = row_sequence(snapshot) == row_sequence(post)
+                target_afters = [row for row in post if row["video_id"] == vid]
+                targets_match = (len(target_afters) == len(expected_targets) and
+                                 all(expected_targets.get(row["row"]) == (row["source"], row["download"])
+                                     for row in target_afters))
+                if sequence_unchanged:
+                    post_by_row = {row["row"]: row for row in post}
+                    others_unchanged = all(
+                        original["video_id"] == vid or
+                        (original["row"] in post_by_row and
+                         (post_by_row[original["row"]]["source"], post_by_row[original["row"]]["download"]) ==
+                         (original["source"], original["download"]))
+                        for original in snapshot)
+                else:
+                    others_unchanged = False
                 if changed_others:
-                    manual_reason = "other sheet videos changed during write; repaired by video_id: " + ", ".join(changed_others)
+                    manual_reason = "other sheet rows changed during write; repair attempted: " + ", ".join(changed_others)
                 if not sequence_unchanged:
                     manual_reason = (manual_reason + "; " if manual_reason else "") + "sheet row/video_id sequence or URL text changed during write"
-                if (target_after and target_after[1:] == (expected_source, model)
+                if (targets_match
                         and not changed_others and others_unchanged and sequence_unchanged):
                     synced = True
                 elif not manual_reason:

@@ -379,6 +379,39 @@ def test_writeback_sets_own_only_for_blank_source_and_uses_raw_two_cells():
     assert {x["range"] for x in service.writes} == {"'YT Link'!B2", "'YT Link'!C2"}
 
 
+def test_writeback_updates_every_duplicate_target_row():
+    service = FakeSheets(["URL", "Source", "Download 여부"], [
+        ["https://youtu.be/abcdefghijk", "", ""],
+        ["https://www.youtube.com/watch?v=abcdefghijk&si=duplicate", "Pocket", "old"],
+    ])
+    ledger = mvi.writeback_success_rows(success_ledger(), service)
+    assert service.rows == [
+        ["https://youtu.be/abcdefghijk", "own", "gpt-6-luna"],
+        ["https://www.youtube.com/watch?v=abcdefghijk&si=duplicate", "Pocket", "gpt-6-luna"],
+    ]
+    assert ledger.iloc[0].sheet_synced == "true"
+    assert {x["range"] for x in service.writes} == {"'YT Link'!B2", "'YT Link'!C2", "'YT Link'!C3"}
+
+
+def test_writeback_holds_when_duplicate_non_target_rows_change_during_write():
+    class ChangeDuplicateOtherRows(FakeSheets):
+        def batchUpdate(self, spreadsheetId, body):
+            if not self.write_calls:
+                self.rows[0][1:] = ["changed-1", "changed-1"]
+                self.rows[1][1:] = ["changed-2", "changed-2"]
+            return super().batchUpdate(spreadsheetId, body)
+
+    service = ChangeDuplicateOtherRows(["URL", "Source", "Download 여부"], [
+        ["https://youtu.be/other000001", "First", "first-model"],
+        ["https://youtu.be/other000001?si=duplicate", "Second", "second-model"],
+        ["https://youtu.be/abcdefghijk", "", ""],
+    ])
+    ledger = mvi.writeback_success_rows(success_ledger(), service)
+    assert ledger.iloc[0].sheet_synced == "false"
+    assert ledger.iloc[0].needs_manual_check == "true"
+    assert [row[1:] for row in service.rows[:2]] == [["First", "first-model"], ["Second", "second-model"]]
+
+
 def test_writeback_skips_write_when_snapshot_already_matches_expected_values():
     service = FakeSheets(["URL", "Source", "Download 여부"], [
         ["https://youtu.be/abcdefghijk", "own", "gpt-6-luna"]])
@@ -600,6 +633,30 @@ def test_channel_overlap_does_not_bypass_retry_or_regen_caps(
     assert queued == []
     assert ledger.iloc[0].status == "retryable_failed"
     assert ledger.iloc[0].reason == expected_reason
+
+
+@pytest.mark.parametrize(("reason", "counter"), [
+    ("ordinary failure", "attempts"),
+    ("staged Markdown missing or hash mismatch; reprocessing required", "regen_attempts"),
+])
+def test_repeated_channel_overlap_failures_advance_the_applicable_cap(reason, counter):
+    ledger = mvi.upsert_ledger(mvi.read_ledger("/missing/manual.csv"),
+        video_id="abcdefghijk", status="retryable_failed", reason=reason)
+    cap = 2 if counter == "regen_attempts" else 2
+    for expected in range(1, cap + 1):
+        queued, ledger = mvi.prepare_manual_queue(
+            ["https://youtu.be/abcdefghijk"], ["https://youtu.be/abcdefghijk"],
+            pd.DataFrame(), ledger, cap)
+        assert [entry[0] for entry in queued] == ["abcdefghijk"]
+        assert int(ledger.iloc[0][counter]) == expected
+        ledger = mvi.upsert_ledger(ledger, video_id="abcdefghijk", status="retryable_failed",
+                                   reason=reason)
+    queued, ledger = mvi.prepare_manual_queue(
+        ["https://youtu.be/abcdefghijk"], ["https://youtu.be/abcdefghijk"],
+        pd.DataFrame(), ledger, cap)
+    assert queued == []
+    assert ledger.iloc[0].reason == ("regen cap reached" if counter == "regen_attempts"
+                                     else f"retry limit reached ({cap})")
 
 
 def test_drive_ok_without_verified_content_readback_does_not_complete_manual_ledger(tmp_path):
