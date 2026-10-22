@@ -84,6 +84,28 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 class VideoNotQueuedError(ValueError):
     """Explicit --video-id is absent from the selected queue."""
 
+
+def _apply_channel_video_metadata(
+    video_config: dict, v_url: str, direct_input_set: set,
+    url_to_obsidian_mirror: dict, url_to_default_audio_lang: dict,
+    url_to_auto_subs_only: dict, url_to_usage_channel: dict, url_to_channel_id: dict,
+) -> dict:
+    """Apply per-video channel crawl metadata to the processing config."""
+    video_config["obsidian_mirror"] = resolve_obsidian_mirror(
+        v_url, direct_input_set, url_to_obsidian_mirror
+    )
+    if url_to_default_audio_lang and v_url in url_to_default_audio_lang:
+        video_config["default_audio_lang"] = url_to_default_audio_lang[v_url]
+    if url_to_auto_subs_only and v_url in url_to_auto_subs_only:
+        video_config["auto_subs_only"] = True
+    if url_to_usage_channel and v_url in url_to_usage_channel:
+        video_config["usage_channel"] = url_to_usage_channel[v_url]
+    if url_to_channel_id and v_url in url_to_channel_id:
+        video_config["channel_id"] = url_to_channel_id[v_url]
+    if v_url in direct_input_set:
+        video_config["from_input"] = True
+    return video_config
+
 # Configure logging
 def setup_logging(log_dir: Optional[str] = None) -> logging.Logger:
     """Setup logging configuration."""
@@ -534,11 +556,19 @@ def load_config() -> dict:
             'CHANNEL_END_DATE': '',
             'FILTERING_SHORTS_MINUTES': 3,
             'CRAWL_QUEUE_MAX_RETRIES': 3,
+            'LIVE_REPLAY_WAIT_HOURS': 72,
+            'LIVE_RETRY_MIN_INTERVAL_MIN': 60,
             'YOUTUBE_AUTO_SCRIPT': True,
             'YOUTUBE_SUBS_LANGS': 'en,ko,jp,en-US,en-GB',
         })
     
     # Env overrides for YouTube subs ( .env takes precedence )
+    for _name, _default in (("LIVE_REPLAY_WAIT_HOURS", 72), ("LIVE_RETRY_MIN_INTERVAL_MIN", 60)):
+        _value = os.getenv(_name, "").strip()
+        if _value:
+            config[_name] = float(_value)
+        else:
+            config.setdefault(_name, _default)
     _auto = os.getenv('YOUTUBE_AUTO_SCRIPT', '').strip().lower()
     if _auto:
         config['YOUTUBE_AUTO_SCRIPT'] = _auto in ('true', '1', 'yes')
@@ -1222,7 +1252,7 @@ def process_single_video(
         _find_exact_durable_full_transcript(output_full_path, video_id) if video_id else None
     )
     _terminal_skip_statuses = frozenset({
-        "passed_shorts", "live_scheduled", "video_unavailable",
+        "passed_shorts", "video_unavailable",
         "skipped_auto_subs_only", "oversized_file", "NO_AUTO_CAPTION",
     })
     _retryable_statuses = frozenset({
@@ -2166,20 +2196,11 @@ def process_videos(config: dict):
         # (unknown channel => off). Direct input_df.csv URLs are specific videos the owner
         # asked for, so they always mirror to Obsidian (Drive is written for every video).
         # Decided by input source, never by channel lookup.
-        video_config["obsidian_mirror"] = resolve_obsidian_mirror(
-            v_url, direct_input_set, url_to_obsidian_mirror
+        return _apply_channel_video_metadata(
+            video_config, v_url, direct_input_set, url_to_obsidian_mirror,
+            url_to_default_audio_lang, url_to_auto_subs_only,
+            url_to_usage_channel, url_to_channel_id,
         )
-        if url_to_default_audio_lang and v_url in url_to_default_audio_lang:
-            video_config["default_audio_lang"] = url_to_default_audio_lang[v_url]
-        if url_to_auto_subs_only and v_url in url_to_auto_subs_only:
-            video_config["auto_subs_only"] = True
-        if url_to_usage_channel and v_url in url_to_usage_channel:
-            video_config["usage_channel"] = url_to_usage_channel[v_url]
-        if url_to_channel_id and v_url in url_to_channel_id:
-            video_config["channel_id"] = url_to_channel_id[v_url]
-        if v_url in url_from_input_set:
-            video_config["from_input"] = True
-        return video_config
 
     def _claim_vid_for_url(v_url: str) -> str:
         claim_vid = queue_url_to_video_id.get(v_url, "")
