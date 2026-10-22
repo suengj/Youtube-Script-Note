@@ -485,6 +485,13 @@ def reconcile_queue_with_output_df(
             continue
         st = status_map[vid]
         replay_state = str(row.get("last_error", "")).strip()
+        # A replay rediscovered as a short is terminal even if the only output
+        # row still says live_scheduled (the duplicate output row may be omitted).
+        if replay_state == SHORTS_STATUS:
+            q.at[idx, "status"] = "done"
+            if not str(row.get("done_at", "")).strip():
+                q.at[idx, "done_at"] = now_iso
+            continue
         # Probe failures while waiting for a live replay are observations about this
         # attempt, not a replacement for the bounded replay-wait state.
         if replay_state == "live_no_replay":
@@ -1110,7 +1117,11 @@ def build_queue_and_get_candidates(
                 "published_at": pub_s,
                 "status": "queued",
                 "retry_count": 0,
-                "last_error": "",
+                "last_error": (
+                    LIVE_SCHEDULED_STATUS
+                    if output_status_by_vid.get(vid, "") == LIVE_SCHEDULED_STATUS
+                    else ""
+                ),
                 "discovered_at": now_iso,
                 "last_attempted_at": "",
                 "done_at": "",
