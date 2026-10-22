@@ -32,6 +32,8 @@ P03 is a macOS / Apple Silicon pipeline that:
 
 See [docs/PROJECT.md](docs/PROJECT.md) for full pipeline documentation.
 
+Owner supplied individual video URLs can be imported into the existing `data/input_df.csv` queue. See [docs/MANUAL_VIDEO_INPUT.md](docs/MANUAL_VIDEO_INPUT.md).
+
 ## Platform support
 
 - **Supported:** macOS and Linux (automatic captions only)

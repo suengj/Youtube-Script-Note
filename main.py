@@ -54,6 +54,7 @@ if sys.stderr.encoding != 'utf-8':
 
 import stt_function_v3 as stt
 import channel_crawl
+import manual_video_input
 from filename_utils import fit_filename, parse_note_name, validate_llm_suffix
 import run_lock
 from job_workspace import VideoJobWorkspace, cleanup_stale_jobs
@@ -89,6 +90,8 @@ def _apply_channel_video_metadata(
     video_config: dict, v_url: str, direct_input_set: set,
     url_to_obsidian_mirror: dict, url_to_default_audio_lang: dict,
     url_to_auto_subs_only: dict, url_to_usage_channel: dict, url_to_channel_id: dict,
+    manual_video_ids: Optional[set] = None,
+    manual_auto_subs_only_ids: Optional[set] = None,
 ) -> dict:
     """Apply per-video channel crawl metadata to the processing config."""
     video_config["obsidian_mirror"] = resolve_obsidian_mirror(
@@ -104,6 +107,14 @@ def _apply_channel_video_metadata(
         video_config["channel_id"] = url_to_channel_id[v_url]
     if v_url in direct_input_set:
         video_config["from_input"] = True
+    try:
+        video_id = stt.extract_youtube_id(v_url) or ""
+    except (ValueError, TypeError):
+        video_id = ""
+    if video_id and manual_video_ids and video_id in manual_video_ids:
+        video_config["manual_retry_no_auto_caption"] = True
+    if video_id and manual_auto_subs_only_ids and video_id in manual_auto_subs_only_ids:
+        video_config["auto_subs_only"] = True
     return video_config
 
 # Configure logging
@@ -178,6 +189,7 @@ class MainLlmConfig:
         token_range=MAIN_LLM_TOKEN_RANGE,
         language: str = "Korean",
         style: str = "Markdown",
+        model_used_callback=None,
     ) -> str:
         return stt.summarize_with_chunking(
             transcription=transcription,
@@ -191,6 +203,7 @@ class MainLlmConfig:
             fallback_client=self.fallback_client,
             fallback_model=self.fallback_model,
             fallback_provider=self.fallback_provider,
+            model_used_callback=model_used_callback,
             primary_provider=self.primary_provider,
         )
 
@@ -499,13 +512,14 @@ def run_direct_summary(client, transcription: str, filename: str, video_id: str,
 
 def summarize_with_pipeline(mode: str, *, direct_client, main_llm, direct_transcription: str,
                             legacy_transcription: str, filename: str, video_id: str,
-                            config: dict, prompt: str):
+                            config: dict, prompt: str, model_used_callback=None):
     """Keep the legacy route isolated while selecting one direct Responses call when enabled."""
     if mode == "direct_luna":
         return run_direct_summary(direct_client, direct_transcription, filename, video_id, config)
     text = main_llm.summarize(
         transcription=legacy_transcription, filename=filename, prompt=prompt,
         token_range=list(MAIN_LLM_TOKEN_RANGE), language="Korean", style="Markdown",
+        model_used_callback=model_used_callback,
     )
     return text, None
 
@@ -1168,6 +1182,14 @@ def atomic_write_text_with_retry(
         raise last_exc
 
 
+def _is_terminal_video_status(status: str, *, manual_retry_no_auto_caption: bool = False) -> bool:
+    terminal = {"passed_shorts", "video_unavailable",
+                "skipped_auto_subs_only", "oversized_file", "NO_AUTO_CAPTION"}
+    if manual_retry_no_auto_caption:
+        terminal.discard("NO_AUTO_CAPTION")
+    return status in terminal
+
+
 def process_single_video(
     v_url: str,
     config: dict,
@@ -1251,10 +1273,6 @@ def process_single_video(
     durable_full_path: Optional[str] = (
         _find_exact_durable_full_transcript(output_full_path, video_id) if video_id else None
     )
-    _terminal_skip_statuses = frozenset({
-        "passed_shorts", "video_unavailable",
-        "skipped_auto_subs_only", "oversized_file", "NO_AUTO_CAPTION",
-    })
     _retryable_statuses = frozenset({
         "download_failed", "api_error", "file_error", "mlx_error", "captions_error", "SOURCE_UNAVAILABLE", "source_unavailable", "error",
     })
@@ -1270,7 +1288,7 @@ def process_single_video(
                 logger.info(f"[STEP 2/5] Retrying prior failed video (status: {latest_status})")
             elif latest_status == "already_existed" and (prior['status'] == 'download_failed').any():
                 logger.info("[STEP 2/5] Retrying video previously skipped after download_failed")
-            elif latest_status in _terminal_skip_statuses or latest_status in (
+            elif _is_terminal_video_status(latest_status, manual_retry_no_auto_caption=bool(config.get("manual_retry_no_auto_caption"))) or latest_status in (
                 "already_existed", "unknown"
             ):
                 if (
@@ -1505,6 +1523,12 @@ def process_single_video(
         caption_revision = hashlib.sha256((transcription.strip() + "\n").encode("utf-8")).hexdigest()
         cached_response = (job_workspace.load_generation_result(input_revision=caption_revision,
             model=str(selected_model), prompt_sha256=generation_prompt_sha) if job_workspace is not None else None)
+        actual_models = [str(selected_model)]
+        if cached_response is not None and job_workspace is not None:
+            actual_models[0] = job_workspace.load_generation_model(
+                input_revision=caption_revision, model=str(selected_model),
+                prompt_sha256=generation_prompt_sha, default=str(selected_model))
+        model_used_callback = lambda used_model: actual_models.__setitem__(0, str(used_model))
         # The cached-summary path skips legacy preprocessing, but the shared upload
         # path still needs the deterministic output name for its prompt metadata.
         output_file = derive_output_name(
@@ -1663,10 +1687,12 @@ def process_single_video(
                     "legacy_two_stage", direct_client=openai_client, main_llm=main_llm,
                     direct_transcription=transcription, legacy_transcription=concise_transcription,
                     filename=audio_nm, video_id=video_id, config=config, prompt=INPUT_PROMPT,
+                    model_used_callback=model_used_callback,
                 )
             if cached_response is None and job_workspace is not None:
                 job_workspace.save_generation_result(input_revision=caption_revision,
-                    model=str(selected_model), prompt_sha256=generation_prompt_sha, summary=response)
+                    model=str(selected_model), prompt_sha256=generation_prompt_sha, summary=response,
+                    generated_model=actual_models[0])
             response_length = len(response)
             logger.info(f"[STEP 6/7] ✓ Full summary generated")
             logger.info(f"  Response length: {response_length} characters")
@@ -1791,7 +1817,7 @@ def process_single_video(
                 metadata = {
                     "url": source_url, "channel": ch_raw or channel_name_from_dl or "",
                     "published_at": upload_date or "", "caption_track": {"lang": subs_lang or "", "kind": subs_source or "auto"},
-                    "model": config.get("DIRECT_LLM_MODEL") if direct_mode else config.get("MAIN_LLM_MODEL"),
+                    "model": actual_models[0],
                     "provider": config.get("MAIN_LLM_PROVIDER", "openai"),
                     "effort": config.get("DIRECT_LLM_REASONING_EFFORT", "") if direct_mode else "",
                     "prompt_profile_revision": profile_revision, "repo_commit": repo_commit,
@@ -1820,7 +1846,20 @@ def process_single_video(
                     video_id=video_id or "",
                     title=title,
                     never_mirror=(str(ch_raw).strip().casefold() == "bromath"),
+                    retain_staging=bool(config.get("from_input")),
                 )
+                if (config.get("from_input") and pub.drive_action == "unchanged"
+                        and not manual_video_input.verified_file_readback(pub.drive_path, content_to_write)):
+                    pub = publish_final_md(
+                        rel_path=rel_md, content=content_to_write, staging_path=staging_file,
+                        md_root=output_md_path, mirror=bool(config.get("obsidian_mirror", False)),
+                        base_path=base_path, work_path=work_path_cfg, video_id=video_id or "",
+                        title=title, never_mirror=(str(ch_raw).strip().casefold() == "bromath"),
+                        retain_staging=True, force_rewrite=True,
+                    )
+                if (config.get("from_input") and pub.drive_ok
+                        and manual_video_input.verified_file_readback(pub.drive_path, content_to_write)):
+                    Path(staging_file).unlink(missing_ok=True)
                 for err in pub.errors:
                     logger.error("Final markdown publish issue (%s): %s", rel_md, err)
                 if pub.mirror_action in ("mirrored", "unchanged"):
@@ -1838,6 +1877,17 @@ def process_single_video(
             logger.info(f"[STEP 7/7] ✓ Markdown saved")
             logger.info(f"  File: {effective_md_path}")
             logger.info(f"  File size: {md_file_size} bytes")
+            result_md_path = effective_md_path
+            if (config.get("from_input") and os.path.isfile(staging_file)
+                    and (not manual_video_input.verified_file_readback(effective_md_path, content_to_write)
+                         or (not api_verified and not manual_video_input.verified_file_readback(
+                             pub.drive_path, content_to_write)))):
+                # Keep the exact generated bytes available for a later Drive retry
+                # when a path-level publish result fails content readback.
+                result_md_path = staging_file
+            if (config.get("from_input") and not api_verified and not pub.drive_ok
+                    and os.path.isfile(staging_file)):
+                result_md_path = staging_file
 
             # Defer metadata/catalog to single writer
             method = ("transcript_reuse" if reused_transcription is not None else
@@ -1890,10 +1940,12 @@ def process_single_video(
             None,
             stage="complete",
             transcript_source=ts,
-            output_md_path_res=effective_md_path,
-            metadata_updates=pending_metadata,
+            output_md_path_res=result_md_path,
             catalog_updates=pending_catalog,
             prompt_entries=pending_prompt_entries,
+            metadata_updates={**pending_metadata, "model": actual_models[0],
+                              "drive_verified": bool(api_verified or (not api_verified and pub.drive_ok and
+                                  manual_video_input.verified_file_readback(pub.drive_path, content_to_write)))},
         )
         
     except KeyboardInterrupt:
@@ -2020,29 +2072,9 @@ def process_videos(config: dict):
                         "auto_subs_only": bool((str(r.get("auto_sub_only", "")).strip())),
                         "obsidian_mirror": channel_crawl.is_obsidian_on(r.get("obsidian")),
                     })
-                # Merge input_df URLs (not yet in output_df) so both channel crawl and manual input are processed
-                input_urls = get_input_urls_for_channel_crawl(data_root, output_df)
-                direct_input_set = set(input_urls)
-                crawl_set = set(url_list)
-                input_only = [u for u in input_urls if u not in crawl_set]
-                if input_only:
-                    url_list = url_list + input_only
-                    url_from_input_set = set(input_only)
-                    logger.info("Channel crawl: added %d URL(s) from input_df.csv (total queue: %d)", len(input_only), len(url_list))
-                else:
-                    url_from_input_set = set()
             else:
                 url_list = []
                 meta_for_channel_crawl = []
-                url_from_input_set = set()
-            # When no channel candidates, still process input_df if present
-            if not url_list:
-                input_urls = get_input_urls_for_channel_crawl(data_root, output_df)
-                if input_urls:
-                    url_list = input_urls
-                    url_from_input_set = set(url_list)
-                    direct_input_set = set(url_list)
-                    logger.info("Channel crawl: no channel candidates; using %d URL(s) from input_df.csv", len(url_list))
         except ValueError as e:
             # ValueError/UnicodeError 계열 메시지 출력
             error_msg = str(e) if e else "Configuration error"
@@ -2056,9 +2088,100 @@ def process_videos(config: dict):
                 logger.info("  [%d] %s", i + 1, url_list[i])
     else:
         input_df, output_df = load_dataframes(data_root)
-        url_list = get_url_list(input_df, output_df)
-        url_from_input_set = set(url_list) if url_list else set()
-        direct_input_set = set(url_from_input_set)
+        url_list = []
+
+    # Manual input_df URLs are canonicalized and merged by video ID in both run modes.
+    # Channel candidates win so their discovered metadata and policies are retained.
+    manual_ledger_path = os.path.join(data_root, "manual_input_status.csv")
+    manual_ledger = manual_video_input.read_ledger(manual_ledger_path)
+
+    def _writeback_manual_sheet() -> None:
+        current = None
+        try:
+            current = manual_video_input.read_ledger(manual_ledger_path)
+            pending = current[(current.status == "success") &
+                              (current.drive_verified.astype(str) == "verified") &
+                              (current.sheet_synced.astype(str).str.lower() != "true") &
+                              (current.needs_manual_check.astype(str).str.lower() != "true")]
+            if pending.empty:
+                return
+            service = manual_video_input.build_sheets_service()
+            current = manual_video_input.writeback_success_rows(
+                current, service,
+                spreadsheet_id=os.getenv("P03_GOOGLE_SHEET_ID", manual_video_input.SHEET_ID),
+                tab=os.getenv("P03_GOOGLE_SHEET_TAB", manual_video_input.SHEET_TAB),
+            )
+        except Exception as sheet_exc:
+            logger.warning("Manual Google Sheet writeback skipped; ledger remains pending: %s", sheet_exc)
+        finally:
+            if current is not None:
+                try:
+                    manual_video_input.save_ledger(current, manual_ledger_path)
+                except Exception as save_exc:
+                    logger.error("Manual Google Sheet ledger persistence failed: %s", save_exc)
+    # A manual final Markdown retained in staging has already completed generation.
+    # Retry only its Drive publish before putting that ID back on the LLM queue.
+    try:
+        manual_ledger = manual_video_input.retry_pending_drive(
+            manual_ledger, base_path=base_path, work_path=config.get("WORK_PATH"),
+            md_root=config["OUTPUT_MD_PATH"])
+        manual_video_input.save_ledger(manual_ledger, manual_ledger_path)
+    except Exception as retry_setup_exc:
+        logger.warning("Manual pending Drive retry unavailable: %s", retry_setup_exc)
+    input_path = os.path.join(data_root, "input_df.csv")
+    manual_rows = []
+    if os.path.exists(input_path):
+        try:
+            manual_df = _read_csv_with_retry(input_path, encoding="cp949")
+            if "url" in manual_df.columns:
+                manual_rows = [str(u).strip() for u in manual_df["url"].tolist() if str(u).strip()]
+        except Exception as exc:
+            logger.warning("Could not load manual input URLs: %s", exc)
+    max_manual_retries = int(config.get("CRAWL_QUEUE_MAX_RETRIES", 3) or 3)
+    manual_duration_map = {}
+    manual_video_channel_ids = {}
+    manual_channel_auto_sub_only = {}
+    try:
+        registered_channels = channel_crawl.load_channel_df(data_root)
+        manual_channel_auto_sub_only = {
+            str(row.get("channel_id", "")).strip(): str(row.get("auto_sub_only", "")).strip().casefold() in {"1", "true", "yes", "y"}
+            for row in registered_channels if str(row.get("channel_id", "")).strip()
+        }
+        manual_ids = [manual_video_input.normalize_youtube_url(u)["video_id"] for u in manual_rows
+                      if manual_video_input.normalize_youtube_url(u)["kind"] == "video"]
+        api_key = str(config.get("YOUTUBE_API_KEY") or "").strip()
+        if api_key and manual_ids:
+            details = channel_crawl._api_request(api_key, "videos", {
+                "part": "contentDetails,snippet", "id": ",".join(sorted(set(manual_ids))), "maxResults": "50"}) or {}
+            for video in details.get("items", []):
+                vid = str(video.get("id", ""))
+                detail = video.get("contentDetails") or {}
+                snippet = video.get("snippet") or {}
+                if detail.get("duration"):
+                    manual_duration_map[vid] = str(detail["duration"])
+                if snippet.get("channelId"):
+                    manual_video_channel_ids[vid] = str(snippet["channelId"])
+    except Exception as policy_exc:
+        logger.warning("Manual video policy metadata unavailable; applying available metadata only: %s", policy_exc)
+    shorts_threshold = int(float(config.get("FILTERING_SHORTS_MINUTES", 3) or 0) * 60)
+    manual_urls, manual_ledger = manual_video_input.prepare_manual_queue(
+        manual_rows, url_list, output_df, manual_ledger, max_manual_retries,
+        duration_map=manual_duration_map, shorts_threshold_seconds=shorts_threshold,
+        channel_auto_sub_only=manual_channel_auto_sub_only,
+        video_channel_ids=manual_video_channel_ids)
+    manual_auto_subs_only_ids = {
+        vid for vid, channel_id in manual_video_channel_ids.items()
+        if manual_channel_auto_sub_only.get(str(channel_id).strip(), False)
+    }
+    # Persist the ledger before processing so failed writes cannot start duplicate work.
+    manual_video_input.save_ledger(manual_ledger, manual_ledger_path)
+    if manual_urls:
+        channel_video_ids = {manual_video_input.normalize_youtube_url(u)["video_id"]
+                             for u in url_list if manual_video_input.normalize_youtube_url(u)["kind"] == "video"}
+        url_list.extend(url for vid, url, _ in manual_urls if vid not in channel_video_ids)
+        direct_input_set = {url for _, url, _ in manual_urls}
+        url_from_input_set = set(direct_input_set)
+        logger.info("Added %d canonical manual video URL(s) by video ID", len(manual_urls))
     
     wanted_video_id = config.get("VIDEO_ID_FILTER")
     if wanted_video_id:
@@ -2070,6 +2193,7 @@ def process_videos(config: dict):
         url_list = url_list[:int(max_videos)]
     if not url_list:
         logger.info("No videos to process. All videos have been processed.")
+        _writeback_manual_sheet()
         return
 
     _run_batch_cleanup(config, dry_run_legacy=True)
@@ -2200,6 +2324,7 @@ def process_videos(config: dict):
             video_config, v_url, direct_input_set, url_to_obsidian_mirror,
             url_to_default_audio_lang, url_to_auto_subs_only,
             url_to_usage_channel, url_to_channel_id,
+            {vid for vid, _, _ in manual_urls}, manual_auto_subs_only_ids,
         )
 
     def _claim_vid_for_url(v_url: str) -> str:
@@ -2214,9 +2339,35 @@ def process_videos(config: dict):
     api_storage_failure = False
     def _finalize_result(result: VideoProcessResult, v_url: str, claim_vid: str, i: int, pbar) -> None:
         nonlocal output_df, crawl_queue_df, consecutive_failures, counter, last_success_time, api_storage_failure
+        if result.video_id in {vid for vid, _, _ in manual_urls} and result.status == "success" and not result.metadata_updates.get("drive_verified"):
+            result.status = "file_error"
+            result.retryable = True
+            result.error_message = "pending_drive: final Markdown is staged but Drive verification is pending"
         state_writer.apply(result)
         output_df = state_writer.get_output_df()
         crawl_queue_df = state_writer.get_crawl_queue_df()
+        if result.video_id in {vid for vid, _, _ in manual_urls}:
+            try:
+                md_path = result.output_md_path or ""
+                md_exists = md_path.startswith("drive-api:") or os.path.isfile(md_path)
+                status, reason, md_path, drive_state = manual_video_input.ledger_outcome(
+                    result.status, result.error_message or "", md_path,
+                    md_exists=md_exists,
+                    drive_disabled=os.getenv("P03_DRIVE_SYNC_ENABLED", "1").strip() == "0",
+                    drive_verified=bool(result.metadata_updates.get("drive_verified")))
+                manual_ledger = manual_video_input.read_ledger(manual_ledger_path)
+                manual_ledger = manual_video_input.upsert_ledger(
+                    manual_ledger, video_id=result.video_id,
+                    canonical_url=next((u for vid, u, _ in manual_urls if vid == result.video_id), v_url),
+                    source_url=next((src for vid, _, src in manual_urls if vid == result.video_id), v_url),
+                    status=status, reason=reason, md_path=md_path, drive_verified=drive_state,
+                    model=str(result.metadata_updates.get("model", "")),
+                    md_sha256=(hashlib.sha256(Path(md_path).read_text(encoding="utf-8-sig").encode("utf-8")).hexdigest()
+                               if md_path and os.path.isfile(md_path) else ""))
+                manual_video_input.save_ledger(manual_ledger, manual_ledger_path)
+            except Exception as ledger_exc:
+                # output_df is already durable; its success row remains the dedupe guard.
+                logger.error("Manual input ledger write failed for %s: %s", result.video_id, ledger_exc)
         if claim_vid:
             claim_mgr.release(claim_vid)
         elif result.video_id and result.video_id != "unknown":
@@ -2421,12 +2572,38 @@ def process_videos(config: dict):
             from scripts.drive_yt_summary.publish import flush_staging
             from scripts.drive_yt_summary.sync import run_sync_safe
 
+            before_flush_ledger = manual_video_input.read_ledger(manual_ledger_path)
+            expected_staged_contents = {}
+            manual_staging_hashes = {}
+            for _, item in before_flush_ledger.iterrows():
+                staged_path = str(item.md_path or "")
+                expected_hash = str(item.get("md_sha256", "") or "")
+                if staged_path:
+                    manual_staging_hashes[staged_path] = expected_hash
+            pending_staged = before_flush_ledger[(before_flush_ledger.status == "retryable_failed") &
+                before_flush_ledger.reason.astype(str).str.startswith("pending_drive:")]
+            quarantine_staged = before_flush_ledger[before_flush_ledger.status == "pending_quarantine"]
+            for _, pending_item in pending_staged.iterrows():
+                staged_path = str(pending_item.md_path or "")
+                try:
+                    staged_content = Path(staged_path).read_text(encoding="utf-8-sig")
+                    staged_hash = hashlib.sha256(staged_content.encode("utf-8")).hexdigest()
+                    if staged_hash == str(pending_item.get("md_sha256", "") or ""):
+                        expected_staged_contents[os.path.basename(staged_path)] = staged_content
+                except (OSError, UnicodeError):
+                    pass
             retried = flush_staging(
                 md_root=config["OUTPUT_MD_PATH"],
                 base_path=base_path,
                 work_path=(config.get("WORK_PATH") or "").strip(),
+                retain_staging_paths={str(item.md_path) for _, item in pending_staged.iterrows()},
+                manual_expected_hashes=manual_staging_hashes,
+                blocked_staging_paths={str(item.md_path) for _, item in quarantine_staged.iterrows()},
             )
             if retried:
+                before_flush_ledger = manual_video_input.reconcile_staging_flush(
+                    before_flush_ledger, retried, expected_staged_contents)
+                manual_video_input.save_ledger(before_flush_ledger, manual_ledger_path)
                 logger.info(
                     "Drive staging retry: %s/%s published",
                     sum(1 for r in retried if r.drive_ok),
@@ -2463,6 +2640,7 @@ def process_videos(config: dict):
         except Exception as ce:
             logger.warning("JEV classify retry failed (non-fatal): %s", type(ce).__name__)
 
+    _writeback_manual_sheet()
     _run_batch_cleanup(config, dry_run_legacy=False)
     
     if failed_urls:

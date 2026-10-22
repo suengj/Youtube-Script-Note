@@ -84,7 +84,34 @@ class VideoJobWorkspace:
         except (OSError, ValueError, TypeError, UnicodeError, AttributeError):
             return None
 
-    def save_generation_result(self, *, input_revision: str, model: str, prompt_sha256: str, summary: str) -> None:
+    def load_generation_model(self, *, input_revision: str, model: str, prompt_sha256: str,
+                              default: str = "") -> str:
+        """Return the actual final-call model for a valid cached generation record."""
+        path = self.generation_cache_path()
+        try:
+            fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+            try:
+                info = os.fstat(fd)
+                if not stat.S_ISREG(info.st_mode) or info.st_size > GENERATION_CACHE_MAX_BYTES:
+                    return default
+                with os.fdopen(fd, "r", encoding="utf-8") as stream:
+                    fd = -1
+                    record = json.load(stream)
+            finally:
+                if fd >= 0:
+                    os.close(fd)
+            summary = record.get("summary")
+            if (record.get("video_id") != self.video_id or record.get("input_revision") != input_revision or
+                    record.get("model") != model or record.get("prompt_sha256") != prompt_sha256 or
+                    not isinstance(summary, str) or
+                    record.get("summary_sha256") != hashlib.sha256(summary.encode("utf-8")).hexdigest()):
+                return default
+            return str(record.get("generated_model") or default)
+        except (OSError, ValueError, TypeError, UnicodeError, AttributeError):
+            return default
+
+    def save_generation_result(self, *, input_revision: str, model: str, prompt_sha256: str, summary: str,
+                               generated_model: str = "") -> None:
         """Atomically persist the generated summary and its full binding identity."""
         if not isinstance(summary, str) or not summary or len(summary.encode("utf-8")) > GENERATION_CACHE_MAX_BYTES:
             raise ValueError("invalid generation result")
@@ -94,6 +121,7 @@ class VideoJobWorkspace:
             "video_id": self.video_id,
             "input_revision": input_revision,
             "model": model,
+            "generated_model": generated_model or model,
             "prompt_sha256": prompt_sha256,
             "summary_sha256": hashlib.sha256(encoded).hexdigest(),
             "summary": summary,

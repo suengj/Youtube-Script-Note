@@ -907,15 +907,15 @@ def yt_downloader_ytdlp(URL, DOWNLOAD_PATH, video_id, max_retries=3, config=None
                 channel_name = info.get('uploader') or info.get('channel') or ''
                 title = info.get('title', f'video_{video_id}')
                 auto_tracks = info.get("automatic_captions") or {}
+                uploader_tracks = info.get("subtitles") or {}
                 accepted_langs = [str(lang).lower() for lang in subs_langs]
-                has_auto_captions = any(
-                    lang in auto_tracks or any(key.startswith(lang + "-") for key in auto_tracks)
-                    for lang in accepted_langs
-                )
                 allow_uploader_subs = (os.getenv("P03_ALLOW_UPLOADER_SUBS", "").strip() == "1")
-                # auto_subs_only channel: process only when 자막 OR 자동 자막 exists; skip if neither
+                has_auto_captions, has_uploader_captions = _caption_availability(
+                    auto_tracks, uploader_tracks, accepted_langs, allow_uploader_subs)
+                # Registered auto_sub_only policy means captions only; it must
+                # preserve videos with either accepted uploader or automatic captions.
                 auto_subs_only = bool(config.get("auto_subs_only")) if config else False
-                if auto_subs_only and not has_auto_captions:
+                if auto_subs_only and not (has_auto_captions or has_uploader_captions):
                     logger.info("Skipping (auto_subs_only channel, no subs): %s", URL)
                     return ("__SKIP_AUTO_SUBS_ONLY__", None, video_id, None, None, None, None, None, None, "", _format_upload_date(info))
                 subs_path_result = None
@@ -1070,6 +1070,16 @@ def yt_downloader_ytdlp(URL, DOWNLOAD_PATH, video_id, max_retries=3, config=None
     
     _set_last_ytdlp_failure("yt-dlp: exhausted retries without success")
     return None
+
+
+def _caption_availability(auto_tracks, uploader_tracks, accepted_langs, allow_uploader):
+    """Return accepted automatic/uploader caption availability from yt-dlp metadata."""
+    has_auto = any(lang in auto_tracks or any(key.startswith(lang + "-") for key in auto_tracks)
+                   for lang in accepted_langs)
+    has_uploader = allow_uploader and any(
+        lang in uploader_tracks or any(key.startswith(lang + "-") for key in uploader_tracks)
+        for lang in accepted_langs)
+    return has_auto, has_uploader
 
 def _is_errno11_deadlock(exc: BaseException) -> bool:
     """macOS EDEADLK / Resource deadlock often surfaces as OSError errno 11."""
@@ -1390,7 +1400,8 @@ def summarize_with_chunking(transcription, filename, prompt, client,
                             token_range=(1.3, 1.5), language="Korean", style="Markdown",
                             token_limit=None, model="gpt-5-mini-2025-08-07",
                             fallback_client=None, fallback_model=None,
-                            primary_provider=None, fallback_provider=None):
+                            primary_provider=None, fallback_provider=None,
+                            model_used_callback=None):
     """
     Summarize transcription with 2-step chunking when input exceeds token limit (Option B).
     If transcription is under limit: prompt_structure + response_text_5mini.
@@ -1402,6 +1413,7 @@ def summarize_with_chunking(transcription, filename, prompt, client,
         "fallback_model": fallback_model,
         "primary_provider": primary_provider,
         "fallback_provider": fallback_provider,
+        "model_used_callback": model_used_callback,
     }
     n_tokens = count_tokens(transcription)
     if n_tokens <= limit:
@@ -1530,9 +1542,13 @@ def response_text_5mini(
     fallback_model=None,
     primary_provider=None,
     fallback_provider=None,
+    model_used_callback=None,
 ):
     try:
-        return _response_text_5mini_once(INPUT_QUERY, client, model)
+        result = _response_text_5mini_once(INPUT_QUERY, client, model)
+        if model_used_callback:
+            model_used_callback(model)
+        return result
     except Exception as exc:
         if not fallback_client or not fallback_model or not _is_retryable_llm_error(exc):
             raise
@@ -1545,7 +1561,10 @@ def response_text_5mini(
             fallback_provider or "unknown",
             fallback_model,
         )
-        return _response_text_5mini_once(INPUT_QUERY, fallback_client, fallback_model)
+        result = _response_text_5mini_once(INPUT_QUERY, fallback_client, fallback_model)
+        if model_used_callback:
+            model_used_callback(fallback_model)
+        return result
 
 
 def _response_text_5mini_once(INPUT_QUERY, client, model="gpt-5-mini-2025-08-07"):
