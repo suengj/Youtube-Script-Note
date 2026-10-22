@@ -199,9 +199,11 @@ def prepare_manual_queue(manual_rows, channel_urls, output_df, ledger, max_retri
                                    reason=f"prior terminal pipeline status: {output_status}")
             continue
         attempts = _attempt_count(prior.iloc[-1].get("attempts")) if len(prior) else 0
-        if (prior_status == "retryable_failed" and
-                str(prior.iloc[-1].get("reason") or "").startswith("pending_drive:")):
-            # Preserve the generated staging artifact as the sole retry source.
+        pending_drive = (prior_status == "retryable_failed" and
+                         str(prior.iloc[-1].get("reason") or "").startswith("pending_drive:"))
+        if pending_drive:
+            # retry_pending_drive either publishes the exact staged artifact or
+            # clears this marker when it is missing/stale, allowing regeneration.
             continue
         if prior_status == "retryable_failed" and attempts >= max_retries:
             ledger = upsert_ledger(ledger, video_id=vid, canonical_url=item["canonical_url"],
@@ -287,64 +289,89 @@ def writeback_success_rows(ledger, service, *, spreadsheet_id: str = SHEET_ID, t
     wanted = ledger[(ledger.status == "success") &
                     (ledger.drive_verified.astype(str) == "verified") &
                     (ledger.sheet_synced.astype(str).str.lower() != "true")]
+    def read_columns(columns):
+        ranges = [f"{_quoted_tab(tab)}!{col_letter(col)}2:{col_letter(col)}" for col in columns]
+        response = service.spreadsheets().values().batchGet(
+            spreadsheetId=spreadsheet_id, ranges=ranges).execute()
+        return [entry.get("values", []) for entry in response.get("valueRanges", [])]
+
     for _, item in wanted.iterrows():
         vid = str(item.video_id)
         model = str(item.get("model", "") or "").strip()
         if not model:
             continue
-        headers, values = read_sheet_rows(service, spreadsheet_id, tab)
+        headers = validate_sheet(service, spreadsheet_id, tab)
         columns = {name: headers.index(name) + 1 for name in SHEET_HEADERS}
         url_col, source_col, model_col = (columns[k] for k in SHEET_HEADERS)
-        matches = []
-        for row_no, row in enumerate(values[1:], start=2):
-            url = row[url_col - 1] if len(row) >= url_col else ""
-            normalized = normalize_youtube_url(url)
-            if normalized["kind"] == "video" and normalized["video_id"] == vid:
-                matches.append(row_no)
-        synced = bool(matches)
-        for row_no in matches:
-            quoted = _quoted_tab(tab)
-            ranges = [f"{quoted}!{col_letter(c)}{row_no}" for c in (url_col, source_col, model_col)]
-            snapshot_rsp = service.spreadsheets().values().batchGet(
-                spreadsheetId=spreadsheet_id, ranges=ranges).execute()
-            snapshot = [str((v.get("values") or [[""]])[0][0]) for v in snapshot_rsp.get("valueRanges", [])]
-            if len(snapshot) != 3:
-                synced = False
-                continue
-            snapshot_url, old_source, old_model = snapshot
-            if normalize_youtube_url(snapshot_url).get("video_id") != vid:
-                synced = False
-                continue
+        synced = False
+        for attempt in range(2):
+            snapshot_columns = read_columns((url_col, source_col, model_col))
+            urls, sources, downloads = snapshot_columns
+            snapshot = {}
+            for offset, url_cell in enumerate(urls):
+                url = str((url_cell or [""])[0] or "")
+                normalized = normalize_youtube_url(url)
+                if normalized["kind"] != "video":
+                    continue
+                row_no = offset + 2
+                source = str((sources[offset] or [""])[0] or "") if offset < len(sources) else ""
+                download = str((downloads[offset] or [""])[0] or "") if offset < len(downloads) else ""
+                snapshot[normalized["video_id"]] = (row_no, source, download)
+            target_before = snapshot.get(vid)
+            if not target_before:
+                break
+            target_row, old_source, old_download = target_before
             expected_source = old_source if old_source.strip() else "own"
-            writes = [{"range": ranges[2], "values": [[model]]}]
+            quoted = _quoted_tab(tab)
+            writes = [{"range": f"{quoted}!{col_letter(model_col)}{target_row}", "values": [[model]]}]
             if not old_source.strip():
-                writes.append({"range": ranges[1], "values": [["own"]]})
+                writes.append({"range": f"{quoted}!{col_letter(source_col)}{target_row}", "values": [["own"]]})
             service.spreadsheets().values().batchUpdate(
                 spreadsheetId=spreadsheet_id,
                 body={"valueInputOption": "RAW", "data": writes},
             ).execute()
-            readback_rsp = service.spreadsheets().values().batchGet(
-                spreadsheetId=spreadsheet_id, ranges=ranges).execute()
-            readback = [str((v.get("values") or [[""]])[0][0]) for v in readback_rsp.get("valueRanges", [])]
-            if len(readback) == 3 and normalize_youtube_url(readback[0]).get("video_id") == vid \
-                    and readback[1] == expected_source and readback[2] == model:
-                continue
-            synced = False
-            if readback and (readback[0] != snapshot_url or
-                             normalize_youtube_url(readback[0]).get("video_id") != vid):
-                # Sheets has no compare-and-set. Restore only from the snapshot for
-                # this exact row content, never from a different video's target values.
-                if readback[0] == snapshot_url:
-                    rollback = [{"range": ranges[1], "values": [[old_source]]},
-                                {"range": ranges[2], "values": [[old_model]]}]
-                    service.spreadsheets().values().batchUpdate(
-                        spreadsheetId=spreadsheet_id,
-                        body={"valueInputOption": "RAW", "data": rollback},
-                    ).execute()
-                else:
-                    logging.getLogger(__name__).error("Sheet row moved during manual write: target video_id=%s row=%s snapshot_url=%s current_url=%s",
-                                 vid, row_no, snapshot_url, readback[0])
-                    ledger.loc[ledger.video_id.astype(str) == vid, "needs_manual_check"] = "true"
+
+            post_columns = read_columns((url_col, source_col, model_col))
+            post_urls, post_sources, post_downloads = post_columns
+            post = {}
+            for offset, url_cell in enumerate(post_urls):
+                url = str((url_cell or [""])[0] or "")
+                normalized = normalize_youtube_url(url)
+                if normalized["kind"] != "video":
+                    continue
+                row_no = offset + 2
+                source = str((post_sources[offset] or [""])[0] or "") if offset < len(post_sources) else ""
+                download = str((post_downloads[offset] or [""])[0] or "") if offset < len(post_downloads) else ""
+                post[normalized["video_id"]] = (row_no, source, download)
+
+            # A stale row write may have changed a different video's cells. Restore
+            # by current identity and the one pre-write whole-column snapshot.
+            repairs = []
+            for other_vid, (current_row, current_source, current_download) in post.items():
+                if other_vid == vid or other_vid not in snapshot:
+                    continue
+                _, original_source, original_download = snapshot[other_vid]
+                if (current_source, current_download) != (original_source, original_download):
+                    repairs.extend([
+                        {"range": f"{quoted}!{col_letter(source_col)}{current_row}", "values": [[original_source]]},
+                        {"range": f"{quoted}!{col_letter(model_col)}{current_row}", "values": [[original_download]]},
+                    ])
+            if repairs:
+                service.spreadsheets().values().batchUpdate(
+                    spreadsheetId=spreadsheet_id,
+                    body={"valueInputOption": "RAW", "data": repairs},
+                ).execute()
+
+            target_after = post.get(vid)
+            others_unchanged = all(
+                other_vid == vid or (other_vid in post and post[other_vid][1:] == original[1:])
+                for other_vid, original in snapshot.items()
+            )
+            if target_after and target_after[1:] == (expected_source, model) and not repairs and others_unchanged:
+                synced = True
+                break
+        if not synced:
+            ledger.loc[ledger.video_id.astype(str) == vid, "needs_manual_check"] = "true"
         ledger.loc[ledger.video_id.astype(str) == vid, "sheet_synced"] = "true" if synced else "false"
     return ledger
 
@@ -376,8 +403,13 @@ def reconcile_staging_flush(ledger, results, expected_contents=None):
             # Flush results do not carry a video ID. The exact retained note must
             # identify the ledger video before it can complete that manual row.
             expected = (expected_contents or {}).get(staged_name)
-            if (expected is not None and content != expected) or str(item.video_id) not in content:
+            staged = Path(str(item.md_path or ""))
+            expected_hash = str(item.get("md_sha256", "") or "")
+            actual_hash = hashlib.sha256(content.encode("utf-8")).hexdigest()
+            if (expected is None or content != expected or not staged.is_file() or
+                    not expected_hash or actual_hash != expected_hash or str(item.video_id) not in content):
                 continue
+            staged.unlink(missing_ok=True)
             ledger = upsert_ledger(ledger, video_id=str(item.video_id), status="success",
                                    reason="", md_path=dest, drive_verified="verified")
             break
@@ -394,36 +426,44 @@ def retry_pending_drive(ledger, *, base_path: str, work_path: str | None, md_roo
                      ledger.reason.astype(str).str.startswith("pending_drive:")]
     for _, item in pending.iterrows():
         staged = Path(str(item.md_path or ""))
-        if not staged.is_file():
-            # A previous batch flush may have removed staging after a verified
-            # publish but before ledger reconciliation. Recover only from a
-            # matching destination note that identifies this video.
-            destination_root = os.getenv("P03_DRIVE_SYNC_ROOT", "").strip()
-            dest = Path(destination_root) / "source" / staged.name if destination_root and staged.name else Path()
-            try:
-                content = dest.read_text(encoding="utf-8-sig") if dest.is_file() else ""
-            except (OSError, UnicodeError):
-                content = ""
-            expected_hash = str(item.get("md_sha256", "") or "")
-            observed_hash = hashlib.sha256(content.encode("utf-8")).hexdigest() if content else ""
-            if content and expected_hash and observed_hash == expected_hash and str(item.video_id) in content:
-                ledger = upsert_ledger(ledger, video_id=str(item.video_id), status="success",
-                                       reason="", md_path=str(dest), drive_verified="verified")
+        expected_hash = str(item.get("md_sha256", "") or "")
+        try:
+            staged.relative_to(staging_base)
+            in_staging = True
+        except ValueError:
+            in_staging = False
+        try:
+            content = staged.read_text(encoding="utf-8-sig") if in_staging and staged.is_file() else ""
+            observed_hash = hashlib.sha256(content.encode("utf-8")).hexdigest() if in_staging and staged.is_file() else ""
+        except (OSError, UnicodeError):
+            content, observed_hash = "", ""
+        if not in_staging or not staged.is_file() or not expected_hash or observed_hash != expected_hash:
+            mask = ledger.video_id.astype(str) == str(item.video_id)
+            ledger.loc[mask, "reason"] = "staged Markdown missing or hash mismatch; reprocessing required"
+            ledger.loc[mask, ["md_path", "md_sha256"]] = ""
+            ledger.loc[mask, "drive_verified"] = "false"
             continue
         try:
-            content = staged.read_text(encoding="utf-8-sig")
             try:
                 rel = staged.relative_to(staging_base).as_posix()
             except ValueError:
-                # Older pending rows can point at the Drive/mirror destination
-                # after a failed readback. Republish that retained file by basename.
                 rel = staged.name
             result = publish(rel_path=rel, content=content, staging_path=str(staged),
                              md_root=md_root, mirror=False, base_path=base_path,
-                             work_path=work_path, video_id=str(item.video_id))
+                             work_path=work_path, video_id=str(item.video_id), retain_staging=True)
             if result.drive_ok and verified_file_readback(result.drive_path, content):
                 ledger = upsert_ledger(ledger, video_id=str(item.video_id), status="success",
                                        reason="", md_path=result.drive_path, drive_verified="verified")
+                staged.unlink(missing_ok=True)
+            elif result.drive_action == "unchanged":
+                result = publish(rel_path=rel, content=content, staging_path=str(staged),
+                                 md_root=md_root, mirror=False, base_path=base_path,
+                                 work_path=work_path, video_id=str(item.video_id),
+                                 retain_staging=True, force_rewrite=True)
+                if result.drive_ok and verified_file_readback(result.drive_path, content):
+                    ledger = upsert_ledger(ledger, video_id=str(item.video_id), status="success",
+                                           reason="", md_path=result.drive_path, drive_verified="verified")
+                    staged.unlink(missing_ok=True)
         except Exception:
             # Retain the pending ledger/staging artifact for the next run.
             continue

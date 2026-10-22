@@ -256,6 +256,7 @@ class FakeSheets:
         self.headers = headers
         self.rows = [list(row) for row in rows]
         self.writes = []
+        self.write_calls = []
         self.mismatch = mismatch
     def spreadsheets(self): return self
     def values(self): return self
@@ -283,6 +284,7 @@ class FakeSheets:
         return {"values": [[value]]}
     def batchUpdate(self, spreadsheetId, body):
         self.writes = body["data"]
+        self.write_calls.append(body["data"])
         def apply():
             import re
             for update in self.writes:
@@ -298,12 +300,20 @@ class FakeSheets:
             import re
             out = []
             for range_ in ranges:
-                m = re.fullmatch(r"'YT Link'!([A-Z]+)(\d+)", range_)
+                m = re.fullmatch(r"'YT Link'!([A-Z]+)(\d+)(?::([A-Z]+))?", range_)
                 col, row = 0, int(m.group(2)) - 2
                 for char in m.group(1): col = col * 26 + ord(char) - 64
-                val = self.rows[row][col - 1] if row < len(self.rows) and col <= len(self.rows[row]) else ""
-                if self.mismatch and col == 3: val = "wrong"
-                out.append({"range": range_, "values": [[val]]})
+                if m.group(3):
+                    vals = []
+                    for row_i in range(max(0, row), len(self.rows)):
+                        val = self.rows[row_i][col - 1] if col <= len(self.rows[row_i]) else ""
+                        if self.mismatch and col == 3: val = "wrong"
+                        vals.append([val])
+                    out.append({"range": range_, "values": vals})
+                else:
+                    val = self.rows[row][col - 1] if row < len(self.rows) and col <= len(self.rows[row]) else ""
+                    if self.mismatch and col == 3: val = "wrong"
+                    out.append({"range": range_, "values": [[val]]})
             return {"valueRanges": out}
         return FakeRequest(read)
 
@@ -327,10 +337,10 @@ class MovingFakeSheets(FakeSheets):
     def batchGet(self, spreadsheetId, ranges):
         return super().batchGet(spreadsheetId, ranges)
     def batchUpdate(self, spreadsheetId, body):
-        # Move the target after the pre-write row snapshot but before write.
+        # Insert a row after snapshot but before the stale row write.
         if not getattr(self, "moved", False):
             self.moved = True
-            self.rows.insert(0, ["https://youtu.be/other000001", "Pocket", "victim-model"])
+            self.rows.insert(0, ["https://youtu.be/insert00001", "new", "new-model"])
         return super().batchUpdate(spreadsheetId, body)
 
 
@@ -381,13 +391,20 @@ def test_writeback_sets_own_only_for_blank_source_and_uses_raw_two_cells():
 
 def test_writeback_revalidates_moved_row_and_retries_without_corrupting_other_video():
     service = MovingFakeSheets(["URL", "Source", "Download 여부"], [
-        ["https://youtu.be/abcdefghijk", "", ""]])
+        ["https://youtu.be/victim00001", "Pocket", "old-model"],
+        ["https://youtu.be/abcdefghijk", "", ""],
+        ["https://youtu.be/other000001", "Keep", "keep-model"],
+    ])
     ledger = mvi.writeback_success_rows(success_ledger(), service)
-    assert ledger.iloc[0].sheet_synced == "false"
-    assert ledger.iloc[0].get("needs_manual_check", "") in {"true", True}
-    assert service.rows[0] == ["https://youtu.be/other000001", "own", "gpt-6-luna"]
-    target = next(row for row in service.rows if row[0].endswith("abcdefghijk"))
-    assert target[1:] == ["", ""]
+    assert ledger.iloc[0].sheet_synced == "true"
+    by_id = {mvi.normalize_youtube_url(row[0])["video_id"]: row for row in service.rows}
+    assert by_id["victim00001"][1:] == ["Pocket", "old-model"]
+    assert by_id["other000001"][1:] == ["Keep", "keep-model"]
+    assert by_id["abcdefghijk"][1:] == ["own", "gpt-6-luna"]
+    assert len(service.write_calls) == 3
+    assert service.write_calls[0][0]["range"] == "'YT Link'!C3"
+    assert {entry["range"] for entry in service.write_calls[1]} == {"'YT Link'!B3", "'YT Link'!C3"}
+    assert "'YT Link'!C4" in {entry["range"] for entry in service.write_calls[2]}
 
 
 def test_readback_mismatch_keeps_pending_and_retries_next_run():
@@ -415,7 +432,8 @@ def test_staging_fallback_retries_publish_without_llm(tmp_path):
     staged.write_text("already generated", encoding="utf-8")
     ledger = mvi.upsert_ledger(mvi.read_ledger("/missing/manual.csv"), video_id="abcdefghijk",
                                status="retryable_failed", reason="pending_drive: waiting",
-                               md_path=str(staged), model="gpt-6-luna")
+                               md_path=str(staged), model="gpt-6-luna",
+                               md_sha256=__import__("hashlib").sha256(b"already generated").hexdigest())
     calls = []
     destination = tmp_path / "verified" / "summary.md"
     destination.parent.mkdir()
@@ -426,15 +444,18 @@ def test_staging_fallback_retries_publish_without_llm(tmp_path):
     def publish(**kwargs):
         calls.append(kwargs)
         assert kwargs["content"] == "already generated"
+        assert kwargs["retain_staging"] is True
         return Pub()
     retried = mvi.retry_pending_drive(ledger, base_path=str(tmp_path), work_path=str(tmp_path / "work"),
                                       md_root=str(tmp_path / "md"), publisher=publish)
     assert len(calls) == 1 and retried.iloc[0].status == "success"
     assert retried.iloc[0].model == "gpt-6-luna" and retried.iloc[0].drive_verified == "verified"
+    assert not staged.exists()
 
     class FailedPub:
         drive_ok = False
         drive_path = ""
+    staged.write_text("already generated", encoding="utf-8")
     still_pending = mvi.upsert_ledger(ledger, video_id="abcdefghijk", status="retryable_failed",
                                       reason="pending_drive: waiting", md_path=str(staged), attempted=True)
     still_pending = mvi.retry_pending_drive(still_pending, base_path=str(tmp_path),
@@ -452,29 +473,40 @@ def test_drive_ok_without_verified_content_readback_does_not_complete_manual_led
     destination.parent.mkdir()
     destination.write_text("corrupted content", encoding="utf-8")
     ledger = mvi.upsert_ledger(mvi.read_ledger("/missing/manual.csv"), video_id="abcdefghijk",
-                               status="retryable_failed", reason="pending_drive: waiting", md_path=str(staged))
+                               status="retryable_failed", reason="pending_drive: waiting", md_path=str(staged),
+                               md_sha256=__import__("hashlib").sha256(b"right content").hexdigest())
     class Pub:
         drive_ok = True
+        drive_action = "unchanged"
         drive_path = str(destination)
+    calls = []
+    def publish(**kwargs):
+        calls.append(kwargs)
+        if kwargs.get("force_rewrite"):
+            destination.write_text(kwargs["content"], encoding="utf-8")
+        return Pub()
     updated = mvi.retry_pending_drive(ledger, base_path=str(tmp_path), work_path=str(tmp_path / "work"),
-                                      md_root=str(tmp_path / "md"), publisher=lambda **_: Pub())
-    assert updated.iloc[0].status == "retryable_failed"
-    assert updated.iloc[0].drive_verified != "verified"
+                                      md_root=str(tmp_path / "md"), publisher=publish)
+    assert updated.iloc[0].status == "success" and updated.iloc[0].drive_verified == "verified"
+    assert len(calls) == 2 and calls[0]["retain_staging"] and calls[1]["force_rewrite"]
+    assert not staged.exists()
 
 
-def test_pending_drive_path_outside_staging_root_can_be_retried(tmp_path):
+def test_pending_drive_path_outside_staging_root_is_reprocessed_not_published(tmp_path):
     staged = tmp_path / "drive" / "source" / "summary.md"
     staged.parent.mkdir(parents=True)
     staged.write_text("expected content", encoding="utf-8")
     ledger = mvi.upsert_ledger(mvi.read_ledger("/missing/manual.csv"), video_id="abcdefghijk",
-        status="retryable_failed", reason="pending_drive: readback mismatch", md_path=str(staged))
+        status="retryable_failed", reason="pending_drive: readback mismatch", md_path=str(staged),
+        md_sha256=__import__("hashlib").sha256(b"expected content").hexdigest())
     calls = []
     class Pub:
         drive_ok = True
         drive_path = str(staged)
     retried = mvi.retry_pending_drive(ledger, base_path=str(tmp_path), work_path=str(tmp_path / "work"),
         md_root=str(tmp_path / "md"), publisher=lambda **kw: calls.append(kw) or Pub())
-    assert calls and retried.iloc[0].status == "success"
+    assert not calls and retried.iloc[0].status == "retryable_failed"
+    assert "reprocessing required" in retried.iloc[0].reason
 
 
 def test_missing_stage_does_not_change_root_for_following_retained_entry(tmp_path, monkeypatch):
@@ -486,7 +518,8 @@ def test_missing_stage_does_not_change_root_for_following_retained_entry(tmp_pat
     ledger = mvi.upsert_ledger(ledger, video_id="missing0001", status="retryable_failed",
         reason="pending_drive: waiting", md_path=str(root / "2026" / "missing.md"))
     ledger = mvi.upsert_ledger(ledger, video_id="abcdefghijk", status="retryable_failed",
-        reason="pending_drive: waiting", md_path=str(existing))
+        reason="pending_drive: waiting", md_path=str(existing),
+        md_sha256=__import__("hashlib").sha256(existing.read_text(encoding="utf-8").encode()).hexdigest())
     monkeypatch.setenv("P03_DRIVE_SYNC_ROOT", str(tmp_path / "drive"))
     calls = []
     class Pub:
@@ -531,7 +564,8 @@ def test_batch_flush_reconciles_manual_pending_drive(tmp_path):
     content = "summary for https://youtube.com/watch?v=abcdefghijk"
     staged.write_text(content, encoding="utf-8")
     ledger = mvi.upsert_ledger(mvi.read_ledger("/missing/manual.csv"), video_id="abcdefghijk",
-                               status="retryable_failed", reason="pending_drive: waiting", md_path=str(staged))
+                               status="retryable_failed", reason="pending_drive: waiting", md_path=str(staged),
+                               md_sha256=__import__("hashlib").sha256(content.encode()).hexdigest())
     destination = tmp_path / "drive" / staged.name
     destination.parent.mkdir()
     destination.write_text(content, encoding="utf-8")
@@ -540,9 +574,34 @@ def test_batch_flush_reconciles_manual_pending_drive(tmp_path):
         drive_path = str(destination)
     reconciled = mvi.reconcile_staging_flush(ledger, [Published()], {staged.name: content})
     assert reconciled.iloc[0].status == "success" and reconciled.iloc[0].drive_verified == "verified"
+    assert not staged.exists()
 
 
-def test_missing_staging_recovers_only_from_matching_verified_destination_hash(tmp_path, monkeypatch):
+def test_batch_flush_retains_only_manual_pending_staging_until_reconcile(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    from scripts.drive_yt_summary import publish
+    root = tmp_path / "work" / "output_md_staging"
+    manual = root / "2026" / "manual.md"
+    channel = root / "2026" / "channel.md"
+    manual.parent.mkdir(parents=True)
+    manual.write_text("manual", encoding="utf-8")
+    channel.write_text("channel", encoding="utf-8")
+    calls = []
+    def fake_publish(**kwargs):
+        calls.append(kwargs)
+        return SimpleNamespace(drive_ok=True, drive_action="unchanged",
+                               drive_path=str(tmp_path / kwargs["rel_path"]))
+    monkeypatch.setattr(publish, "publish_final_md", fake_publish)
+    publish.flush_staging(md_root=str(tmp_path / "md"), base_path=str(tmp_path),
+        work_path=str(tmp_path / "work"), retain_staging_paths={str(manual)})
+    retain_by_path = {call["staging_path"]: call["retain_staging"] for call in calls}
+    assert retain_by_path[str(manual)] is True
+    assert retain_by_path[str(channel)] is False
+    assert any(call["staging_path"] == str(manual) and call.get("force_rewrite") is True for call in calls)
+    assert not any(call["staging_path"] == str(channel) and call.get("force_rewrite") for call in calls)
+
+
+def test_missing_staging_is_reprocessed_even_if_destination_matches_hash(tmp_path, monkeypatch):
     root = tmp_path / "drive"
     (root / "source").mkdir(parents=True)
     content = "summary for https://youtube.com/watch?v=abcdefghijk"
@@ -555,7 +614,11 @@ def test_missing_staging_recovers_only_from_matching_verified_destination_hash(t
     monkeypatch.setenv("P03_DRIVE_SYNC_ROOT", str(root))
     recovered = mvi.retry_pending_drive(ledger, base_path=str(tmp_path), work_path=str(tmp_path / "work"),
                                         md_root=str(tmp_path / "md"), publisher=lambda **_: pytest.fail("must not republish"))
-    assert recovered.iloc[0].status == "success" and recovered.iloc[0].md_path == str(destination)
+    assert recovered.iloc[0].status == "retryable_failed"
+    assert "reprocessing required" in recovered.iloc[0].reason
+    queued, recovered = mvi.prepare_manual_queue(["https://youtu.be/abcdefghijk"], [],
+        pd.DataFrame(), recovered, 5)
+    assert [entry[0] for entry in queued] == ["abcdefghijk"]
     corrupted = destination.read_text(encoding="utf-8") + "corrupted"
     destination.write_text(corrupted, encoding="utf-8")
     pending = mvi.upsert_ledger(ledger, video_id="abcdefghijk", status="retryable_failed",

@@ -63,7 +63,8 @@ class DriveDesktopAdapter:
         self.source_dir = source_dir
         self.state_path = state_path
 
-    def put(self, rel: str, drive_name: str, content: str, *, video_id: str = "", title: str = "") -> tuple:
+    def put(self, rel: str, drive_name: str, content: str, *, video_id: str = "", title: str = "",
+            force_rewrite: bool = False) -> tuple:
         """Returns (action, dest_path, revision). Raises on failure."""
         digest = content_hash(content)
         verify_sync_root(self.sync_root)
@@ -72,7 +73,7 @@ class DriveDesktopAdapter:
             state = load_state(self.state_path)
             prev = state.files.get(rel)
             dest = Path(prev.dest_path) if prev else self.source_dir / drive_name
-            if prev and prev.content_hash == digest and dest.is_file():
+            if not force_rewrite and prev and prev.content_hash == digest and dest.is_file():
                 return "unchanged", str(dest), prev.revision
             action = "updated" if prev else "created"
             atomic_write_text(dest, content)
@@ -162,6 +163,7 @@ def publish_final_md(
     title: str = "",
     never_mirror: bool = False,
     retain_staging: bool = False,
+    force_rewrite: bool = False,
 ) -> PublishResult:
     """Drive write (canonical) then optional vault mirror; neither failure blocks the other.
 
@@ -187,7 +189,8 @@ def publish_final_md(
         else:
             adapter = DriveDesktopAdapter(config.sync_root, config.source_dir, config.state_path)
             action, dest, revision = adapter.put(
-                rel_path, drive_name, content, video_id=video_id, title=title
+                rel_path, drive_name, content, video_id=video_id, title=title,
+                force_rewrite=force_rewrite,
             )
             result.drive_action, result.drive_path, result.revision = action, dest, revision
             _classify_after_drive_write(result, config.sync_root)
@@ -221,7 +224,8 @@ def publish_final_md(
 
 
 def flush_staging(
-    *, md_root: str, base_path: str, work_path: Optional[str] = None, sync_root: Optional[str] = None
+    *, md_root: str, base_path: str, work_path: Optional[str] = None, sync_root: Optional[str] = None,
+    retain_staging_paths: Optional[set[str]] = None,
 ) -> List[PublishResult]:
     """Retry Drive publish for files left in staging (Drive only; mirror was attempted already)."""
     out: List[PublishResult] = []
@@ -235,11 +239,25 @@ def flush_staging(
             continue
         rel = path.relative_to(root).as_posix()
         never_mirror = _never_mirror_marker(path).is_file() or _is_bromath_note(content)
-        out.append(
-            publish_final_md(
+        is_retained_manual = str(path) in (retain_staging_paths or set())
+        result = publish_final_md(
+            rel_path=rel, content=content, staging_path=str(path), md_root=md_root,
+            mirror=False, base_path=base_path, work_path=work_path, sync_root=sync_root,
+            never_mirror=never_mirror, retain_staging=is_retained_manual,
+        )
+        if (is_retained_manual and result.drive_action == "unchanged"
+                and not _destination_matches(result.drive_path, content)):
+            result = publish_final_md(
                 rel_path=rel, content=content, staging_path=str(path), md_root=md_root,
                 mirror=False, base_path=base_path, work_path=work_path, sync_root=sync_root,
-                never_mirror=never_mirror,
+                never_mirror=never_mirror, retain_staging=True, force_rewrite=True,
             )
-        )
+        out.append(result)
     return out
+
+
+def _destination_matches(path: str, expected: str) -> bool:
+    try:
+        return Path(path).read_text(encoding="utf-8-sig") == expected
+    except (OSError, UnicodeError, TypeError):
+        return False

@@ -1848,6 +1848,18 @@ def process_single_video(
                     never_mirror=(str(ch_raw).strip().casefold() == "bromath"),
                     retain_staging=bool(config.get("from_input")),
                 )
+                if (config.get("from_input") and pub.drive_action == "unchanged"
+                        and not manual_video_input.verified_file_readback(pub.drive_path, content_to_write)):
+                    pub = publish_final_md(
+                        rel_path=rel_md, content=content_to_write, staging_path=staging_file,
+                        md_root=output_md_path, mirror=bool(config.get("obsidian_mirror", False)),
+                        base_path=base_path, work_path=work_path_cfg, video_id=video_id or "",
+                        title=title, never_mirror=(str(ch_raw).strip().casefold() == "bromath"),
+                        retain_staging=True, force_rewrite=True,
+                    )
+                if (config.get("from_input") and pub.drive_ok
+                        and manual_video_input.verified_file_readback(pub.drive_path, content_to_write)):
+                    Path(staging_file).unlink(missing_ok=True)
                 for err in pub.errors:
                     logger.error("Final markdown publish issue (%s): %s", rel_md, err)
                 if pub.mirror_action in ("mirrored", "unchanged"):
@@ -2560,13 +2572,17 @@ def process_videos(config: dict):
             for _, pending_item in pending_staged.iterrows():
                 staged_path = str(pending_item.md_path or "")
                 try:
-                    expected_staged_contents[os.path.basename(staged_path)] = Path(staged_path).read_text(encoding="utf-8-sig")
+                    staged_content = Path(staged_path).read_text(encoding="utf-8-sig")
+                    staged_hash = hashlib.sha256(staged_content.encode("utf-8")).hexdigest()
+                    if staged_hash == str(pending_item.get("md_sha256", "") or ""):
+                        expected_staged_contents[os.path.basename(staged_path)] = staged_content
                 except (OSError, UnicodeError):
                     pass
             retried = flush_staging(
                 md_root=config["OUTPUT_MD_PATH"],
                 base_path=base_path,
                 work_path=(config.get("WORK_PATH") or "").strip(),
+                retain_staging_paths={str(item.md_path) for _, item in pending_staged.iterrows()},
             )
             if retried:
                 before_flush_ledger = manual_video_input.reconcile_staging_flush(
