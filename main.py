@@ -534,11 +534,19 @@ def load_config() -> dict:
             'CHANNEL_END_DATE': '',
             'FILTERING_SHORTS_MINUTES': 3,
             'CRAWL_QUEUE_MAX_RETRIES': 3,
+            'LIVE_REPLAY_WAIT_HOURS': 72,
+            'LIVE_RETRY_MIN_INTERVAL_MIN': 60,
             'YOUTUBE_AUTO_SCRIPT': True,
             'YOUTUBE_SUBS_LANGS': 'en,ko,jp,en-US,en-GB',
         })
     
     # Env overrides for YouTube subs ( .env takes precedence )
+    for _name, _default in (("LIVE_REPLAY_WAIT_HOURS", 72), ("LIVE_RETRY_MIN_INTERVAL_MIN", 60)):
+        _value = os.getenv(_name, "").strip()
+        if _value:
+            config[_name] = float(_value)
+        else:
+            config.setdefault(_name, _default)
     _auto = os.getenv('YOUTUBE_AUTO_SCRIPT', '').strip().lower()
     if _auto:
         config['YOUTUBE_AUTO_SCRIPT'] = _auto in ('true', '1', 'yes')
@@ -1222,7 +1230,7 @@ def process_single_video(
         _find_exact_durable_full_transcript(output_full_path, video_id) if video_id else None
     )
     _terminal_skip_statuses = frozenset({
-        "passed_shorts", "live_scheduled", "video_unavailable",
+        "passed_shorts", "video_unavailable",
         "skipped_auto_subs_only", "oversized_file", "NO_AUTO_CAPTION",
     })
     _retryable_statuses = frozenset({
