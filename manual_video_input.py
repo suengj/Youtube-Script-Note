@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import csv
 import hashlib
+import logging
 import os
 import re
 import tempfile
@@ -12,7 +13,7 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
 VIDEO_ID_RE = re.compile(r"^[A-Za-z0-9_-]{11}$")
-LEDGER_COLUMNS = ["video_id", "canonical_url", "source_urls", "first_seen_at", "status", "reason", "attempts", "last_attempt_at", "done_at", "md_path", "md_sha256", "drive_verified", "model", "sheet_synced"]
+LEDGER_COLUMNS = ["video_id", "canonical_url", "source_urls", "first_seen_at", "status", "reason", "attempts", "last_attempt_at", "done_at", "md_path", "md_sha256", "drive_verified", "model", "sheet_synced", "needs_manual_check"]
 LEDGER_STATUSES = {"new", "processing", "success", "retryable_failed", "unsupported", "skipped_policy"}
 SHEET_ID = "1iRtWdbbJGM8EY1K0jDXkt36IImQM-BmhDoufsFOjRKI"
 SHEET_TAB = "YT Link"
@@ -169,12 +170,6 @@ def prepare_manual_queue(manual_rows, channel_urls, output_df, ledger, max_retri
                                        source_url=source_url, status="skipped_policy",
                                        reason=f"Shorts duration policy: {seconds}s <= {shorts_threshold_seconds}s")
                 continue
-        channel_id = (video_channel_ids or {}).get(vid, "")
-        if channel_id and bool((channel_auto_sub_only or {}).get(str(channel_id).strip(), False)):
-            ledger = upsert_ledger(ledger, video_id=vid, canonical_url=item["canonical_url"],
-                                   source_url=source_url, status="skipped_policy",
-                                   reason=f"registered channel auto_sub_only policy: {channel_id}")
-            continue
         if prior_status == "success":
             ledger = upsert_ledger(ledger, video_id=vid, canonical_url=item["canonical_url"],
                                    source_url=source_url, status="success",
@@ -297,74 +292,59 @@ def writeback_success_rows(ledger, service, *, spreadsheet_id: str = SHEET_ID, t
         model = str(item.get("model", "") or "").strip()
         if not model:
             continue
-        synced = False
-        for _attempt in range(3):
-            headers, values = read_sheet_rows(service, spreadsheet_id, tab)
-            columns = {name: headers.index(name) + 1 for name in SHEET_HEADERS}
-            url_col, source_col, model_col = (columns[k] for k in SHEET_HEADERS)
-            matches = []
-            for row_no, row in enumerate(values[1:], start=2):
-                url = row[url_col - 1] if len(row) >= url_col else ""
-                normalized = normalize_youtube_url(url)
-                if normalized["kind"] == "video" and normalized["video_id"] == vid:
-                    source = row[source_col - 1] if len(row) >= source_col else ""
-                    model_value = row[model_col - 1] if len(row) >= model_col else ""
-                    matches.append((row_no, str(url), str(source), not str(source).strip(), str(model_value)))
-            if not matches:
-                break
-            batch = []
-            for row_no, _url, _source, blank, _old_model in matches:
-                batch.append({"range": f"{_quoted_tab(tab)}!{col_letter(model_col)}{row_no}", "values": [[model]]})
-                if blank:
-                    batch.append({"range": f"{_quoted_tab(tab)}!{col_letter(source_col)}{row_no}", "values": [["own"]]})
-            # Re-read the exact rows immediately before writing. If rows moved since
-            # discovery, discard these coordinates and locate them again.
-            _, before = read_sheet_rows(service, spreadsheet_id, tab)
-            stable = True
-            for row_no, url, source, blank, _old_model in matches:
-                row = before[row_no - 1] if row_no - 1 < len(before) else []
-                actual_url = row[url_col - 1] if len(row) >= url_col else ""
-                actual_source = row[source_col - 1] if len(row) >= source_col else ""
-                norm = normalize_youtube_url(actual_url)
-                if norm["kind"] != "video" or norm["video_id"] != vid or str(actual_url) != url or (not blank and str(actual_source) != source) or (blank and str(actual_source).strip()):
-                    stable = False
-                    break
-            if not stable:
-                time.sleep(0.01)
+        headers, values = read_sheet_rows(service, spreadsheet_id, tab)
+        columns = {name: headers.index(name) + 1 for name in SHEET_HEADERS}
+        url_col, source_col, model_col = (columns[k] for k in SHEET_HEADERS)
+        matches = []
+        for row_no, row in enumerate(values[1:], start=2):
+            url = row[url_col - 1] if len(row) >= url_col else ""
+            normalized = normalize_youtube_url(url)
+            if normalized["kind"] == "video" and normalized["video_id"] == vid:
+                matches.append(row_no)
+        synced = bool(matches)
+        for row_no in matches:
+            quoted = _quoted_tab(tab)
+            ranges = [f"{quoted}!{col_letter(c)}{row_no}" for c in (url_col, source_col, model_col)]
+            snapshot_rsp = service.spreadsheets().values().batchGet(
+                spreadsheetId=spreadsheet_id, ranges=ranges).execute()
+            snapshot = [str((v.get("values") or [[""]])[0][0]) for v in snapshot_rsp.get("valueRanges", [])]
+            if len(snapshot) != 3:
+                synced = False
                 continue
+            snapshot_url, old_source, old_model = snapshot
+            if normalize_youtube_url(snapshot_url).get("video_id") != vid:
+                synced = False
+                continue
+            expected_source = old_source if old_source.strip() else "own"
+            writes = [{"range": ranges[2], "values": [[model]]}]
+            if not old_source.strip():
+                writes.append({"range": ranges[1], "values": [["own"]]})
             service.spreadsheets().values().batchUpdate(
                 spreadsheetId=spreadsheet_id,
-                body={"valueInputOption": "RAW", "data": batch},
+                body={"valueInputOption": "RAW", "data": writes},
             ).execute()
-            _, after = read_sheet_rows(service, spreadsheet_id, tab)
-            synced = True
-            rollback = []
-            for row_no, _url, _source, blank, old_model in matches:
-                row = after[row_no - 1] if row_no - 1 < len(after) else []
-                actual_url = row[url_col - 1] if len(row) >= url_col else ""
-                norm = normalize_youtube_url(actual_url)
-                actual_source = row[source_col - 1] if len(row) >= source_col else ""
-                actual_model = row[model_col - 1] if len(row) >= model_col else ""
-                expected_source = "own" if blank else _source
-                if norm["kind"] != "video" or norm["video_id"] != vid or str(actual_model) != model or str(actual_source) != expected_source:
-                    synced = False
-                    # If row movement redirected our write, restore cells that
-                    # still contain our values on the now different row.
-                    if norm["kind"] != "video" or norm["video_id"] != vid:
-                        model_range = f"{_quoted_tab(tab)}!{col_letter(model_col)}{row_no}"
-                        if str(actual_model) == model:
-                            rollback.append({"range": model_range, "values": [[old_model]]})
-                        if blank and str(actual_source) == "own":
-                            rollback.append({"range": f"{_quoted_tab(tab)}!{col_letter(source_col)}{row_no}", "values": [[""]]})
-                    break
-            if synced:
-                break
-            if rollback:
-                service.spreadsheets().values().batchUpdate(
-                    spreadsheetId=spreadsheet_id,
-                    body={"valueInputOption": "RAW", "data": rollback},
-                ).execute()
-            time.sleep(0.01)
+            readback_rsp = service.spreadsheets().values().batchGet(
+                spreadsheetId=spreadsheet_id, ranges=ranges).execute()
+            readback = [str((v.get("values") or [[""]])[0][0]) for v in readback_rsp.get("valueRanges", [])]
+            if len(readback) == 3 and normalize_youtube_url(readback[0]).get("video_id") == vid \
+                    and readback[1] == expected_source and readback[2] == model:
+                continue
+            synced = False
+            if readback and (readback[0] != snapshot_url or
+                             normalize_youtube_url(readback[0]).get("video_id") != vid):
+                # Sheets has no compare-and-set. Restore only from the snapshot for
+                # this exact row content, never from a different video's target values.
+                if readback[0] == snapshot_url:
+                    rollback = [{"range": ranges[1], "values": [[old_source]]},
+                                {"range": ranges[2], "values": [[old_model]]}]
+                    service.spreadsheets().values().batchUpdate(
+                        spreadsheetId=spreadsheet_id,
+                        body={"valueInputOption": "RAW", "data": rollback},
+                    ).execute()
+                else:
+                    logging.getLogger(__name__).error("Sheet row moved during manual write: target video_id=%s row=%s snapshot_url=%s current_url=%s",
+                                 vid, row_no, snapshot_url, readback[0])
+                    ledger.loc[ledger.video_id.astype(str) == vid, "needs_manual_check"] = "true"
         ledger.loc[ledger.video_id.astype(str) == vid, "sheet_synced"] = "true" if synced else "false"
     return ledger
 
@@ -409,7 +389,7 @@ def retry_pending_drive(ledger, *, base_path: str, work_path: str | None, md_roo
     """Retry retained manual Markdown via Drive publish without running transcription/LLM."""
     from scripts.drive_yt_summary.publish import publish_final_md, staging_root
     publish = publisher or publish_final_md
-    root = staging_root(work_path, base_path)
+    staging_base = Path(staging_root(work_path, base_path))
     pending = ledger[(ledger.status == "retryable_failed") &
                      ledger.reason.astype(str).str.startswith("pending_drive:")]
     for _, item in pending.iterrows():
@@ -418,8 +398,8 @@ def retry_pending_drive(ledger, *, base_path: str, work_path: str | None, md_roo
             # A previous batch flush may have removed staging after a verified
             # publish but before ledger reconciliation. Recover only from a
             # matching destination note that identifies this video.
-            root = os.getenv("P03_DRIVE_SYNC_ROOT", "").strip()
-            dest = Path(root) / "source" / staged.name if root and staged.name else Path()
+            destination_root = os.getenv("P03_DRIVE_SYNC_ROOT", "").strip()
+            dest = Path(destination_root) / "source" / staged.name if destination_root and staged.name else Path()
             try:
                 content = dest.read_text(encoding="utf-8-sig") if dest.is_file() else ""
             except (OSError, UnicodeError):
@@ -432,7 +412,12 @@ def retry_pending_drive(ledger, *, base_path: str, work_path: str | None, md_roo
             continue
         try:
             content = staged.read_text(encoding="utf-8-sig")
-            rel = staged.relative_to(root).as_posix()
+            try:
+                rel = staged.relative_to(staging_base).as_posix()
+            except ValueError:
+                # Older pending rows can point at the Drive/mirror destination
+                # after a failed readback. Republish that retained file by basename.
+                rel = staged.name
             result = publish(rel_path=rel, content=content, staging_path=str(staged),
                              md_root=md_root, mirror=False, base_path=base_path,
                              work_path=work_path, video_id=str(item.video_id))

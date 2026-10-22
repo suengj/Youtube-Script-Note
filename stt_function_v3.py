@@ -907,15 +907,15 @@ def yt_downloader_ytdlp(URL, DOWNLOAD_PATH, video_id, max_retries=3, config=None
                 channel_name = info.get('uploader') or info.get('channel') or ''
                 title = info.get('title', f'video_{video_id}')
                 auto_tracks = info.get("automatic_captions") or {}
+                uploader_tracks = info.get("subtitles") or {}
                 accepted_langs = [str(lang).lower() for lang in subs_langs]
-                has_auto_captions = any(
-                    lang in auto_tracks or any(key.startswith(lang + "-") for key in auto_tracks)
-                    for lang in accepted_langs
-                )
                 allow_uploader_subs = (os.getenv("P03_ALLOW_UPLOADER_SUBS", "").strip() == "1")
-                # auto_subs_only channel: process only when 자막 OR 자동 자막 exists; skip if neither
+                has_auto_captions, has_uploader_captions = _caption_availability(
+                    auto_tracks, uploader_tracks, accepted_langs, allow_uploader_subs)
+                # Registered auto_sub_only policy means captions only; it must
+                # preserve videos with either accepted uploader or automatic captions.
                 auto_subs_only = bool(config.get("auto_subs_only")) if config else False
-                if auto_subs_only and not has_auto_captions:
+                if auto_subs_only and not (has_auto_captions or has_uploader_captions):
                     logger.info("Skipping (auto_subs_only channel, no subs): %s", URL)
                     return ("__SKIP_AUTO_SUBS_ONLY__", None, video_id, None, None, None, None, None, None, "", _format_upload_date(info))
                 subs_path_result = None
@@ -1070,6 +1070,16 @@ def yt_downloader_ytdlp(URL, DOWNLOAD_PATH, video_id, max_retries=3, config=None
     
     _set_last_ytdlp_failure("yt-dlp: exhausted retries without success")
     return None
+
+
+def _caption_availability(auto_tracks, uploader_tracks, accepted_langs, allow_uploader):
+    """Return accepted automatic/uploader caption availability from yt-dlp metadata."""
+    has_auto = any(lang in auto_tracks or any(key.startswith(lang + "-") for key in auto_tracks)
+                   for lang in accepted_langs)
+    has_uploader = allow_uploader and any(
+        lang in uploader_tracks or any(key.startswith(lang + "-") for key in uploader_tracks)
+        for lang in accepted_langs)
+    return has_auto, has_uploader
 
 def _is_errno11_deadlock(exc: BaseException) -> bool:
     """macOS EDEADLK / Resource deadlock often surfaces as OSError errno 11."""

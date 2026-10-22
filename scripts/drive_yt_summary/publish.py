@@ -161,6 +161,7 @@ def publish_final_md(
     video_id: str = "",
     title: str = "",
     never_mirror: bool = False,
+    retain_staging: bool = False,
 ) -> PublishResult:
     """Drive write (canonical) then optional vault mirror; neither failure blocks the other.
 
@@ -207,7 +208,7 @@ def publish_final_md(
             result.errors.append(f"mirror: {type(exc).__name__}: {exc}")
 
     safe_to_drop = result.drive_ok or (disabled and result.mirror_action in {"mirrored", "unchanged"})
-    if safe_to_drop and staging_path:
+    if safe_to_drop and staging_path and not retain_staging:
         try:
             Path(staging_path).unlink(missing_ok=True)
             _never_mirror_marker(Path(staging_path)).unlink(missing_ok=True)

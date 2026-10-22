@@ -160,14 +160,21 @@ def test_manual_queue_applies_shorts_and_registered_channel_policies():
     rows = ["https://youtu.be/short000001", "https://youtu.be/restrict001"]
     ledger = mvi.read_ledger("/missing/manual.csv")
     queued, ledger = mvi.prepare_manual_queue(
-        rows, [], pd.DataFrame(), ledger, duration_map={"short000001": "PT45S"},
+        rows[:1] + rows[1:], [], pd.DataFrame(), ledger, duration_map={"short000001": "PT45S"},
         shorts_threshold_seconds=180, video_channel_ids={"restrict001": "UCregistered"},
         channel_auto_sub_only={"UCregistered": True})
-    assert queued == []
+    assert [x[0] for x in queued] == ["restrict001"]
     assert ledger.loc[ledger.video_id == "short000001", "status"].iloc[0] == "skipped_policy"
     assert "45s <= 180s" in ledger.loc[ledger.video_id == "short000001", "reason"].iloc[0]
-    assert ledger.loc[ledger.video_id == "restrict001", "status"].iloc[0] == "skipped_policy"
-    assert "auto_sub_only" in ledger.loc[ledger.video_id == "restrict001", "reason"].iloc[0]
+    # Caption availability is decided by the downloader, not by channel metadata.
+    assert ledger.loc[ledger.video_id == "restrict001", "status"].iloc[0] == "processing"
+
+
+def test_auto_sub_only_accepts_existing_uploader_or_automatic_captions(monkeypatch):
+    import stt_function_v3 as stt
+    assert stt._caption_availability({}, {"en": [{"ext": "vtt"}]}, ["en"], True) == (False, True)
+    assert stt._caption_availability({"en-orig": [{"ext": "vtt"}]}, {}, ["en"], False) == (True, False)
+    assert stt._caption_availability({}, {}, ["en"], True) == (False, False)
 
 
 def test_drive_failure_and_missing_markdown_never_become_success(tmp_path):
@@ -190,6 +197,7 @@ def test_process_videos_runs_unregistered_manual_video_through_existing_path(tmp
     base.mkdir()
     md.mkdir()
     seen = []
+    registry_roots = []
 
     class Writer:
         def __init__(self, **kwargs):
@@ -215,6 +223,8 @@ def test_process_videos_runs_unregistered_manual_video_through_existing_path(tmp
                                   status="download_failed", retryable=True, error_message="temporary network failure")
 
     monkeypatch.setattr(main, "initialize_clients", lambda config: (None, None, None))
+    monkeypatch.setattr(main.channel_crawl, "load_channel_df",
+                        lambda root: registry_roots.append(root) or [])
     monkeypatch.setattr(main, "create_transcript_preprocessor", lambda *args: object())
     monkeypatch.setattr(main, "SharedStateWriter", Writer)
     monkeypatch.setattr(main, "ClaimManager", Claims)
@@ -233,6 +243,7 @@ def test_process_videos_runs_unregistered_manual_video_through_existing_path(tmp
         "CRAWL_QUEUE_MAX_RETRIES": 2,
     }
     main.process_videos(config)
+    assert registry_roots == [str(data)]
     assert seen == [("https://www.youtube.com/watch?v=abcdefghijk", True)]
     assert len(pd.read_csv(data / "input_df.csv", encoding="cp949")) == 1
     ledger = mvi.read_ledger(data / "manual_input_status.csv")
@@ -281,6 +292,20 @@ class FakeSheets:
                 while len(self.rows[row]) < col: self.rows[row].append("")
                 self.rows[row][col - 1] = update["values"][0][0]
         return FakeRequest(apply)
+    def batchGet(self, spreadsheetId, ranges):
+        self.batch_get_calls = getattr(self, "batch_get_calls", []) + [list(ranges)]
+        def read():
+            import re
+            out = []
+            for range_ in ranges:
+                m = re.fullmatch(r"'YT Link'!([A-Z]+)(\d+)", range_)
+                col, row = 0, int(m.group(2)) - 2
+                for char in m.group(1): col = col * 26 + ord(char) - 64
+                val = self.rows[row][col - 1] if row < len(self.rows) and col <= len(self.rows[row]) else ""
+                if self.mismatch and col == 3: val = "wrong"
+                out.append({"range": range_, "values": [[val]]})
+            return {"valueRanges": out}
+        return FakeRequest(read)
 
 
 class FakeRequest:
@@ -299,6 +324,14 @@ class MovingFakeSheets(FakeSheets):
             self.moved = True
             self.rows.insert(0, ["https://youtu.be/other000001", "", "victim-model"])
         return super().get(spreadsheetId, range=range, fields=fields)
+    def batchGet(self, spreadsheetId, ranges):
+        return super().batchGet(spreadsheetId, ranges)
+    def batchUpdate(self, spreadsheetId, body):
+        # Move the target after the pre-write row snapshot but before write.
+        if not getattr(self, "moved", False):
+            self.moved = True
+            self.rows.insert(0, ["https://youtu.be/other000001", "Pocket", "victim-model"])
+        return super().batchUpdate(spreadsheetId, body)
 
 
 def success_ledger(video_id="abcdefghijk", model="gpt-6-luna"):
@@ -350,10 +383,11 @@ def test_writeback_revalidates_moved_row_and_retries_without_corrupting_other_vi
     service = MovingFakeSheets(["URL", "Source", "Download 여부"], [
         ["https://youtu.be/abcdefghijk", "", ""]])
     ledger = mvi.writeback_success_rows(success_ledger(), service)
-    assert ledger.iloc[0].sheet_synced == "true"
-    assert service.rows[0] == ["https://youtu.be/other000001", "", "victim-model"]
+    assert ledger.iloc[0].sheet_synced == "false"
+    assert ledger.iloc[0].get("needs_manual_check", "") in {"true", True}
+    assert service.rows[0] == ["https://youtu.be/other000001", "own", "gpt-6-luna"]
     target = next(row for row in service.rows if row[0].endswith("abcdefghijk"))
-    assert target[1:] == ["own", "gpt-6-luna"]
+    assert target[1:] == ["", ""]
 
 
 def test_readback_mismatch_keeps_pending_and_retries_next_run():
@@ -426,6 +460,69 @@ def test_drive_ok_without_verified_content_readback_does_not_complete_manual_led
                                       md_root=str(tmp_path / "md"), publisher=lambda **_: Pub())
     assert updated.iloc[0].status == "retryable_failed"
     assert updated.iloc[0].drive_verified != "verified"
+
+
+def test_pending_drive_path_outside_staging_root_can_be_retried(tmp_path):
+    staged = tmp_path / "drive" / "source" / "summary.md"
+    staged.parent.mkdir(parents=True)
+    staged.write_text("expected content", encoding="utf-8")
+    ledger = mvi.upsert_ledger(mvi.read_ledger("/missing/manual.csv"), video_id="abcdefghijk",
+        status="retryable_failed", reason="pending_drive: readback mismatch", md_path=str(staged))
+    calls = []
+    class Pub:
+        drive_ok = True
+        drive_path = str(staged)
+    retried = mvi.retry_pending_drive(ledger, base_path=str(tmp_path), work_path=str(tmp_path / "work"),
+        md_root=str(tmp_path / "md"), publisher=lambda **kw: calls.append(kw) or Pub())
+    assert calls and retried.iloc[0].status == "success"
+
+
+def test_missing_stage_does_not_change_root_for_following_retained_entry(tmp_path, monkeypatch):
+    root = tmp_path / "work" / "output_md_staging"
+    existing = root / "2026" / "existing.md"
+    existing.parent.mkdir(parents=True)
+    existing.write_text("summary https://youtube.com/watch?v=abcdefghijk", encoding="utf-8")
+    ledger = mvi.read_ledger("/missing/manual.csv")
+    ledger = mvi.upsert_ledger(ledger, video_id="missing0001", status="retryable_failed",
+        reason="pending_drive: waiting", md_path=str(root / "2026" / "missing.md"))
+    ledger = mvi.upsert_ledger(ledger, video_id="abcdefghijk", status="retryable_failed",
+        reason="pending_drive: waiting", md_path=str(existing))
+    monkeypatch.setenv("P03_DRIVE_SYNC_ROOT", str(tmp_path / "drive"))
+    calls = []
+    class Pub:
+        drive_ok = True
+        drive_path = str(tmp_path / "drive" / "existing.md")
+    Path(Pub.drive_path).parent.mkdir(parents=True, exist_ok=True)
+    Path(Pub.drive_path).write_text(existing.read_text(encoding="utf-8"), encoding="utf-8")
+    updated = mvi.retry_pending_drive(ledger, base_path=str(tmp_path), work_path=str(tmp_path / "work"),
+        md_root=str(tmp_path / "md"), publisher=lambda **kw: calls.append(kw) or Pub())
+    assert len(calls) == 1 and updated.loc[updated.video_id == "abcdefghijk", "status"].iloc[0] == "success"
+
+
+def test_publisher_retains_manual_staging_until_readback(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    from scripts.drive_yt_summary import publish
+    staged = tmp_path / "work" / "output_md_staging" / "2026" / "note.md"
+    staged.parent.mkdir(parents=True)
+    staged.write_text("expected", encoding="utf-8")
+    destination = tmp_path / "drive" / "note.md"
+    destination.parent.mkdir()
+    destination.write_text("corrupted", encoding="utf-8")
+    monkeypatch.setattr(publish, "load_config", lambda *a, **k: SimpleNamespace(
+        enabled=True, sync_root=tmp_path / "drive", source_dir=tmp_path / "drive" / "source",
+        state_path=tmp_path / "state.json"))
+    monkeypatch.setattr(publish, "selective_mirror_enabled", lambda: True)
+    monkeypatch.setattr(publish, "_classify_after_drive_write", lambda *a: None)
+    class Adapter:
+        def __init__(self, *_): pass
+        def put(self, *a, **k): return "unchanged", str(destination), 1
+    monkeypatch.setattr(publish, "DriveDesktopAdapter", Adapter)
+    result = publish.publish_final_md(rel_path="2026/note.md", content="expected",
+        staging_path=str(staged), md_root=str(tmp_path / "md"), mirror=False,
+        base_path=str(tmp_path), work_path=str(tmp_path / "work"), video_id="abcdefghijk",
+        retain_staging=True)
+    assert result.drive_ok and staged.read_text(encoding="utf-8") == "expected"
+    assert not mvi.verified_file_readback(result.drive_path, "expected")
 
 
 def test_batch_flush_reconciles_manual_pending_drive(tmp_path):
