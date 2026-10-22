@@ -1390,7 +1390,8 @@ def summarize_with_chunking(transcription, filename, prompt, client,
                             token_range=(1.3, 1.5), language="Korean", style="Markdown",
                             token_limit=None, model="gpt-5-mini-2025-08-07",
                             fallback_client=None, fallback_model=None,
-                            primary_provider=None, fallback_provider=None):
+                            primary_provider=None, fallback_provider=None,
+                            model_used_callback=None):
     """
     Summarize transcription with 2-step chunking when input exceeds token limit (Option B).
     If transcription is under limit: prompt_structure + response_text_5mini.
@@ -1402,6 +1403,7 @@ def summarize_with_chunking(transcription, filename, prompt, client,
         "fallback_model": fallback_model,
         "primary_provider": primary_provider,
         "fallback_provider": fallback_provider,
+        "model_used_callback": model_used_callback,
     }
     n_tokens = count_tokens(transcription)
     if n_tokens <= limit:
@@ -1530,9 +1532,13 @@ def response_text_5mini(
     fallback_model=None,
     primary_provider=None,
     fallback_provider=None,
+    model_used_callback=None,
 ):
     try:
-        return _response_text_5mini_once(INPUT_QUERY, client, model)
+        result = _response_text_5mini_once(INPUT_QUERY, client, model)
+        if model_used_callback:
+            model_used_callback(model)
+        return result
     except Exception as exc:
         if not fallback_client or not fallback_model or not _is_retryable_llm_error(exc):
             raise
@@ -1545,7 +1551,10 @@ def response_text_5mini(
             fallback_provider or "unknown",
             fallback_model,
         )
-        return _response_text_5mini_once(INPUT_QUERY, fallback_client, fallback_model)
+        result = _response_text_5mini_once(INPUT_QUERY, fallback_client, fallback_model)
+        if model_used_callback:
+            model_used_callback(fallback_model)
+        return result
 
 
 def _response_text_5mini_once(INPUT_QUERY, client, model="gpt-5-mini-2025-08-07"):

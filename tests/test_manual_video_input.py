@@ -1,0 +1,352 @@
+from __future__ import annotations
+
+import sys
+from pathlib import Path
+
+import pandas as pd
+import pytest
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
+
+import manual_video_input as mvi  # noqa: E402
+from scripts.import_manual_urls_from_sheet import import_rows  # noqa: E402
+
+
+@pytest.mark.parametrize("url", [
+    "https://www.youtube.com/watch?v=abcdefghijk&si=abc&list=PL123&index=2&t=5",
+    "https://youtu.be/abcdefghijk?si=abc",
+    "https://youtube.com/shorts/abcdefghijk?feature=share",
+    "https://m.youtube.com/live/abcdefghijk",
+    "https://music.youtube.com/embed/abcdefghijk?start=3",
+])
+def test_video_url_forms_share_canonical_video_id(url):
+    result = mvi.normalize_youtube_url(url)
+    assert result == {"kind": "video", "video_id": "abcdefghijk",
+                      "canonical_url": "https://www.youtube.com/watch?v=abcdefghijk", "reason": ""}
+
+
+@pytest.mark.parametrize(("url", "kind"), [
+    ("https://youtube.com/@somehandle/videos", "channel"),
+    ("https://youtube.com/channel/UC123", "channel"),
+    ("https://youtube.com/c/somechannel", "channel"),
+    ("https://youtube.com/user/someuser", "channel"),
+    ("https://youtube.com/playlist?list=PL123", "playlist"),
+    ("https://example.com/watch?v=abcdefghijk", "unsupported"),
+])
+def test_non_video_input_classification(url, kind):
+    assert mvi.normalize_youtube_url(url)["kind"] == kind
+
+
+def test_ledger_atomic_schema_and_upsert(tmp_path):
+    path = tmp_path / "manual_input_status.csv"
+    ledger = mvi.read_ledger(path)
+    ledger = mvi.upsert_ledger(ledger, video_id="abcdefghijk", canonical_url="https://youtube.com/watch?v=abcdefghijk",
+                               source_url="https://youtu.be/abcdefghijk", status="processing", attempted=True)
+    ledger = mvi.upsert_ledger(ledger, video_id="abcdefghijk", source_url="https://youtube.com/shorts/abcdefghijk",
+                               status="retryable_failed", reason="NO_AUTO_CAPTION")
+    mvi.save_ledger(ledger, path)
+    reloaded = mvi.read_ledger(path)
+    row = reloaded.iloc[0]
+    assert row.status == "retryable_failed" and row.attempts == 1
+    assert "youtube.com/shorts" in row.source_urls and row.reason == "NO_AUTO_CAPTION"
+    assert list(reloaded.columns) == mvi.LEDGER_COLUMNS
+
+
+def test_importer_locates_headers_and_preserves_existing_rows_idempotently(tmp_path, capsys):
+    data = tmp_path / "data"
+    data.mkdir()
+    input_path = data / "input_df.csv"
+    input_path.write_text("date,url,category,title,source\n2024-01-01,https://youtu.be/zzzzzzzzzzz,old,Old title,manual\n", encoding="cp949")
+    rows = [
+        ["Updated/Published Time/", "URL", "Title", "Source", "Download 여부"],
+        ["2025-01-01", "https://www.youtube.com/watch?v=abcdefghijk&si=a", "First", "Pocket", "gpt"],
+        ["2025-01-02", "https://youtu.be/abcdefghijk", "Duplicate", "Zapier", "gpt"],
+        ["2025-01-03", "https://youtube.com/@handle", "Channel", "Pocket", ""],
+        ["2025-01-04", "https://youtube.com/playlist?list=PL123", "List", "Pocket", ""],
+        ["2025-01-05", "https://elsewhere.invalid/", "Bad", "Pocket", ""],
+    ]
+    summary = import_rows(rows, input_path, data)
+    assert summary["new"] == 1 and summary["video"] == 2
+    frame = pd.read_csv(input_path, encoding="cp949", dtype=str).fillna("")
+    assert len(frame) == 2
+    assert frame.iloc[0]["url"].endswith("zzzzzzzzzzz")
+    assert frame.iloc[1]["date"] == "2025-01-01"
+    assert frame.iloc[1]["title"] == "First" and frame.iloc[1]["source"] == "Pocket"
+    assert import_rows(rows, input_path, data)["new"] == 0
+
+
+def test_importer_reports_success_and_queued_ids(tmp_path, capsys):
+    data = tmp_path / "data"
+    data.mkdir()
+    (data / "input_df.csv").write_text("date,url\n,https://youtu.be/queued00001\n", encoding="cp949")
+    pd.DataFrame([{"v_id": "success0001", "url": "u", "status": "success"}]).to_csv(data / "output_df_new.csv", index=False)
+    rows = [["URL", "Source", "Download 여부", "Title"],
+            ["https://youtu.be/success0001", "", "", "Success"],
+            ["https://youtu.be/queued00001", "", "", "Queued"],
+            ["https://youtu.be/newvideo001", "", "", "New"]]
+    result = import_rows(rows, data / "input_df.csv", data, dry_run=True)
+    output = capsys.readouterr().out
+    assert result["new"] == 1
+    assert "already-success: 1" in output and "already-queued: 1" in output
+    assert len(pd.read_csv(data / "input_df.csv", encoding="cp949")) == 1
+
+
+def test_retry_limit_uses_attempt_count(tmp_path):
+    ledger = mvi.read_ledger(tmp_path / "missing.csv")
+    for _ in range(2):
+        ledger = mvi.upsert_ledger(ledger, video_id="abcdefghijk", status="processing", attempted=True)
+    assert int(ledger.iloc[0].attempts) == 2
+
+
+def test_manual_queue_dedupes_by_id_prefers_channel_and_skips_success():
+    rows = [
+        "https://youtu.be/abcdefghijk?si=x",
+        "https://youtube.com/watch?v=abcdefghijk&list=PL1",
+        "https://youtube.com/shorts/chan0000001",
+        "https://youtube.com/watch?v=success0001",
+        "https://youtube.com/playlist?list=PL123",
+    ]
+    output = pd.DataFrame([{"v_id": "success0001", "status": "success"}])
+    ledger = mvi.read_ledger("/missing/manual.csv")
+    queued, ledger = mvi.prepare_manual_queue(rows, ["https://youtube.com/live/chan0000001"], output, ledger, 2)
+    assert [item[0] for item in queued] == ["abcdefghijk"]
+    assert ledger.loc[ledger.video_id == "chan0000001", "status"].iloc[0] == "skipped_policy"
+    assert ledger.loc[ledger.video_id == "success0001", "status"].iloc[0] == "skipped_policy"
+    assert ledger.loc[ledger.status == "unsupported", "reason"].str.contains("playlist").any()
+
+
+def test_manual_queue_keeps_failures_retryable_and_caps_attempts():
+    ledger = mvi.read_ledger("/missing/manual.csv")
+    for _ in range(2):
+        ledger = mvi.upsert_ledger(ledger, video_id="abcdefghijk", status="retryable_failed",
+                                   reason="temporary", attempted=True)
+    queued, ledger = mvi.prepare_manual_queue(["https://youtu.be/abcdefghijk"], [], pd.DataFrame(), ledger, 2)
+    assert queued == []
+    assert "retry limit reached" in ledger.iloc[0].reason
+    ledger = mvi.read_ledger("/missing/manual.csv")
+    queued, ledger = mvi.prepare_manual_queue(["https://youtu.be/abcdefghijk"], [], pd.DataFrame(), ledger, 2)
+    assert queued[0][0] == "abcdefghijk"
+
+
+@pytest.mark.parametrize(("status", "expected"), [
+    ("NO_AUTO_CAPTION", "retryable_failed"),
+    ("download_failed", "retryable_failed"),
+    ("file_error", "retryable_failed"),
+    ("video_unavailable", "unsupported"),
+    ("live_scheduled", "skipped_policy"),
+])
+def test_pipeline_failure_outcomes_retain_retry_or_reason(status, expected):
+    got, reason, _, verified = mvi.ledger_outcome(status, "network/no subtitles")
+    assert got == expected and reason
+    assert verified == "false"
+
+
+def test_drive_failure_and_missing_markdown_never_become_success(tmp_path):
+    md = tmp_path / "note.md"
+    md.write_text("verified local file", encoding="utf-8")
+    assert mvi.ledger_outcome("file_error", "Drive publish failed", str(md), md_exists=True)[0] == "retryable_failed"
+    assert mvi.ledger_outcome("success", "", str(tmp_path / "missing.md"), md_exists=False)[0] == "retryable_failed"
+    assert mvi.ledger_outcome("success", "", str(md), md_exists=True)[0] == "retryable_failed"
+    assert mvi.ledger_outcome("success", "", str(md), md_exists=True, drive_verified=True)[0] == "success"
+
+
+def test_process_videos_runs_unregistered_manual_video_through_existing_path(tmp_path, monkeypatch):
+    import main
+    from pipeline_models import VideoProcessResult
+
+    data = tmp_path / "data"
+    data.mkdir()
+    (data / "input_df.csv").write_text("date,url,category\n2026-10-01,https://youtu.be/abcdefghijk?si=variant,manual\n", encoding="cp949")
+    base, md = tmp_path / "base", tmp_path / "md"
+    base.mkdir()
+    md.mkdir()
+    seen = []
+
+    class Writer:
+        def __init__(self, **kwargs):
+            self.df = kwargs["output_df"]
+        def apply(self, result):
+            self.df.loc[len(self.df)] = {"date": "2026-10-22", "url": result.source_url,
+                                         "v_id": result.video_id, "status": result.status}
+            main._save_output_df_with_retry(self.df, str(data / "output_df_new.csv"), na_rep="")
+        def get_output_df(self):
+            return self.df
+        def get_crawl_queue_df(self):
+            return None
+
+    class Claims:
+        def __init__(self, *_): pass
+        def recover_all_stale(self): return []
+        def try_claim(self, *_args, **_kwargs): return True
+        def release(self, *_): pass
+
+    def fake_process(**kwargs):
+        seen.append((kwargs["v_url"], kwargs["config"].get("from_input")))
+        return VideoProcessResult(video_id="abcdefghijk", source_url=kwargs["v_url"],
+                                  status="download_failed", retryable=True, error_message="temporary network failure")
+
+    monkeypatch.setattr(main, "initialize_clients", lambda config: (None, None, None))
+    monkeypatch.setattr(main, "create_transcript_preprocessor", lambda *args: object())
+    monkeypatch.setattr(main, "SharedStateWriter", Writer)
+    monkeypatch.setattr(main, "ClaimManager", Claims)
+    monkeypatch.setattr(main, "process_single_video", fake_process)
+    monkeypatch.setattr(main, "_run_batch_cleanup", lambda *args, **kwargs: None)
+    monkeypatch.setattr(main.time, "sleep", lambda *_: None)
+    monkeypatch.setenv("P03_DRIVE_BACKEND", "desktop")
+    monkeypatch.setenv("P03_DRIVE_SYNC_ENABLED", "0")
+    config = {
+        "BASE_PATH": str(base), "DATA_ROOT": str(data), "WORK_PATH": str(base),
+        "HF_HOME": str(tmp_path / "hf"), "OUTPUT_MD_PATH": str(md),
+        "CHANNEL_CRAWL": False, "VIDEO_WORKERS": 1,
+        "MIN_WAIT_BETWEEN_VIDEOS": 0, "MAX_WAIT_BETWEEN_VIDEOS": 0,
+        "EXTENDED_WAIT_INTERVAL": 100, "EXTENDED_WAIT_DURATION": 0,
+        "MAX_CONSECUTIVE_FAILURES": 2, "FAILURE_WAIT_MULTIPLIER": 1,
+        "CRAWL_QUEUE_MAX_RETRIES": 2,
+    }
+    main.process_videos(config)
+    assert seen == [("https://www.youtube.com/watch?v=abcdefghijk", True)]
+    assert len(pd.read_csv(data / "input_df.csv", encoding="cp949")) == 1
+    ledger = mvi.read_ledger(data / "manual_input_status.csv")
+    assert ledger.iloc[0].status == "retryable_failed"
+    assert "temporary network failure" in ledger.iloc[0].reason
+
+
+class FakeSheets:
+    def __init__(self, headers, rows, *, mismatch=False):
+        self.headers = headers
+        self.rows = [list(row) for row in rows]
+        self.writes = []
+        self.mismatch = mismatch
+    def spreadsheets(self): return self
+    def values(self): return self
+    def get(self, spreadsheetId, range=None, fields=None):
+        if range is None:
+            return FakeRequest(lambda: {"sheets": [{"properties": {"title": "YT Link"}}]})
+        self.last_range = range
+        return FakeRequest(lambda: self._get(range))
+    def _get(self, range):
+        if range == "'YT Link'!1:1": return {"values": [self.headers]}
+        if range == "'YT Link'!A:Z": return {"values": [self.headers, *self.rows]}
+        col_row = range.split("!")[1]
+        import re
+        match = re.fullmatch(r"([A-Z]+)(\d+)", col_row)
+        col, row = 0, int(match.group(2)) - 2
+        for char in match.group(1): col = col * 26 + ord(char) - 64
+        value = self.rows[row][col - 1] if row < len(self.rows) and col <= len(self.rows[row]) else ""
+        if self.mismatch and col_row.startswith("C"):
+            value = "wrong"
+        return {"values": [[value]]}
+    def batchUpdate(self, spreadsheetId, body):
+        self.writes = body["data"]
+        def apply():
+            import re
+            for update in self.writes:
+                m = re.fullmatch(r"'YT Link'!([A-Z]+)(\d+)", update["range"])
+                col, row = 0, int(m.group(2)) - 2
+                for char in m.group(1): col = col * 26 + ord(char) - 64
+                while len(self.rows[row]) < col: self.rows[row].append("")
+                self.rows[row][col - 1] = update["values"][0][0]
+        return FakeRequest(apply)
+
+
+class FakeRequest:
+    def __init__(self, fn): self.fn = fn
+    def execute(self): return self.fn() or {}
+
+
+def success_ledger(video_id="abcdefghijk", model="gpt-6-luna"):
+    ledger = mvi.read_ledger("/missing/manual.csv")
+    return mvi.upsert_ledger(ledger, video_id=video_id, canonical_url=f"https://youtube.com/watch?v={video_id}",
+                             status="success", drive_verified="verified", model=model)
+
+
+def test_missing_key_skips_sheet_and_keeps_ledger_pending(tmp_path, monkeypatch):
+    ledger = success_ledger()
+    monkeypatch.delenv("P03_GOOGLE_SA_JSON", raising=False)
+    with pytest.raises(FileNotFoundError):
+        mvi.build_sheets_service()
+    assert ledger.iloc[0].status == "success" and ledger.iloc[0].sheet_synced == "false"
+
+
+def test_header_missing_aborts_before_sheet_write():
+    service = FakeSheets(["URL", "Source"], [])
+    ledger = success_ledger()
+    with pytest.raises(ValueError, match="Download 여부"):
+        mvi.writeback_success_rows(ledger, service)
+    assert service.writes == []
+
+
+def test_writeback_finds_moved_row_preserves_source_and_formulas():
+    service = FakeSheets(["URL", "Source", "Download 여부", "F", "L"], [
+        ["https://youtu.be/other000001", "", "", "=F2", "=L2"],
+        ["https://youtu.be/abcdefghijk?si=moved", "Pocket", "", "=F3", "=L3"],
+    ])
+    ledger = success_ledger()
+    ledger = mvi.writeback_success_rows(ledger, service)
+    assert ledger.iloc[0].sheet_synced == "true"
+    assert service.rows[1][1] == "Pocket" and service.rows[1][2] == "gpt-6-luna"
+    assert service.rows[1][3:] == ["=F3", "=L3"]
+    assert [x["range"] for x in service.writes] == ["'YT Link'!C3"]
+    assert all(x["range"].split("!")[1][0] in {"B", "C"} for x in service.writes)
+
+
+def test_writeback_sets_own_only_for_blank_source_and_uses_raw_two_cells():
+    service = FakeSheets(["URL", "Source", "Download 여부", "F", "L"], [
+        ["https://youtu.be/abcdefghijk", "", "", "=F2", "=L2"]])
+    ledger = mvi.writeback_success_rows(success_ledger(model="fallback-x"), service)
+    assert ledger.iloc[0].sheet_synced == "true"
+    assert service.rows[0][1:3] == ["own", "fallback-x"]
+    assert {x["range"] for x in service.writes} == {"'YT Link'!B2", "'YT Link'!C2"}
+
+
+def test_readback_mismatch_keeps_pending_and_retries_next_run():
+    ledger = success_ledger()
+    mismatch = FakeSheets(["URL", "Source", "Download 여부"], [["https://youtu.be/abcdefghijk", "", ""]], mismatch=True)
+    ledger = mvi.writeback_success_rows(ledger, mismatch)
+    assert ledger.iloc[0].sheet_synced == "false"
+    retry = FakeSheets(["URL", "Source", "Download 여부"], [["https://youtu.be/abcdefghijk", "", ""]])
+    ledger = mvi.writeback_success_rows(ledger, retry)
+    assert ledger.iloc[0].sheet_synced == "true"
+
+
+def test_failure_statuses_are_never_written():
+    ledger = mvi.upsert_ledger(mvi.read_ledger("/missing/manual.csv"), video_id="abcdefghijk",
+                               status="retryable_failed", model="gpt-6-luna")
+    service = FakeSheets(["URL", "Source", "Download 여부"], [["https://youtu.be/abcdefghijk", "", ""]])
+    mvi.writeback_success_rows(ledger, service)
+    assert service.writes == []
+
+
+def test_staging_fallback_retries_publish_without_llm(tmp_path):
+    root = tmp_path / "work" / "output_md_staging"
+    staged = root / "2026" / "summary.md"
+    staged.parent.mkdir(parents=True)
+    staged.write_text("already generated", encoding="utf-8")
+    ledger = mvi.upsert_ledger(mvi.read_ledger("/missing/manual.csv"), video_id="abcdefghijk",
+                               status="retryable_failed", reason="pending_drive: waiting",
+                               md_path=str(staged), model="gpt-6-luna")
+    calls = []
+    class Pub:
+        drive_ok = True
+        drive_path = "/verified/summary.md"
+    def publish(**kwargs):
+        calls.append(kwargs)
+        assert kwargs["content"] == "already generated"
+        return Pub()
+    retried = mvi.retry_pending_drive(ledger, base_path=str(tmp_path), work_path=str(tmp_path / "work"),
+                                      md_root=str(tmp_path / "md"), publisher=publish)
+    assert len(calls) == 1 and retried.iloc[0].status == "success"
+    assert retried.iloc[0].model == "gpt-6-luna" and retried.iloc[0].drive_verified == "verified"
+
+    class FailedPub:
+        drive_ok = False
+        drive_path = ""
+    still_pending = mvi.upsert_ledger(ledger, video_id="abcdefghijk", status="retryable_failed",
+                                      reason="pending_drive: waiting", md_path=str(staged), attempted=True)
+    still_pending = mvi.retry_pending_drive(still_pending, base_path=str(tmp_path),
+        work_path=str(tmp_path / "work"), md_root=str(tmp_path / "md"), publisher=lambda **_: FailedPub())
+    queued, still_pending = mvi.prepare_manual_queue(["https://youtu.be/abcdefghijk"], [],
+                                                    pd.DataFrame(), still_pending, 5)
+    assert queued == [] and still_pending.iloc[0].reason.startswith("pending_drive:")
+
