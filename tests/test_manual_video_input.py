@@ -60,8 +60,8 @@ def test_importer_locates_headers_and_preserves_existing_rows_idempotently(tmp_p
     input_path.write_text("date,url,category,title,source\n2024-01-01,https://youtu.be/zzzzzzzzzzz,old,Old title,manual\n", encoding="cp949")
     rows = [
         ["Updated/Published Time/", "URL", "Title", "Source", "Download 여부"],
-        ["2025-01-01", "https://www.youtube.com/watch?v=abcdefghijk&si=a", "First", "Pocket", "gpt"],
-        ["2025-01-02", "https://youtu.be/abcdefghijk", "Duplicate", "Zapier", "gpt"],
+        ["2025-01-01", "https://www.youtube.com/watch?v=abcdefghijk&si=a", "First", "Pocket", ""],
+        ["2025-01-02", "https://youtu.be/abcdefghijk", "Duplicate", "Zapier", ""],
         ["2025-01-03", "https://youtube.com/@handle", "Channel", "Pocket", ""],
         ["2025-01-04", "https://youtube.com/playlist?list=PL123", "List", "Pocket", ""],
         ["2025-01-05", "https://elsewhere.invalid/", "Bad", "Pocket", ""],
@@ -101,8 +101,82 @@ def test_importer_does_not_treat_historical_channel_failure_as_queued(tmp_path):
         data / "output_df_new.csv", index=False)
     rows = [["URL", "Source", "Download 여부"], ["https://youtu.be/failed00001", "", ""]]
     result = import_rows(rows, input_path, data)
-    assert result["new"] == 1
-    assert "failed00001" in pd.read_csv(input_path, encoding="cp949", dtype=str).iloc[0].url
+    assert result["new"] == 0
+    assert result["already_processed"] == 1
+    assert len(pd.read_csv(input_path, encoding="cp949", dtype=str)) == 0
+
+
+def test_importer_skips_rows_without_parseable_cutoff_date(tmp_path):
+    data = tmp_path / "data"
+    data.mkdir()
+    rows = [["Updated/Published Time/", "URL", "Source", "Download 여부"],
+            ["", "https://youtu.be/emptydate01", "", ""],
+            ["not-a-date", "https://youtu.be/baddate0001", "", ""],
+            ["2025-02-01", "https://youtu.be/olderdate01", "", ""],
+            ["2025-03-01", "https://youtu.be/newerdate01", "", ""]]
+    result = import_rows(rows, data / "input_df.csv", data, since="2025-03-01", dry_run=True)
+    assert result["total"] == 1 and result["new"] == 1
+
+
+def test_importer_download_column_marks_row_processed(tmp_path):
+    data = tmp_path / "data"
+    data.mkdir()
+    rows = [["URL", "Source", "Download 여부"],
+            ["https://youtu.be/downld00001", "", "done"],
+            ["https://youtu.be/freshvid001", "", ""]]
+    result = import_rows(rows, data / "input_df.csv", data, dry_run=True)
+    assert result["new"] == 1 and result["already_processed"] == 1
+
+
+def test_importer_download_marker_applies_to_duplicate_video_id(tmp_path):
+    data = tmp_path / "data"
+    data.mkdir()
+    rows = [["URL", "Source", "Download 여부"],
+            ["https://youtu.be/downld00001", "", "done"],
+            ["https://www.youtube.com/watch?v=downld00001&si=other", "", ""]]
+    result = import_rows(rows, data / "input_df.csv", data, dry_run=True)
+    assert result["new"] == 0 and result["already_processed"] == 2
+
+
+def test_importer_matches_any_output_record_using_normalized_url(tmp_path):
+    data = tmp_path / "data"
+    data.mkdir()
+    (data / "input_df.csv").write_text("date,url\n", encoding="cp949")
+    pd.DataFrame([{"url": "https://www.youtube.com/watch?v=outmatch001&si=abc",
+                   "status": "download_failed"}]).to_csv(data / "output_df_new.csv", index=False)
+    rows = [["URL", "Source", "Download 여부"],
+            ["https://youtu.be/outmatch001", "", ""],
+            ["https://youtu.be/freshvid001", "", ""]]
+    result = import_rows(rows, data / "input_df.csv", data, dry_run=True)
+    assert result["new"] == 1 and result["already_processed"] == 1
+
+
+def test_importer_uses_output_url_when_v_id_is_invalid(tmp_path):
+    data = tmp_path / "data"
+    data.mkdir()
+    (data / "input_df.csv").write_text("date,url\n", encoding="cp949")
+    pd.DataFrame([{"v_id": "unknown", "url": "https://youtu.be/outmatch001",
+                   "status": "download_failed"}]).to_csv(data / "output_df_new.csv", index=False)
+    rows = [["URL", "Source", "Download 여부"], ["https://youtu.be/outmatch001", "", ""]]
+
+    result = import_rows(rows, data / "input_df.csv", data, dry_run=True)
+
+    assert result["new"] == 0
+    assert result["already_processed"] == 1
+
+
+def test_importer_caps_newest_eligible_rows_and_reports_deferred(tmp_path, capsys):
+    data = tmp_path / "data"
+    data.mkdir()
+    rows = [["Updated/Published Time/", "URL", "Source", "Download 여부"],
+            ["2025-01-01", "https://youtu.be/oldvid00001", "", ""],
+            ["2025-02-01", "https://youtu.be/midvid00001", "", ""],
+            ["2025-03-01", "https://youtu.be/newvid00001", "", ""]]
+    result = import_rows(rows, data / "input_df.csv", data, max_new=1)
+    frame = pd.read_csv(data / "input_df.csv", encoding="cp949", dtype=str)
+    assert result["new"] == 1 and result["deferred"] == 2
+    assert frame.iloc[0].url.endswith("newvid00001")
+    assert "deferred: 2" in capsys.readouterr().out
 
 
 def test_retry_limit_uses_attempt_count(tmp_path):
@@ -186,14 +260,16 @@ def test_drive_failure_and_missing_markdown_never_become_success(tmp_path):
     assert mvi.ledger_outcome("success", "", str(md), md_exists=True, drive_verified=True)[0] == "success"
 
 
-@pytest.mark.parametrize(("sheet_enabled", "key_present", "importer_raises", "expected_import_calls"), [
-    (False, False, False, 0),
-    (True, False, False, 0),
-    (True, True, True, 1),
-    (True, True, False, 1),
+@pytest.mark.parametrize(("sheet_enabled", "key_present", "importer_raises", "cutoff", "expected_import_calls"), [
+    (False, False, False, None, 0),
+    (True, False, False, "2026-01-01", 0),
+    (True, True, False, None, 0),
+    (True, True, False, "not-a-date", 0),
+    (True, True, True, "2026-01-01", 1),
+    (True, True, False, "2026-01-01", 1),
 ])
 def test_process_videos_runs_unregistered_manual_video_through_existing_path(
-        tmp_path, monkeypatch, sheet_enabled, key_present, importer_raises, expected_import_calls):
+        tmp_path, monkeypatch, sheet_enabled, key_present, importer_raises, cutoff, expected_import_calls):
     import main
     from pipeline_models import VideoProcessResult
 
@@ -230,7 +306,7 @@ def test_process_videos_runs_unregistered_manual_video_through_existing_path(
         return VideoProcessResult(video_id="abcdefghijk", source_url=kwargs["v_url"],
                                   status="download_failed", retryable=True, error_message="temporary network failure")
 
-    def fake_import(data_root):
+    def fake_import(data_root, **kwargs):
         import_roots.append(data_root)
         if importer_raises:
             raise RuntimeError("sheet unavailable")
@@ -249,6 +325,10 @@ def test_process_videos_runs_unregistered_manual_video_through_existing_path(
     monkeypatch.setenv("P03_DRIVE_SYNC_ENABLED", "0")
     if sheet_enabled:
         monkeypatch.setenv("P03_SHEET_IMPORT_ENABLED", "1")
+        if cutoff is None:
+            monkeypatch.delenv("P03_SHEET_IMPORT_SINCE", raising=False)
+        else:
+            monkeypatch.setenv("P03_SHEET_IMPORT_SINCE", cutoff)
     else:
         monkeypatch.delenv("P03_SHEET_IMPORT_ENABLED", raising=False)
     if key_present:
