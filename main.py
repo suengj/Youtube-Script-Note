@@ -55,6 +55,7 @@ if sys.stderr.encoding != 'utf-8':
 import stt_function_v3 as stt
 import channel_crawl
 import manual_video_input
+from scripts import import_manual_urls_from_sheet
 from filename_utils import fit_filename, parse_note_name, validate_llm_suffix
 import run_lock
 from job_workspace import VideoJobWorkspace, cleanup_stale_jobs
@@ -1981,6 +1982,15 @@ def process_videos(config: dict):
     # Load configuration
     base_path = config['BASE_PATH']
     data_root = config['DATA_ROOT']
+    if os.getenv("P03_SHEET_IMPORT_ENABLED", "0").strip() == "1":
+        sa_key = (os.getenv("P03_GOOGLE_SA_JSON") or "").strip()
+        if not sa_key or not os.path.isfile(sa_key):
+            logger.warning("Manual Google Sheet import skipped: P03_GOOGLE_SA_JSON key file is missing")
+        else:
+            try:
+                import_manual_urls_from_sheet.import_from_sheet(data_root)
+            except Exception as exc:
+                logger.warning("Manual Google Sheet import failed; continuing batch: %s: %s", type(exc).__name__, exc)
     work_path = config.get('WORK_PATH') or base_path
     if work_path != base_path:
         logger.info("WORK_PATH set: audio, yt_subs, and prompt/logs use local path (iCloud sync avoided): %s", work_path)

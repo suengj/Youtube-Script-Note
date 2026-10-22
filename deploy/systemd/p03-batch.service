@@ -7,6 +7,8 @@ Wants=network-online.target
 Type=oneshot
 WorkingDirectory=%h/work/youtube-script-note
 EnvironmentFile=%h/.config/p03/p03.env
+# Optional Sheet auto-import settings live in p03.env or p03-locators.env:
+# P03_SHEET_IMPORT_ENABLED=1 and P03_GOOGLE_SA_JSON=/secure/path/service-account.json
 EnvironmentFile=%h/.config/p03/p03-locators.env
 Environment=SYSTEMD_SCHEDULED=1
 ExecStart=/bin/bash %h/work/youtube-script-note/deploy/run-p03-linux.sh

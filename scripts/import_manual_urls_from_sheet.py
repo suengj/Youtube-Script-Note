@@ -131,6 +131,18 @@ def import_rows(rows, input_path: Path, data_root: Path, *, since: str | None = 
     return {"new": len(new), **counts, "total": len(records)}
 
 
+def import_from_sheet(data_root: str | Path, *, spreadsheet_id: str | None = None,
+                      tab: str | None = None, since: str | None = None,
+                      dry_run: bool = False):
+    """Fetch the configured Sheet and append unseen video IDs under data_root."""
+    root = Path(data_root)
+    rows = _read_sheet_rows(
+        spreadsheet_id or os.getenv("P03_GOOGLE_SHEET_ID", SHEET_ID),
+        tab or os.getenv("P03_GOOGLE_SHEET_TAB", SHEET_TAB),
+    )
+    return import_rows(rows, root / "input_df.csv", root, since=since, dry_run=dry_run)
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--data-root", type=Path, default=Path(os.getenv("DATA_ROOT", ROOT / "data")))
@@ -140,11 +152,11 @@ def main(argv=None):
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args(argv)
     try:
-        rows = _read_sheet_rows(args.spreadsheet_id, args.tab)
+        import_from_sheet(args.data_root, spreadsheet_id=args.spreadsheet_id,
+                          tab=args.tab, since=args.since, dry_run=args.dry_run)
     except Exception as exc:
         print(f"Google Sheet import aborted: {type(exc).__name__}: {exc}", file=sys.stderr)
         return 2
-    import_rows(rows, args.data_root / "input_df.csv", args.data_root, since=args.since, dry_run=args.dry_run)
     return 0
 
 

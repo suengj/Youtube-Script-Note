@@ -2,9 +2,9 @@
 
 ## Owner steps
 
-In the **YT Link** tab, paste each individual YouTube video URL in column B under the `URL` header. Optionally set `Source` to `own`; leave `Download 여부` empty. The importer reads the sheet and appends unseen video IDs to `data/input_df.csv`; the next batch run picks them up.
+In the **YT Link** tab, paste each individual YouTube video URL in column B under the `URL` header. Optionally set `Source` to `own`; leave `Download 여부` empty. A batch automatically imports unseen video IDs into `<DATA_ROOT>/input_df.csv` when `P03_SHEET_IMPORT_ENABLED=1`; the default is `0` (off). The normal batch queue then picks them up in that run. The import runs under the existing batch run lock. If the service-account key is missing or sheet import fails, the batch logs a warning and continues with its existing queues.
 
-Configure the service account key path in `P03_GOOGLE_SA_JSON` (deployed path: `/Users/suengj/Developer/api_key/p03_google_sa.json`). The key needs access to the spreadsheet. The integration requests only the `https://www.googleapis.com/auth/spreadsheets` scope. The spreadsheet defaults to `1iRtWdbbJGM8EY1K0jDXkt36IImQM-BmhDoufsFOjRKI` and tab `YT Link`; override with `P03_GOOGLE_SHEET_ID` / `P03_GOOGLE_SHEET_TAB` or importer `--spreadsheet-id` / `--tab`.
+Set `P03_SHEET_IMPORT_ENABLED=1` and configure the service-account key path in `P03_GOOGLE_SA_JSON` (deployed path: `/Users/suengj/Developer/api_key/p03_google_sa.json`). The key needs access to the spreadsheet. The integration requests only the `https://www.googleapis.com/auth/spreadsheets` scope. The spreadsheet defaults to `1iRtWdbbJGM8EY1K0jDXkt36IImQM-BmhDoufsFOjRKI` and tab `YT Link`; override with `P03_GOOGLE_SHEET_ID` / `P03_GOOGLE_SHEET_TAB` or importer `--spreadsheet-id` / `--tab`.
 
 Run from the repository root:
 
@@ -12,6 +12,8 @@ Run from the repository root:
 python scripts/import_manual_urls_from_sheet.py --dry-run
 python scripts/import_manual_urls_from_sheet.py
 ```
+
+For Linux systemd deployment, set `P03_SHEET_IMPORT_ENABLED=1` and `P03_GOOGLE_SA_JSON=/path/to/service-account.json` in the existing `%h/.config/p03/p03.env` or `p03-locators.env` `EnvironmentFile`; keep the key outside the repository and readable by the service user. Add the same variables to the environment used by other deployment methods. There is no new scheduler.
 
 There is no CSV-export import mode. Before reading or writing values, the script checks that the tab exists and row 1 contains `URL`, `Source`, and `Download 여부`. An error aborts sheet I/O with a log message; local ledger state remains usable. The importer normalizes URL forms and deduplicates by video ID. It preserves existing `input_df.csv` rows and appends only new video IDs, retaining date/title/source where those columns exist.
 
