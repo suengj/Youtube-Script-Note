@@ -19,6 +19,27 @@ python scripts/import_manual_urls_from_sheet.py --all --dry-run
 
 For Linux systemd deployment, set `P03_SHEET_IMPORT_ENABLED=1` and `P03_GOOGLE_SA_JSON=/path/to/service-account.json` in the existing `%h/.config/p03/p03.env` or `p03-locators.env` `EnvironmentFile`; keep the key outside the repository and readable by the service user. Add the same variables to the environment used by other deployment methods. There is no new scheduler.
 
+## Emergency stop / resume (cloud-dev)
+
+Stop the running batch and prevent scheduled reruns:
+
+```bash
+systemctl --user stop p03-batch.service
+systemctl --user disable --now p03-batch.timer
+systemctl --user is-active p03-batch.service p03-batch.timer
+systemctl --user list-timers --all | grep -E 'p03-batch|mgr-p03-(on|off)'
+```
+
+Both units should be inactive and the timer should not be listed as waiting. No `mgr-p03-on/off` timer units are currently present in `deploy/`; if added, stop/disable those timers too. Moving or renaming `data/input_df.csv` does **not** stop the batch: the enabled Sheet importer recreates/appends it on a later run (incident 2026-10-23, SUE-1765).
+
+Resume only after owner approval, by re-enabling the timer:
+
+```bash
+systemctl --user enable --now p03-batch.timer
+```
+
+To disable only the manual-input path while leaving the batch scheduled, set `P03_SHEET_IMPORT_ENABLED=0` and `P03_MANUAL_MAX=0` in its environment file. Code supports `P03_MANUAL_MAX=0` to admit no manual rows; this does not stop channel processing.
+
 The CLI requires `--since YYYY-MM-DD` unless `--all` is explicitly supplied. With a cutoff, rows with an empty or unparseable `Updated/Published Time/` cell are skipped. There is no CSV-export import mode. Before reading or writing values, the script checks that the tab exists and row 1 contains `URL`, `Source`, and `Download 여부`. If a Sheet read fails, it falls back to registry-only processed checks and imports nothing new. The importer normalizes URL forms and deduplicates by video ID. Any matching video ID with a non-empty `Source` or `Download 여부` cell on any Sheet row is processed, and missing registry entries are repaired with source `sheet_marked`. It preserves existing `input_df.csv` rows and appends only new video IDs, retaining date/title/source where those columns exist.
 
 ## Processing, retries, and sheet status
