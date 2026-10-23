@@ -2018,6 +2018,7 @@ def process_videos(config: dict):
     base_path = config['BASE_PATH']
     data_root = config['DATA_ROOT']
     run_id = datetime.now().strftime("%Y%m%d%H%M%S") + "-" + uuid.uuid4().hex[:8]
+    inventory_coverage_ledger = channel_crawl.BatchCoverageLedger()
     run_started_at = utc_now_iso()
     api_backend = os.getenv(
         "P03_DRIVE_BACKEND", "api" if sys.platform.startswith("linux") else "desktop"
@@ -2037,6 +2038,7 @@ def process_videos(config: dict):
     def _mark_discovery_state_failure(reason):
         _mark_inventory_incomplete(reason)
         inventory_discovery["complete"] = False
+        inventory_discovery["discovery_complete"] = False
 
     # Missing files are not empty-state evidence. Continue where possible so
     # the run can recover, but preserve the missing source as an incomplete
@@ -2095,9 +2097,20 @@ def process_videos(config: dict):
             _mark_inventory_incomplete("inventory_start_write_failed")
 
     def _finish_manifest_inventory(*, completed, counts, discovery_report):
+        coverage_ledger = (discovery_report or {}).get("coverage_ledger")
+        if isinstance(coverage_ledger, channel_crawl.BatchCoverageLedger):
+            coverage_ledger.classify_pending_as_unresolved()
+            channel_crawl._sync_coverage_report(discovery_report)
+            discovery_complete = bool(discovery_report.get(
+                "discovery_complete", discovery_report.get("complete"),
+            ))
+            discovery_report["complete"] = bool(
+                discovery_complete and coverage_ledger.is_complete()
+            )
+        else:
+            discovery_complete = bool(discovery_report and discovery_report.get("complete"))
         if not api_backend or inventory_sink is None or not callable(getattr(inventory_sink, "write_inventory", None)):
             return
-        discovery_complete = bool(discovery_report and discovery_report.get("complete"))
         cutoff = (discovery_report.get("cutoff") if discovery_report else None)
         scope_ids = set(inventory_scope_video_ids)
         outcomes = dict((discovery_report or {}).get("queue_scope_outcomes") or {})
@@ -2111,7 +2124,7 @@ def process_videos(config: dict):
             outcomes,
             extra_unresolved=(
                 int(counts.get("unresolved", 0)) +
-                int((discovery_report or {}).get("unresolved", 0)) +
+                int((discovery_report or {}).get("channel_unresolved", 0)) +
                 int((discovery_report or {}).get("queue_scope_unresolved", 0))
             ),
         )
@@ -2134,7 +2147,11 @@ def process_videos(config: dict):
             unresolved=final_counts["unresolved"],
             scope_count=reconciled["scope_count"],
             manifest_succeeded=reconciled["manifest_succeeded"],
-            coverage_state_valid=not inventory_incomplete_reasons,
+            coverage_state_valid=(
+                not inventory_incomplete_reasons and
+                (not isinstance(coverage_ledger, channel_crawl.BatchCoverageLedger)
+                 or coverage_ledger.is_complete())
+            ),
             count_partition_verified=reconciled.get("count_partition_verified", False),
             discovery_complete=discovery_complete,
             all_successes_present=False,
@@ -2165,12 +2182,15 @@ def process_videos(config: dict):
         "enabled": bool(config.get("CHANNEL_CRAWL")),
         # No channel discovery is required for a manual-only selected scope.
         "complete": not bool(config.get("CHANNEL_CRAWL")),
+        "discovery_complete": not bool(config.get("CHANNEL_CRAWL")),
         "unresolved": 0,
         "cutoff": inventory_cutoff,
         "queue_scope_video_ids": [],
         "queue_scope_outcomes": {},
         "retry_exhausted_video_ids": [],
         "queue_scope_unresolved": 0,
+        "coverage_ledger": inventory_coverage_ledger,
+        "_coverage_ledger_created_at_batch": True,
     }
     inventory_scope_video_ids = set()
     inventory_outcomes = {}
@@ -2258,11 +2278,6 @@ def process_videos(config: dict):
                 has_drive_canonical=lambda vid: _has_drive_canonical_for_video(vid, config, base_path),
                 discovery_report=inventory_discovery,
             )
-            for row in shorts_rows or []:
-                video_id = str(row.get("video_id") or "").strip()
-                if video_id:
-                    inventory_scope_video_ids.add(video_id)
-                    inventory_outcomes[video_id] = channel_crawl.SHORTS_STATUS
             if shorts_rows:
                 shorts_df = pd.DataFrame(shorts_rows)
                 if len(shorts_df) > 0:
@@ -2274,6 +2289,15 @@ def process_videos(config: dict):
                         shorts_recorded_count = len(shorts_df)
                         output_df = pd.concat([output_df, shorts_df], ignore_index=True)
                         _save_output_df_with_retry(output_df, output_df_path)
+                        for video_id in shorts_df["v_id"].astype(str).str.strip():
+                            if not video_id:
+                                continue
+                            inventory_scope_video_ids.add(video_id)
+                            inventory_outcomes[video_id] = channel_crawl.SHORTS_STATUS
+                            inventory_coverage_ledger.classify_video_id(
+                                video_id, "success-verified", reason="shorts_output_persisted",
+                                status=channel_crawl.SHORTS_STATUS,
+                            )
                         logger.info(
                             "Channel crawl: recorded %d shorts as status=%s to output_df",
                             len(shorts_df),
@@ -2498,13 +2522,22 @@ def process_videos(config: dict):
 
     # Declare the whole discovered/manual pending scope before VIDEO_ID_FILTER or
     # MAX_VIDEOS can defer some work. Deferred items stay unresolved at finalization.
-    for url in url_list:
+    declared_batch_ids = set()
+    for row_index, url in enumerate(url_list):
         try:
             video_id = str(stt.extract_youtube_id(url) or "").strip()
         except (ValueError, TypeError):
             video_id = ""
         if video_id:
             inventory_scope_video_ids.add(video_id)
+        duplicate = bool(video_id and video_id in declared_batch_ids)
+        if video_id:
+            declared_batch_ids.add(video_id)
+        inventory_coverage_ledger.declare(
+            "batch_url", video_id, row_index=row_index,
+            anomaly=("duplicate_batch_video_id" if duplicate else ""),
+            anomaly_is_extra_unresolved=duplicate,
+        )
     inventory_scope_video_ids.update(str(vid).strip() for vid, _, _ in manual_urls if str(vid).strip())
     
     wanted_video_id = config.get("VIDEO_ID_FILTER")
@@ -2673,6 +2706,12 @@ def process_videos(config: dict):
         if re.fullmatch(r"[A-Za-z0-9_-]{11}", video_id):
             inventory_scope_video_ids.add(video_id)
             inventory_outcomes[video_id] = status
+            classification = channel_crawl._coverage_classification_for_status(
+                status, already_processed=(status.casefold() == "already_existed"),
+            )
+            inventory_coverage_ledger.classify_video_id(
+                video_id, classification, reason="processing_result_persisted", status=status,
+            )
         else:
             inventory_counts["unresolved"] += 1
 
@@ -2682,10 +2721,10 @@ def process_videos(config: dict):
             result.status = "file_error"
             result.retryable = True
             result.error_message = "pending_drive: final Markdown is staged but Drive verification is pending"
-        _record_inventory_result(result)
         state_writer.apply(result)
         output_df = state_writer.get_output_df()
         crawl_queue_df = state_writer.get_crawl_queue_df()
+        _record_inventory_result(result)
         if result.video_id in {vid for vid, _, _ in manual_urls}:
             ledger_status = ""
             ledger_drive_state = ""

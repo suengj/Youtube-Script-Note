@@ -544,14 +544,14 @@ def test_unknown_queue_status_is_preserved_as_unresolved_coverage():
 
     queue = pd.DataFrame([
         {"video_id": "blank000001", "status": "", "retry_count": 0},
-        {"video_id": "future000001", "status": "future_status", "retry_count": 0},
+        {"video_id": "future00001", "status": "future_status", "retry_count": 0},
         {"video_id": "claim000001", "status": "claimed", "retry_count": 0},
         {"video_id": "done0000001", "status": "done", "retry_count": 0},
     ])
     report = {}
     channel_crawl._record_inventory_queue_scope(report, queue, max_retries=3)
     assert report["queue_scope_video_ids"] == [
-        "blank000001", "claim000001", "done0000001", "future000001",
+        "blank000001", "claim000001", "done0000001", "future00001",
     ]
     reconciled = reconcile_inventory_scope(report["queue_scope_video_ids"], {})
     assert reconciled["unresolved"] == 4
@@ -856,6 +856,7 @@ def test_unresolved_configured_channel_survives_and_recovers_on_next_run(tmp_pat
         str(tmp_path), config, output, discovery_report=second_report,
     )
     assert second_report["channel_count"] == 1
-    assert second_report["complete"] is True
+    assert second_report["discovery_complete"] is True
+    assert second_report["complete"] is False  # recovered video is queued, not processed yet
     queue = channel_crawl.load_crawl_queue_df(str(tmp_path))
     assert video_id in set(queue["video_id"].astype(str))

@@ -214,7 +214,8 @@ def test_incomplete_discovery_preserves_cursor_for_next_run(tmp_path, monkeypatc
         output, discovery_report=report,
     )
     assert calls[1] == cc._parse_iso_date(old_cursor)
-    assert report["complete"] is True
+    assert report["discovery_complete"] is True
+    assert report["complete"] is False  # queue rows remain declared and unprocessed
     assert "missed00001" in set(second_queue["video_id"].astype(str))
 
 
@@ -268,7 +269,8 @@ def test_queue_write_failure_keeps_cursor_and_rediscovers_next_run(tmp_path, mon
     second_queue, _, _ = cc.build_queue_and_get_candidates(str(tmp_path), config, output, discovery_report=report)
 
     assert calls == [cc._parse_iso_date(old_cursor), cc._parse_iso_date(old_cursor)]
-    assert report["complete"] is True
+    assert report["discovery_complete"] is True
+    assert report["complete"] is False  # queued work is not a completed batch scope
     assert report["queue_persisted"] is True
     assert second_queue["video_id"].astype(str).tolist() == ["retry000001"]
     assert cc.load_channel_df(str(tmp_path))[0]["last_discovered_published_at"] == "2026-10-23T00:00:00Z"
@@ -300,7 +302,8 @@ def test_interruption_after_queue_commit_rediscovers_and_dedupes(tmp_path, monke
     second_queue, _, _ = cc.build_queue_and_get_candidates(str(tmp_path), config, output, discovery_report=report)
 
     assert calls == [cc._parse_iso_date(old_cursor), cc._parse_iso_date(old_cursor)]
-    assert report["complete"] is True
+    assert report["discovery_complete"] is True
+    assert report["complete"] is False  # persisted queue rows still need processing
     assert second_queue["video_id"].astype(str).tolist() == ["retry000001"]
     assert cc.load_crawl_queue_df(str(tmp_path))["video_id"].astype(str).tolist() == ["retry000001"]
     assert cc.load_channel_df(str(tmp_path))[0]["last_discovered_published_at"] == "2026-10-23T00:00:00Z"
@@ -363,10 +366,127 @@ def test_malformed_discovery_id_blocks_both_cursors_until_recovered(tmp_path, mo
         output, discovery_report=report,
     )
 
-    assert report["complete"] is True
+    assert report["discovery_complete"] is True
+    assert report["complete"] is False  # queue scope is pending until processing results arrive
     assert report["unresolved"] == 0
     assert "missed00001" in set(second_queue["video_id"].astype(str))
     assert cc.load_channel_df(str(tmp_path))[0]["last_discovered_published_at"] == "2026-10-23T00:00:00Z"
+
+
+def test_coverage_ledger_keeps_unknown_output_discovery_unresolved(tmp_path, monkeypatch):
+    channel_id = "UC" + "u" * 22
+    uploads_id = "UU" + "u" * 22
+    old_cursor = "2026-10-20T00:00:00Z"
+    video_id = "future00001"
+    cc.save_channel_df(str(tmp_path), [{
+        "channel_url": f"https://www.youtube.com/channel/{channel_id}",
+        "channel_name": "Future status", "channel_id": channel_id,
+        "uploads_playlist_id": uploads_id,
+        "last_processed_published_at": old_cursor,
+        "last_discovered_published_at": old_cursor,
+    }])
+    monkeypatch.setattr(cc, "fetch_channel_via_api", lambda *_args, **_kwargs: (
+        [{"video_id": video_id, "url": f"https://youtu.be/{video_id}",
+          "published_at": "2026-10-21T00:00:00Z"}],
+        "Future status", uploads_id,
+    ))
+    report = {}
+
+    queue, candidates, _ = cc.build_queue_and_get_candidates(
+        str(tmp_path), {"YOUTUBE_API_KEY": "fixture", "FILTERING_SHORTS_MINUTES": 0},
+        pd.DataFrame([{"v_id": video_id, "status": "future_status"}]),
+        discovery_report=report,
+    )
+
+    ledger = report["coverage_ledger"]
+    item = next(item for item in ledger.items if item["video_id"] == video_id)
+    assert item["classification"] == "unresolved"
+    assert report["queue_scope_video_ids"] == [video_id]
+    assert report["queue_scope_outcomes"][video_id] == "future_status"
+    assert report["coverage_unresolved"] == 1
+    assert report["complete"] is False
+    assert queue.empty
+    assert candidates.empty
+    assert cc.load_channel_df(str(tmp_path))[0]["last_discovered_published_at"] == old_cursor
+
+
+def test_cursor_filtered_discovery_requires_durable_queue_or_output_record(tmp_path, monkeypatch):
+    channel_id = "UC" + "c" * 22
+    uploads_id = "UU" + "c" * 22
+    old_cursor = "2026-10-20T00:00:00Z"
+    video_id = "cursor00001"
+    cc.save_channel_df(str(tmp_path), [{
+        "channel_url": f"https://www.youtube.com/channel/{channel_id}",
+        "channel_name": "Cursor gap", "channel_id": channel_id,
+        "uploads_playlist_id": uploads_id,
+        "last_processed_published_at": old_cursor,
+        "last_discovered_published_at": old_cursor,
+    }])
+    monkeypatch.setattr(cc, "fetch_channel_via_api", lambda *_args, **_kwargs: (
+        [{"video_id": video_id, "url": f"https://youtu.be/{video_id}",
+          "published_at": "2026-10-19T00:00:00Z"}],
+        "Cursor gap", uploads_id,
+    ))
+    report = {}
+
+    queue, candidates, _ = cc.build_queue_and_get_candidates(
+        str(tmp_path), {"YOUTUBE_API_KEY": "fixture", "FILTERING_SHORTS_MINUTES": 0},
+        pd.DataFrame(columns=["v_id", "status"]), discovery_report=report,
+    )
+
+    item = next(item for item in report["coverage_ledger"].items if item["video_id"] == video_id)
+    assert item["classification"] == "unresolved"
+    assert report["coverage_unresolved"] == 1
+    assert report["complete"] is False
+    assert queue.empty
+    assert candidates.empty
+    assert cc.load_channel_df(str(tmp_path))[0]["last_discovered_published_at"] == old_cursor
+
+
+def test_coverage_ledger_keeps_blank_duplicate_and_malformed_queue_anomalies_after_cleanup(tmp_path, monkeypatch):
+    channel_id = "UC" + "q" * 22
+    uploads_id = "UU" + "q" * 22
+    video_id = "queued00001"
+    cc.save_channel_df(str(tmp_path), [{
+        "channel_url": f"https://www.youtube.com/channel/{channel_id}",
+        "channel_name": "Queue anomalies", "channel_id": channel_id,
+        "uploads_playlist_id": uploads_id,
+        "last_processed_published_at": "2026-10-20T00:00:00Z",
+        "last_discovered_published_at": "2026-10-20T00:00:00Z",
+    }])
+    raw_queue = pd.concat([
+        _queue_row(video_id=video_id, status="done"),
+        _queue_row(video_id=video_id, status="done"),
+        _queue_row(video_id="", status="queued"),
+        _queue_row(video_id="bad_id_00001", status="queued"),
+    ], ignore_index=True)
+    cc.save_crawl_queue_df(str(tmp_path), raw_queue)
+    monkeypatch.setattr(cc, "fetch_channel_via_api", lambda *_args, **_kwargs: ([], "", uploads_id))
+    report = {}
+
+    queue, _, _ = cc.build_queue_and_get_candidates(
+        str(tmp_path), {"YOUTUBE_API_KEY": "fixture", "FILTERING_SHORTS_MINUTES": 0},
+        pd.DataFrame([{"v_id": video_id, "status": "success"}]),
+        discovery_report=report,
+    )
+
+    ledger = report["coverage_ledger"]
+    queue_items = [item for item in ledger.items if item["source"] == "queue"]
+    assert len(queue_items) == 4
+    assert all(item["classification"] is not None for item in queue_items)
+    assert sum(item["anomaly"] == "duplicate_queue_video_id" for item in queue_items) == 1
+    assert sum(item["anomaly"] == "blank_queue_video_id" for item in queue_items) == 1
+    assert sum(item["anomaly"] == "malformed_queue_video_id" for item in queue_items) == 1
+    assert report["coverage_anomalies"] == 3
+    assert report["coverage_unresolved"] == 2
+    assert report["queue_scope_unresolved"] == 3
+    assert report["complete"] is False
+    assert queue["video_id"].tolist() == [video_id]
+    before = (report["coverage_anomalies"], report["coverage_unresolved"],
+              report["queue_scope_unresolved"])
+    cc._sync_coverage_report(report)
+    assert (report["coverage_anomalies"], report["coverage_unresolved"],
+            report["queue_scope_unresolved"]) == before
 
 
 def test_discovery_requeues_prior_live_output_and_keeps_cursor_backed_by_queue(tmp_path, monkeypatch):
