@@ -114,14 +114,23 @@ def call_responses(client, model: str, instructions: str, input_text: str, effor
             raise ResponsesCallError(
                 "run_budget_expired", "P03 run budget expired before paid LLM summary", rec
             )
-        rec.attempts = attempt
         try:
-            response = client.responses.create(
+            response = run_budget.call_with_retries(
+                client.responses.create,
                 model=model, instructions=instructions, input=input_text,
                 reasoning={"effort": effort}, max_output_tokens=max_output_tokens,
+                on_attempt=lambda: setattr(rec, "attempts", rec.attempts + 1),
+                on_error=lambda exc: rec.attempt_errors.append({
+                    "attempt": rec.attempts, "category": _error_category(exc)
+                }),
             )
+        except run_budget.RunBudgetExpired as exc:
+            rec.status = "error"
+            rec.latency_s = round(time.monotonic() - started, 3)
+            raise ResponsesCallError(
+                "run_budget_expired", "P03 run budget expired before paid LLM summary", rec
+            ) from exc
         except Exception as exc:
-            rec.attempt_errors.append({"attempt": attempt, "category": _error_category(exc)})
             if attempt >= max_attempts or not stt._is_retryable_llm_error(exc):
                 rec.status = "error"
                 rec.latency_s = round(time.monotonic() - started, 3)

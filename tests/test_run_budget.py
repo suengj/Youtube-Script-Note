@@ -388,10 +388,64 @@ def test_expired_run_budget_blocks_paid_work_from_all_recovery_paths(tmp_path, m
     assert client.calls == 0
 
 
-def test_openai_sdk_retry_cannot_cross_run_deadline(monkeypatch):
-    httpx = pytest.importorskip("httpx")
-    openai = pytest.importorskip("openai")
-    OpenAI = openai.OpenAI
+def test_chat_completion_retries_transient_500_with_origin_request_count(monkeypatch):
+    from types import SimpleNamespace
+
+    import run_budget
+    import stt_function_v3 as stt
+
+    monkeypatch.setattr(run_budget, "_deadline", None)
+    delays = []
+    monkeypatch.setattr(run_budget.random, "random", lambda: 0)
+    monkeypatch.setattr(run_budget.time, "sleep", delays.append)
+
+    class HttpError(Exception):
+        status_code = 500
+
+    calls = []
+
+    def create(**_kwargs):
+        calls.append(1)
+        if len(calls) == 1:
+            raise HttpError("temporary server error")
+        return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content="ok"))])
+
+    client = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=create)))
+    assert stt.token_minimizer("role", "query", "transcript", client) == "ok"
+    assert len(calls) == 2
+    assert delays == [0.5]
+
+
+def test_call_responses_preserves_origin_total_sdk_and_application_attempts(monkeypatch):
+    from types import SimpleNamespace
+
+    import run_budget
+    from llm_responses import ResponsesCallError, call_responses
+
+    monkeypatch.setattr(run_budget, "_deadline", None)
+    delays = []
+    monkeypatch.setattr(run_budget.random, "random", lambda: 0)
+    monkeypatch.setattr(run_budget.time, "sleep", delays.append)
+
+    class HttpError(Exception):
+        status_code = 500
+
+    calls = []
+
+    def create(**_kwargs):
+        calls.append(1)
+        raise HttpError("persistent server error")
+
+    client = SimpleNamespace(responses=SimpleNamespace(create=create))
+    with pytest.raises(ResponsesCallError) as exc:
+        call_responses(client, "model", "instructions", "input")
+    assert len(calls) == 9
+    assert exc.value.usage.attempts == 9
+    assert delays == [0.5, 1.0, 0.25, 0.5, 1.0, 0.5, 0.5, 1.0]
+
+
+def test_deadline_crossed_after_first_500_blocks_next_http_attempt(monkeypatch):
+    from types import SimpleNamespace
 
     import run_budget
     from llm_responses import ResponsesCallError, call_responses
@@ -399,21 +453,19 @@ def test_openai_sdk_retry_cannot_cross_run_deadline(monkeypatch):
     now = [100.0]
     monkeypatch.setattr(run_budget.time, "time", lambda: now[0])
     monkeypatch.setattr(run_budget, "_deadline", 101.0)
-    requests = []
+    monkeypatch.setattr(run_budget.time, "sleep", lambda _seconds: None)
 
-    def transport(request):
-        requests.append(request)
+    class HttpError(Exception):
+        status_code = 500
+
+    calls = []
+
+    def create(**_kwargs):
+        calls.append(1)
         now[0] = 102.0
-        return httpx.Response(500, json={"error": {"message": "temporary", "type": "server_error"}},
-                              request=request)
+        raise HttpError("temporary server error")
 
-    client = OpenAI(api_key="test", max_retries=0,
-                    http_client=httpx.Client(transport=httpx.MockTransport(transport)))
-    try:
-        with pytest.raises(ResponsesCallError, match="run budget expired"):
-            call_responses(client, "model", "instructions", "input", retries=1, backoff_s=0)
-    finally:
-        client.close()
-
-    assert len(requests) == 1
-    assert requests[0].url.path == "/v1/responses"
+    client = SimpleNamespace(responses=SimpleNamespace(create=create))
+    with pytest.raises(ResponsesCallError, match="run budget expired"):
+        call_responses(client, "model", "instructions", "input", backoff_s=0)
+    assert len(calls) == 1

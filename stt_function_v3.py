@@ -1239,7 +1239,7 @@ def token_minimizer(INPUT_ROLE, INPUT_QUERY,
     if run_budget.expired():
         raise RuntimeError("P03 run budget expired before paid transcript minimization")
 
-    completion = client.chat.completions.create(
+    completion = run_budget.call_with_retries(client.chat.completions.create,
         model = model,
         messages = INPUT_MESSAGE
     )
@@ -1449,7 +1449,7 @@ def response_text_4o(INPUT_ROLE, INPUT_QUERY, client, model = "gpt-4o-mini-2024-
 
     INPUT_MESSAGE = prompt_engineering(INPUT_ROLE, INPUT_QUERY)
 
-    completion = client.chat.completions.create(
+    completion = run_budget.call_with_retries(client.chat.completions.create,
         model = model,
         messages = INPUT_MESSAGE
     )
@@ -1470,7 +1470,7 @@ def response_text_o1(INPUT_QUERY, client, model = "o1-mini-2024-09-12"):
 
     start_time = time.time(); print("response starts")
 
-    completion = client.chat.completions.create(
+    completion = run_budget.call_with_retries(client.chat.completions.create,
         model = model,
         messages = INPUT_MESSAGE
     )
@@ -1490,7 +1490,7 @@ def response_text_o3(INPUT_QUERY, client, model = "o3-mini-2025-01-31"):
 
     start_time = time.time(); print("response starts")
 
-    completion = client.chat.completions.create(
+    completion = run_budget.call_with_retries(client.chat.completions.create,
         model = model,
         messages = INPUT_MESSAGE
     )
@@ -1511,7 +1511,7 @@ def response_text_o4(INPUT_QUERY, client, model = "o4-mini-2025-04-16"):
 
     start_time = time.time(); print("response starts")
 
-    completion = client.chat.completions.create(
+    completion = run_budget.call_with_retries(client.chat.completions.create,
         model = model,
         messages = INPUT_MESSAGE
     )
@@ -1583,7 +1583,7 @@ def _response_text_5mini_once(INPUT_QUERY, client, model="gpt-5-mini-2025-08-07"
 
     start_time = time.time(); print("response starts")
 
-    completion = client.chat.completions.create(
+    completion = run_budget.call_with_retries(client.chat.completions.create,
         model = model,
         messages = INPUT_MESSAGE
     )
@@ -1615,7 +1615,7 @@ def response_text_grok(INPUT_ROLE, INPUT_QUERY, client, model = "grok-2-latest")
 
     INPUT_MESSAGE = prompt_engineering(INPUT_ROLE, INPUT_QUERY)
 
-    completion = client.chat.completions.create(
+    completion = run_budget.call_with_retries(client.chat.completions.create,
         model = model,
         messages = INPUT_MESSAGE
     )
