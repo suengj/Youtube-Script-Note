@@ -151,6 +151,9 @@ class DriveApiSink:
                         last_conflict = True
                         continue
                     raise
+                # Keep every valid document observation, including when a
+                # later revision check forces this attempt to retry.
+                preserved_docs.append(doc)
                 try:
                     doc, restored_missing = restore_missing_manifest_fields(doc, preserved_docs)
                 except ValueError as exc:
@@ -195,6 +198,7 @@ class DriveApiSink:
                         readback_doc = parse_manifest_yaml(readback)
                     except Exception as exc:
                         raise DriveUploadError("canonical manifest readback YAML is invalid") from exc
+                    preserved_docs.append(readback_doc)
                     expected_revision = str(latest_meta.get("headRevisionId") or "")
                     observed_revision = str(readback_meta.get("headRevisionId") or "")
                     revision_jump = bool(
@@ -206,7 +210,6 @@ class DriveApiSink:
                         # A valid but unexpected readback indicates an external
                         # writer raced the unconditional Drive update. Preserve all
                         # observed rows and re-merge from the new head, bounded.
-                        preserved_docs.extend((doc, readback_doc))
                         last_conflict = True
                         continue
                     if after_verified:

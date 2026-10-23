@@ -170,6 +170,7 @@ def _write_merged_manifest(path: Path, new_files, titles_by_rel, *, max_attempts
     preserved_docs = []
     for _attempt in range(max_attempts):
         before_bytes, before_doc = _read_manifest(path)
+        preserved_docs.append(before_doc)
         signature = (hashlib.sha256(before_bytes).hexdigest(), hashlib.md5(before_bytes).hexdigest())
         try:
             restored_doc, _restored = restore_missing_manifest_fields(before_doc, preserved_docs)
@@ -178,16 +179,16 @@ def _write_merged_manifest(path: Path, new_files, titles_by_rel, *, max_attempts
         merged = _merge_manifest_doc(restored_doc, generated)
         expected = serialize_manifest_yaml(merged)
         latest_bytes, latest_doc = _read_manifest(path)
+        preserved_docs.append(latest_doc)
         latest_signature = (hashlib.sha256(latest_bytes).hexdigest(), hashlib.md5(latest_bytes).hexdigest())
         if latest_signature != signature:
-            preserved_docs.extend((before_doc, latest_doc))
             continue
         try:
             atomic_write_text(path, expected.decode("utf-8"))
             readback = path.read_bytes()
             readback_doc = parse_manifest_yaml(readback)
+            preserved_docs.append(readback_doc)
         except (OSError, FilesystemSyncError, ValueError) as exc:
-            preserved_docs.append(before_doc)
             continue
         previous_ids = _manifest_item_identities(before_doc)
         readback_ids = _manifest_item_identities(readback_doc)
@@ -196,7 +197,6 @@ def _write_merged_manifest(path: Path, new_files, titles_by_rel, *, max_attempts
             return
         # A different but valid readback may be a concurrent write. Preserve both
         # observed documents and rebuild from the newest bytes on the next pass.
-        preserved_docs.extend((before_doc, readback_doc))
     raise FilesystemSyncError("manifest changed during merge/retries; refusing a lossy write")
 
 

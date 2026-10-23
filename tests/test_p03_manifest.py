@@ -58,7 +58,10 @@ class _FakeDrive:
         self.created_inventory_count = 0
         self.manifest_get_count = 0
         self.on_second_manifest_get = None
+        self.on_third_manifest_get = None
         self.on_after_manifest_update = None
+        self.on_manifest_media_read = None
+        self.manifest_media_get_count = 0
         if manifest:
             self._set_manifest({"version": 1, "generated_at": "legacy", "items": []}, revision="1")
 
@@ -132,6 +135,9 @@ class _FakeDrive:
                 if self.manifest_get_count == 2 and self.on_second_manifest_get:
                     hook, self.on_second_manifest_get = self.on_second_manifest_get, None
                     hook()
+                if self.manifest_get_count == 3 and self.on_third_manifest_get:
+                    hook, self.on_third_manifest_get = self.on_third_manifest_get, None
+                    hook()
             item = dict(self.items[fileId])
             item["parents"] = list(item.get("parents", []))
             item["appProperties"] = dict(item.get("appProperties", {}))
@@ -148,6 +154,10 @@ class _FakeDrive:
             if (self.items[fileId].get("name") == INVENTORY_FILE_NAME and
                     self.corrupt_inventory_readback):
                 return payload + b" "
+            if fileId == MANIFEST_FILE_ID:
+                self.manifest_media_get_count += 1
+                if self.on_manifest_media_read:
+                    self.on_manifest_media_read(self.manifest_media_get_count)
             return payload
         return _Request(run)
 
@@ -330,6 +340,111 @@ def test_post_update_clobber_restores_missing_fields_on_matching_item():
     assert result["action"] == "unchanged"
     assert restored["custom_field"] == {"retain": True, "nested": {"also_retain": "yes"}}
     assert drive.manifest_update_count >= 2
+
+
+@pytest.mark.parametrize("backend", ["api", "desktop"])
+@pytest.mark.parametrize("read_write_point", ["initial_read", "pre_update_read", "write", "post_write_readback"])
+@pytest.mark.parametrize("deletion", ["nested_field", "whole_item"])
+def test_manifest_retries_never_succeed_after_losing_any_observed_document(
+    monkeypatch, tmp_path, backend, read_write_point, deletion,
+):
+    original_item = {
+        "file": "old_abcdefghijk.md", "title": "Old", "hash": hashlib.sha256(b"old").hexdigest(),
+        "revision": 1, "video_id": "abcdefghijk", "drive_file_id": "old-drive-id",
+        "custom_field": {"nested": {"retain": "observed"}},
+    }
+    if backend == "api":
+        drive = _FakeDrive()
+        drive._set_manifest({"version": 1, "items": [original_item]}, revision="1")
+        sink = DriveApiSink(drive)
+        manifest_path = None
+    else:
+        from scripts.drive_yt_summary import sync as sync_module
+        from scripts.drive_yt_summary.fs_transport import FilesystemSyncError
+        from scripts.drive_yt_summary.state import SyncStateEntry
+
+        manifest_path = tmp_path / "manifest.yaml"
+        manifest_path.write_bytes(serialize_manifest_yaml({"version": 1, "items": [original_item]}))
+        entry = SyncStateEntry(
+            relative_path="local/local.md", content_hash=hashlib.sha256(b"local").hexdigest(),
+            dest_path="/drive/local.md", drive_name="local.md", updated_at="2026-10-23T00:00:00Z",
+            video_id="lmnopqrst", title="Local", revision=1,
+        )
+
+    def concurrent_delete():
+        if backend == "api":
+            current = parse_manifest_yaml(drive.items[MANIFEST_FILE_ID]["data"])
+        else:
+            current = parse_manifest_yaml(manifest_path.read_bytes())
+        if deletion == "nested_field":
+            item = next(item for item in current["items"] if item.get("drive_file_id") == "old-drive-id")
+            del item["custom_field"]["nested"]["retain"]
+        else:
+            current["items"] = [item for item in current["items"]
+                                if item.get("drive_file_id") != "old-drive-id"]
+        if backend == "api":
+            revision = str(int(drive.items[MANIFEST_FILE_ID]["headRevisionId"]) + 1)
+            drive._set_manifest(current, revision=revision)
+        else:
+            manifest_path.write_bytes(serialize_manifest_yaml(current))
+
+    if backend == "api":
+        if read_write_point == "initial_read":
+            drive.on_manifest_media_read = lambda count: concurrent_delete() if count == 1 else None
+        elif read_write_point == "pre_update_read":
+            drive.on_second_manifest_get = concurrent_delete
+        elif read_write_point == "write":
+            drive.on_after_manifest_update = concurrent_delete
+        else:
+            drive.on_third_manifest_get = concurrent_delete
+    else:
+        real_read = sync_module._read_manifest
+        read_count = 0
+
+        def injected_read(path):
+            nonlocal read_count
+            read_count += 1
+            if read_write_point == "pre_update_read" and read_count == 2:
+                concurrent_delete()
+            observed = real_read(path)
+            if read_write_point == "initial_read" and read_count == 1:
+                concurrent_delete()
+            return observed
+
+        monkeypatch.setattr(sync_module, "_read_manifest", injected_read)
+        real_write = sync_module.atomic_write_text
+        injected = False
+
+        def injected_write(path, content):
+            nonlocal injected
+            real_write(path, content)
+            if not injected:
+                injected = True
+                if read_write_point in {"write", "post_write_readback"}:
+                    concurrent_delete()
+
+        monkeypatch.setattr(sync_module, "atomic_write_text", injected_write)
+
+    outcome = None
+    try:
+        if backend == "api":
+            outcome = _merge(
+                sink, file="local_lmnopqrst.md", video_id="lmnopqrst", summary=b"local",
+                drive_file_id="local-id",
+            )
+        else:
+            sync_module._write_merged_manifest(
+                manifest_path, {"local/local.md": entry}, {"local/local.md": "Local"},
+            )
+            outcome = True
+    except (DriveUploadError, FilesystemSyncError if backend == "desktop" else DriveUploadError):
+        pass
+
+    if outcome is not None:
+        final = sink.read_manifest() if backend == "api" else parse_manifest_yaml(manifest_path.read_bytes())
+        restored = next((item for item in final["items"] if item.get("drive_file_id") == "old-drive-id"), None)
+        assert restored is not None
+        assert restored["custom_field"]["nested"]["retain"] == "observed"
 
 
 @pytest.mark.parametrize(
