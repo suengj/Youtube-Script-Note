@@ -72,12 +72,184 @@ CRAWL_QUEUE_COLUMNS = [
     "auto_sub_only",
     "obsidian",
 ]
+# obsidian was added after the queue schema was established and remains an
+# optional migration column. Every other queue column participates in reading,
+# writing, selection, or inventory coverage and must be present on disk.
+CRAWL_QUEUE_REQUIRED_COLUMNS = set(CRAWL_QUEUE_COLUMNS) - {OBSIDIAN_COLUMN}
+CHANNEL_DF_REQUIRED_COLUMNS = set(CHANNEL_DF_COLUMNS) - {OBSIDIAN_COLUMN}
 DONE_STATUSES = {"success", "already_existed", "oversized_file"}
 SKIPPED_AUTO_SUBS_ONLY_STATUS = "skipped_auto_subs_only"
 FAILED_STATUSES = {"error", "download_failed", "mlx_error", "captions_error", "SOURCE_UNAVAILABLE", "source_unavailable", "api_error", "file_error"}
 SHORTS_STATUS = "passed_shorts"
 LIVE_SCHEDULED_STATUS = "live_scheduled"
 VIDEO_UNAVAILABLE_STATUS = "video_unavailable"
+VIDEO_ID_PATTERN = re.compile(r"[A-Za-z0-9_-]{11}")
+_COVERAGE_CLASSIFICATIONS = {
+    "success-verified",
+    "already-processed-verified",
+    "failed",
+    "unresolved",
+}
+
+
+class BatchCoverageLedger:
+    """Monotonic, row-level coverage evidence for one processing batch."""
+
+    def __init__(self):
+        self.items: List[Dict[str, Any]] = []
+        self.anomaly_count = 0
+        self.unresolved_count = 0
+        self.extra_unresolved_count = 0
+        self._pending_count = 0
+        self._next_item_id = 0
+        self._items_by_id: Dict[str, Dict[str, Any]] = {}
+        self._items_by_video_id: Dict[str, List[Dict[str, Any]]] = {}
+        self._items_by_source_row: Dict[Tuple[str, Any], Dict[str, Any]] = {}
+
+    @staticmethod
+    def normalize_video_id(value) -> str:
+        if value is None:
+            return ""
+        try:
+            if value != value:  # NaN
+                return ""
+        except Exception:
+            pass
+        value = str(value).strip()
+        return "" if value.casefold() in {"nan", "none"} else value
+
+    def declare(
+        self, source: str, video_id, *, row_index=None, anomaly: str = "",
+        in_scope: bool = True, anomaly_is_extra_unresolved: bool = False,
+    ) -> str:
+        normalized = self.normalize_video_id(video_id)
+        valid_id = bool(VIDEO_ID_PATTERN.fullmatch(normalized))
+        if not valid_id and not anomaly:
+            anomaly = "malformed_video_id"
+        self._next_item_id += 1
+        item_id = f"coverage-{self._next_item_id}"
+        item = {
+            "item_id": item_id,
+            "source": str(source),
+            "row_index": row_index,
+            "video_id": normalized,
+            "in_scope": bool(in_scope),
+            "classification": None,
+            "reason": "",
+            "status": "",
+            "anomaly": "",
+        }
+        self.items.append(item)
+        self._items_by_id[item_id] = item
+        self._items_by_video_id.setdefault(normalized, []).append(item)
+        try:
+            self._items_by_source_row[(str(source), row_index)] = item
+        except TypeError:
+            pass
+        self._pending_count += 1
+        if anomaly:
+            self.add_anomaly(item_id, anomaly, extra_unresolved=anomaly_is_extra_unresolved)
+        if not valid_id:
+            self.extra_unresolved_count += 1
+            self.classify(item_id, "unresolved", reason=anomaly or "malformed_video_id")
+        return item_id
+
+    def add_anomaly(self, item_id: str, reason: str, *, extra_unresolved: bool = False) -> None:
+        item = self._item(item_id)
+        if not item["anomaly"]:
+            item["anomaly"] = str(reason or "coverage_anomaly")
+            self.anomaly_count += 1
+            if extra_unresolved:
+                self.extra_unresolved_count += 1
+
+    def set_in_scope(self, item_id: str, in_scope: bool) -> None:
+        self._item(item_id)["in_scope"] = bool(in_scope)
+
+    def classify(
+        self, item_id: str, classification: str, *, reason: str = "", status: str = "",
+    ) -> bool:
+        if classification not in _COVERAGE_CLASSIFICATIONS:
+            raise ValueError(f"unknown coverage classification: {classification}")
+        item = self._item(item_id)
+        previous = item["classification"]
+        if previous is not None:
+            if previous != classification:
+                raise ValueError(f"coverage item {item_id} already classified as {previous}")
+            if status and not item["status"]:
+                item["status"] = str(status)
+            return False
+        item["classification"] = classification
+        item["reason"] = str(reason or "")
+        item["status"] = str(status or "")
+        self._pending_count -= 1
+        if classification == "unresolved":
+            self.unresolved_count += 1
+        return True
+
+    def classify_video_id(
+        self, video_id, classification: str, *, reason: str = "", status: str = "",
+    ) -> int:
+        normalized = self.normalize_video_id(video_id)
+        changed = 0
+        for item in self._items_by_video_id.get(normalized, ()):
+            if item["video_id"] == normalized and item["classification"] is None:
+                changed += int(self.classify(
+                    item["item_id"], classification, reason=reason, status=status,
+                ))
+        return changed
+
+    def classify_source_row(
+        self, source: str, row_index, classification: str, *, reason: str = "", status: str = "",
+    ) -> bool:
+        item = self._items_by_source_row.get((str(source), row_index))
+        if item is None or item["classification"] is not None:
+            return False
+        return self.classify(item["item_id"], classification, reason=reason, status=status)
+
+    def classify_pending_as_unresolved(self, reason: str = "batch_ended_before_classification") -> None:
+        for item in self.items:
+            if item["classification"] is None:
+                self.classify(item["item_id"], "unresolved", reason=reason)
+
+    def is_complete(self) -> bool:
+        return (
+            self._pending_count == 0
+            and self.unresolved_count == 0
+            and self.anomaly_count == 0
+        )
+
+    def pending_count(self) -> int:
+        return self._pending_count
+
+    def scoped_video_ids(self) -> List[str]:
+        return sorted({
+            item["video_id"] for item in self.items
+            if item["in_scope"] and VIDEO_ID_PATTERN.fullmatch(item["video_id"])
+        })
+
+    def extra_unresolved(self) -> int:
+        return self.extra_unresolved_count
+
+    def _item(self, item_id: str) -> Dict[str, Any]:
+        return self._items_by_id[item_id]
+
+
+def _coverage_classification_for_status(status: str, *, already_processed: bool = False) -> str:
+    normalized = str(status or "").strip().casefold()
+    failed_statuses = {value.casefold() for value in FAILED_STATUSES} | {
+        "retry_exhausted", "no_auto_caption", "manual_review", "durable_transcript_unreadable",
+    }
+    terminal_statuses = (
+        {value.casefold() for value in DONE_STATUSES}
+        | {SHORTS_STATUS, "short", VIDEO_UNAVAILABLE_STATUS, SKIPPED_AUTO_SUBS_ONLY_STATUS}
+    )
+    if normalized in failed_statuses:
+        return "failed"
+    if normalized in terminal_statuses:
+        if already_processed or normalized == "already_existed":
+            return "already-processed-verified"
+        return "success-verified"
+    return "unresolved"
 # /channel/UCxxx (24 chars: UC + 22 base64url)
 CHANNEL_URL_ID_PATTERN = re.compile(r"youtube\.com/channel/(UC[\w-]{22})", re.IGNORECASE)
 # @handle: youtube.com/@Handle or youtube.com/@Handle/videos (한글 등 모든 문자 포함, /?&# 전까지)
@@ -198,6 +370,15 @@ class ChannelDfSchemaError(ValueError):
     """channel_df.csv header/value conflict that must be fixed by the owner."""
 
 
+class CoverageStateReadError(OSError):
+    """A persisted crawl state file could not be read safely for coverage."""
+
+    def __init__(self, state_name: str, path: str, cause: Exception):
+        self.state_name = state_name
+        self.path = path
+        super().__init__(f"{state_name} read failed at {path}: {type(cause).__name__}: {cause}")
+
+
 def _norm_marker(value: Any) -> str:
     """strip+lower for marker comparison; NaN/None -> ''."""
     if value is None or (isinstance(value, float) and value != value):
@@ -266,7 +447,8 @@ def load_channel_df(base_path: str) -> List[Dict[str, Any]]:
     """
     Load channel_df.csv. Returns list of dicts with channel_url, channel_name, channel_id, uploads_playlist_id, etc.
     Uses cached channel_id/uploads_playlist_id from CSV when valid; otherwise resolves from URL/API.
-    Rows whose channel_url does not yield a channel_id are skipped.
+    Rows whose channel_url does not yield a channel_id are retained with an empty
+    channel_id so discovery coverage can report them and a later run can retry.
     Unknown columns (and ``obsidian``, if present) are carried through on each row so save_channel_df
     can write them back unchanged.
     """
@@ -275,13 +457,19 @@ def load_channel_df(base_path: str) -> List[Dict[str, Any]]:
         logger.warning(f"channel_df.csv not found: {path}")
         return []
     rows = []
-    _header, all_rows = read_channel_df_raw(path)
+    try:
+        _header, all_rows = read_channel_df_raw(path)
+        missing = sorted(CHANNEL_DF_REQUIRED_COLUMNS - set(_header))
+        if missing:
+            raise ValueError(f"channel_df missing required columns: {', '.join(missing)}")
+    except ChannelDfSchemaError:
+        raise
+    except Exception as exc:
+        raise CoverageStateReadError("channel_df", path, exc) from exc
     total_rows = len(all_rows)
     logger.info("channel_crawl: loading %d rows from channel_df.csv", total_rows)
     for idx, row in enumerate(all_rows, start=1):
         url_s = (row.get("channel_url") or "").strip()
-        if not url_s:
-            continue
         logger.info("channel_crawl: parsing channel row [%d/%d] url=%s", idx, total_rows, url_s[:80])
         cid_cached = (row.get("channel_id") or "").strip()
         if _is_valid_channel_id(cid_cached):
@@ -291,10 +479,9 @@ def load_channel_df(base_path: str) -> List[Dict[str, Any]]:
         if not cid:
             try:
                 safe_url = url_s[:60].encode('utf-8', errors='replace').decode('utf-8', errors='replace')
-                logger.warning("channel_df: skipping row (could not extract channel_id from URL): %s...", safe_url)
+                logger.warning("channel_df: unresolved channel_id for configured row: %s...", safe_url)
             except Exception:
-                logger.warning("channel_df: skipping row (could not extract channel_id from URL): [URL encoding error]")
-            continue
+                logger.warning("channel_df: unresolved channel_id for configured row: [URL encoding error]")
         uploads_cached = (row.get("uploads_playlist_id") or "").strip()
         uploads_id = uploads_cached if _is_valid_uploads_playlist_id(uploads_cached) else ""
         out = dict(row)  # keeps unknown columns + obsidian untouched
@@ -302,7 +489,7 @@ def load_channel_df(base_path: str) -> List[Dict[str, Any]]:
             "channel_url": url_s,
             "channel_name": (row.get("channel_name") or "").strip(),
             "usage_channel": (row.get("usage_channel") or "").strip(),
-            "channel_id": cid,
+            "channel_id": cid or "",
             "uploads_playlist_id": uploads_id,
             "last_processed_published_at": (row.get("last_processed_published_at") or "").strip(),
             "last_discovered_published_at": (row.get("last_discovered_published_at") or "").strip(),
@@ -425,13 +612,23 @@ def load_crawl_queue_df(base_path: str):
                     time.sleep(2 * (attempt + 1))
                     continue
                 raise
+        missing = sorted(CRAWL_QUEUE_REQUIRED_COLUMNS - set(df.columns))
+        if missing:
+            raise ValueError(f"crawl queue missing required columns: {', '.join(missing)}")
         for col in CRAWL_QUEUE_COLUMNS:
             if col not in df.columns:
                 df[col] = ""
-        return df[CRAWL_QUEUE_COLUMNS].copy()
+        df = df[CRAWL_QUEUE_COLUMNS].copy()
+        # CSV columns containing only blanks are inferred as float64 by pandas
+        # 3.x. SharedStateWriter later assigns timestamps and status strings into
+        # these columns, which raises instead of accepting the value. Every queue
+        # column except retry_count is a text field and stays mutable as object.
+        for col in CRAWL_QUEUE_COLUMNS:
+            if col != "retry_count":
+                df[col] = df[col].astype(object)
+        return df
     except Exception as e:
-        logger.warning("crawl_queue: failed to read queue csv (%s). starting empty queue.", e)
-        return pd.DataFrame(columns=CRAWL_QUEUE_COLUMNS)
+        raise CoverageStateReadError("crawl_queue", path, e) from e
 
 
 def save_crawl_queue_df(base_path: str, queue_df) -> None:
@@ -637,7 +834,9 @@ def apply_result_to_queue(queue_df, video_id: str, status: str, error_msg: Optio
     return q
 
 
-def update_channel_last_processed_from_queue(base_path: str, queue_df=None) -> None:
+def update_channel_last_processed_from_queue(
+    base_path: str, queue_df=None, *, exclude_channel_ids=None
+) -> None:
     """
     Update channel_df.last_processed_published_at based on queue rows with status=done.
     """
@@ -652,7 +851,8 @@ def update_channel_last_processed_from_queue(base_path: str, queue_df=None) -> N
     q["status"] = q["status"].astype(str).str.strip()
     q["channel_id"] = q["channel_id"].astype(str).str.strip()
     q["published_at"] = q["published_at"].astype(str).str.strip()
-    done = q[q["status"] == "done"]
+    excluded = {str(value).strip() for value in (exclude_channel_ids or ()) if str(value).strip()}
+    done = q[(q["status"] == "done") & ~q["channel_id"].isin(excluded)]
     if len(done) == 0:
         return
 
@@ -670,6 +870,8 @@ def update_channel_last_processed_from_queue(base_path: str, queue_df=None) -> N
 
     for ch in rows:
         cid = ch.get("channel_id", "")
+        if cid in excluded:
+            continue
         if cid not in channel_max:
             continue
         current = _parse_iso_date((ch.get("last_processed_published_at") or "").strip())
@@ -683,6 +885,7 @@ def fetch_channel_via_api(
     channel_id: str,
     uploads_id: Optional[str] = None,
     cursor_dt: Optional[datetime] = None,
+    discovery_status: Optional[Dict[str, Any]] = None,
 ) -> Tuple[List[Dict[str, Any]], str, str]:
     """
     Fetch channel uploads via YouTube Data API v3.
@@ -691,16 +894,23 @@ def fetch_channel_via_api(
     - cursor_dt: when set (non-backfill), stop paginating when all items on a page have published_at <= cursor_dt.
     """
     channel_title = ""
+    if discovery_status is not None:
+        discovery_status["complete"] = True
+        discovery_status["unresolved"] = int(discovery_status.get("unresolved", 0))
     if not uploads_id or not _is_valid_uploads_playlist_id(uploads_id):
         data = _api_request(api_key, "channels", {"part": "contentDetails,snippet", "id": channel_id})
         if not data or "items" not in data or not data["items"]:
             logger.warning(f"YouTube API: no channel found for {channel_id}")
+            if discovery_status is not None:
+                discovery_status["complete"] = False
             return [], "", ""
         item = data["items"][0]
         uploads_id = (item.get("contentDetails") or {}).get("relatedPlaylists", {}).get("uploads")
         channel_title = (item.get("snippet") or {}).get("title") or ""
         if not uploads_id:
             logger.warning(f"YouTube API: no uploads playlist for {channel_id}")
+            if discovery_status is not None:
+                discovery_status["complete"] = False
             return [], channel_title, ""
 
     entries = []
@@ -711,14 +921,26 @@ def fetch_channel_via_api(
             params["pageToken"] = page_token
         data = _api_request(api_key, "playlistItems", params)
         if not data or "items" not in data:
+            if discovery_status is not None:
+                discovery_status["complete"] = False
             break
         items = data.get("items", [])
         all_past_cursor = True
         for pl_item in items:
             sn = pl_item.get("snippet") or {}
             rid = sn.get("resourceId") or {}
-            video_id = rid.get("videoId")
-            if not video_id:
+            video_id = str(rid.get("videoId") or "").strip()
+            if not re.fullmatch(r"[A-Za-z0-9_-]{11}", video_id):
+                coverage_ledger = (discovery_status or {}).get("_coverage_ledger")
+                if isinstance(coverage_ledger, BatchCoverageLedger):
+                    coverage_ledger.declare(
+                        "api_discovery", video_id,
+                        row_index=len(entries),
+                        anomaly="malformed_discovery_video_id",
+                    )
+                if discovery_status is not None:
+                    discovery_status["unresolved"] += 1
+                    discovery_status["complete"] = False
                 continue
             published = sn.get("publishedAt") or ""
             pub_dt = _parse_iso_date(published) if published else None
@@ -751,7 +973,12 @@ def get_url_list_from_channel_crawl(
     Returns (url_list, meta_list) where meta_list[i] = {url, published_at, channel_id} for url_list[i].
     """
     import pandas as pd
-    channels = load_channel_df(base_path)
+    try:
+        channels = load_channel_df(base_path)
+    except CoverageStateReadError:
+        raise
+    except Exception as exc:
+        raise CoverageStateReadError("channel_df", os.path.join(base_path, CHANNEL_DF_FILENAME), exc) from exc
     if not channels:
         logger.info("channel_crawl: no channels loaded from channel_df.csv")
         return [], []
@@ -874,11 +1101,48 @@ def get_url_list_from_channel_crawl(
     return url_list, meta_list
 
 
+def inventory_cutoff_snapshot(base_path: str, config: dict) -> dict:
+    """Capture the configured producer discovery boundary without external calls."""
+    backfill = bool(config.get("CHANNEL_BACKFILL") or False)
+    empty_cursor_backfill = {
+        channel_id.strip()
+        for channel_id in os.getenv("P03_CHANNEL_EMPTY_CURSOR_BACKFILL", "").split(",")
+        if channel_id.strip()
+    }
+    channels = load_channel_df(base_path)
+    cursors = {}
+    for channel in channels:
+        cid = str(channel.get("channel_id") or "").strip()
+        if not cid:
+            continue
+        last_discovered = (channel.get("last_discovered_published_at") or "").strip()
+        last_processed = (channel.get("last_processed_published_at") or "").strip()
+        empty_backfill = cid in empty_cursor_backfill and not last_discovered and not last_processed
+        effective_cursor = last_discovered if _parse_iso_date(last_discovered) else last_processed
+        effective_cursor_valid = bool(effective_cursor and _parse_iso_date(effective_cursor))
+        cursors[cid] = {
+            "exclusive_after": None if backfill or empty_backfill or not effective_cursor_valid else effective_cursor,
+            "empty_cursor_backfill": bool(empty_backfill),
+            "invalid_cursor": bool(not backfill and not empty_backfill and (last_discovered or last_processed)
+                                    and not effective_cursor_valid),
+        }
+    return {
+        "mode": "backfill" if backfill else "channel_cursor",
+        "backfill_start": (config.get("CHANNEL_START_DATE") or "").strip() or None,
+        "backfill_end": (config.get("CHANNEL_END_DATE") or "").strip() or None,
+        "channels": cursors,
+        "manual_since": (os.getenv("P03_MANUAL_SINCE") or "").strip() or None,
+        "sheet_import_since": (os.getenv("P03_SHEET_IMPORT_SINCE") or "").strip() or None,
+        "selected_max": config.get("MAX_VIDEOS"),
+    }
+
+
 def build_queue_and_get_candidates(
     base_path: str,
     config: dict,
     output_df,
     has_drive_canonical=None,
+    discovery_report: Optional[Dict[str, Any]] = None,
 ):
     """
     Channel crawl discovery -> queue persistence -> candidate selection.
@@ -886,21 +1150,63 @@ def build_queue_and_get_candidates(
     """
     import pandas as pd
 
+    report_requested = discovery_report is not None
+    if discovery_report is None:
+        discovery_report = {}
     channel_requeue_unpublished = {
         channel_id.strip()
         for channel_id in os.getenv("P03_CHANNEL_REQUEUE_UNPUBLISHED", "").split(",")
         if channel_id.strip()
     }
 
+    reuse_batch_ledger = bool(
+        discovery_report is not None and discovery_report.pop("_coverage_ledger_created_at_batch", False)
+    )
+    coverage_ledger = (
+        discovery_report.get("coverage_ledger")
+        if reuse_batch_ledger and discovery_report is not None else None
+    )
+    if not isinstance(coverage_ledger, BatchCoverageLedger):
+        coverage_ledger = BatchCoverageLedger()
+
     channels = load_channel_df(base_path)
+    if discovery_report is not None:
+        discovery_report.clear()
+        discovery_report.update({
+            "enabled": True,
+            "channel_count": len(channels),
+            "channels_succeeded": 0,
+            "channels_failed": [],
+            "cursor_blocked_channels": [],
+            "unresolved": 0,
+            "channel_unresolved": 0,
+            "coverage_ledger": coverage_ledger,
+            "coverage_anomalies": 0,
+            "coverage_unresolved": 0,
+            "coverage_pending": 0,
+            "queue_scope_unresolved": 0,
+            "unresolved_channels": [],
+            "complete": False,
+            "discovery_complete": False,
+            "cutoff": inventory_cutoff_snapshot(base_path, config) if report_requested else None,
+        })
     if not channels:
         logger.info("channel_crawl: no channels loaded from channel_df.csv")
         q = load_crawl_queue_df(base_path)
+        if discovery_report is not None:
+            _declare_inventory_queue_rows(discovery_report, q)
         q = reconcile_queue_with_output_df(
             q, output_df, channel_requeue_unpublished, has_drive_canonical,
             int(config.get("CRAWL_QUEUE_MAX_RETRIES", 3) or 3),
         )
         q = expire_live_replay_rows(q, config.get("LIVE_REPLAY_WAIT_HOURS", 72))
+        if discovery_report is not None:
+            _record_inventory_queue_scope(
+                discovery_report, q, int(config.get("CRAWL_QUEUE_MAX_RETRIES", 3) or 3), output_df
+            )
+            discovery_report["discovery_complete"] = False
+            _sync_coverage_report(discovery_report)
+            discovery_report["complete"] = False
         save_crawl_queue_df(base_path, q)
         return q, select_process_candidates(
             q, int(config.get("CRAWL_QUEUE_MAX_RETRIES", 3)),
@@ -909,6 +1215,8 @@ def build_queue_and_get_candidates(
 
     logger.info("channel_crawl: loaded %d channels from channel_df.csv", len(channels))
     queue_df = load_crawl_queue_df(base_path)
+    if discovery_report is not None:
+        _declare_inventory_queue_rows(discovery_report, queue_df)
     max_retries = int(config.get("CRAWL_QUEUE_MAX_RETRIES", 3) or 3)
     queue_df = reconcile_queue_with_output_df(
         queue_df, output_df, channel_requeue_unpublished, has_drive_canonical, max_retries
@@ -946,12 +1254,16 @@ def build_queue_and_get_candidates(
     if queue_df is not None and len(queue_df) > 0 and "video_id" in queue_df.columns:
         queue_video_ids = set(queue_df["video_id"].astype(str).str.strip())
 
+    if discovery_report is not None:
+        _record_inventory_queue_scope(discovery_report, queue_df, max_retries, output_df)
+
     discovered_rows: List[Dict[str, Any]] = []
     shorts_rows_for_output_df: List[Dict[str, str]] = []
+    discovered_cursor_updates: Dict[str, str] = {}
     now_iso = _now_iso()
 
     for idx, ch in enumerate(channels, start=1):
-        cid = ch["channel_id"]
+        cid = str(ch.get("channel_id") or "").strip()
         ch_name = (ch.get("channel_name") or "").strip() or "(no_name)"
         ch_usage = (ch.get("usage_channel") or "").strip()
         ch_url = (ch.get("channel_url") or "").strip()
@@ -970,6 +1282,17 @@ def build_queue_and_get_candidates(
         if ch_url:
             logger.info("channel_crawl:   source channel_url=%s", ch_url)
 
+        if not _is_valid_channel_id(cid):
+            logger.warning("channel_df: unresolved configured channel URL: %s", ch_url[:80] or "(blank URL)")
+            if discovery_report is not None:
+                _add_channel_unresolved(discovery_report)
+                discovery_report["channels_failed"].append(ch_url or f"row:{idx}")
+                discovery_report["unresolved_channels"].append({
+                    "channel_url": ch_url,
+                    "reason": "channel_id_unresolved",
+                })
+            continue
+
         channel_empty_backfill = (
             cid in empty_cursor_backfill and not last_discovered_s and not last_processed_s
         )
@@ -979,19 +1302,72 @@ def build_queue_and_get_candidates(
                 "skipping channel: %s",
                 ch.get("channel_url", cid)[:80],
             )
+            if discovery_report is not None:
+                discovery_report["channels_failed"].append(cid)
+                discovery_report["cursor_blocked_channels"].append(cid)
+                _add_channel_unresolved(discovery_report)
             continue
 
         cursor_dt = _parse_iso_date(last_discovered_s) if last_discovered_s else None
         if not cursor_dt and last_processed_s:
             cursor_dt = _parse_iso_date(last_processed_s)
+        if not backfill and not channel_empty_backfill and (last_discovered_s or last_processed_s) and not cursor_dt:
+            logger.warning("channel_df: invalid discovery cursor; skipping channel: %s", cid)
+            if discovery_report is not None:
+                discovery_report["channels_failed"].append(cid)
+                discovery_report["cursor_blocked_channels"].append(cid)
+                _add_channel_unresolved(discovery_report)
+            continue
         uploads_id = ch.get("uploads_playlist_id") or None
         if uploads_id and not _is_valid_uploads_playlist_id(uploads_id):
             uploads_id = None
 
-        entries, feed_title, uploads_id_returned = fetch_channel_via_api(
-            api_key, cid, uploads_id=uploads_id,
-            cursor_dt=cursor_dt if not backfill and not channel_empty_backfill else None
-        )
+        unresolved_before_fetch = coverage_ledger.unresolved_count
+        channel_discovery = {
+            "complete": True,
+            "unresolved": 0,
+            "_coverage_ledger": coverage_ledger,
+        }
+        try:
+            try:
+                entries, feed_title, uploads_id_returned = fetch_channel_via_api(
+                    api_key, cid, uploads_id=uploads_id,
+                    cursor_dt=cursor_dt if not backfill and not channel_empty_backfill else None,
+                    discovery_status=channel_discovery,
+                )
+            except TypeError as exc:
+                # Older integrations/tests may replace the fetcher with the
+                # original three-argument callable. A successful return from
+                # that callable still proves that the fetch completed.
+                if "discovery_status" not in str(exc):
+                    raise
+                entries, feed_title, uploads_id_returned = fetch_channel_via_api(
+                    api_key, cid, uploads_id=uploads_id,
+                    cursor_dt=cursor_dt if not backfill and not channel_empty_backfill else None,
+                )
+        except Exception as exc:
+            logger.warning("channel_crawl: discovery failed for cid=%s: %s: %s", cid, type(exc).__name__, exc)
+            entries, feed_title, uploads_id_returned = [], "", ""
+            channel_discovery["complete"] = False
+        if discovery_report is not None:
+            fetch_unresolved = int(channel_discovery.get("unresolved", 0) or 0)
+            ledger_unresolved = coverage_ledger.unresolved_count - unresolved_before_fetch
+            if fetch_unresolved > ledger_unresolved:
+                _add_channel_unresolved(discovery_report, fetch_unresolved - ledger_unresolved)
+            if channel_discovery.get("complete"):
+                discovery_report["channels_succeeded"] += 1
+            else:
+                discovery_report["channels_failed"].append(cid)
+                # A malformed/unresolved item already represents the failed
+                # discovery call in coverage counts; otherwise count the
+                # failed channel discovery itself as one unresolved source.
+                if fetch_unresolved == 0:
+                    _add_channel_unresolved(discovery_report)
+                discovery_report["unresolved_channels"].append({
+                    "channel_url": ch_url,
+                    "channel_id": cid,
+                    "reason": "channel_discovery_failed",
+                })
         if uploads_id_returned:
             ch["uploads_playlist_id"] = uploads_id_returned
         logger.info("channel_crawl:   fetched %d videos from API for cid=%s", len(entries), cid)
@@ -1002,35 +1378,105 @@ def build_queue_and_get_candidates(
         filtered_entries: List[Dict[str, Any]] = []
         seen_discovery_ids: set[str] = set()
         discovered_dt_max: Optional[datetime] = cursor_dt
+        channel_cursor_safe = (
+            bool(channel_discovery.get("complete")) and
+            int(channel_discovery.get("unresolved", 0) or 0) == 0
+        )
 
-        for e in entries:
+        for entry_index, e in enumerate(entries):
+            if isinstance(e, dict):
+                vid = coverage_ledger.normalize_video_id(e.get("video_id"))
+                malformed_row = ""
+            else:
+                vid = ""
+                malformed_row = "malformed_discovery_row"
+            coverage_item_id = coverage_ledger.declare(
+                "discovery", vid, row_index=(cid, entry_index), anomaly=malformed_row,
+            )
+            if not isinstance(e, dict):
+                channel_cursor_safe = False
+                continue
+            if vid and vid in seen_discovery_ids:
+                coverage_ledger.add_anomaly(
+                    coverage_item_id, "duplicate_discovery_video_id", extra_unresolved=True,
+                )
+            elif vid:
+                seen_discovery_ids.add(vid)
+            if not VIDEO_ID_PATTERN.fullmatch(vid):
+                channel_cursor_safe = False
+                continue
+
             pub_s = e.get("published_at") or ""
             pub_dt = _parse_iso_date(pub_s) if pub_s else None
             if not pub_dt:
+                channel_cursor_safe = False
+                coverage_ledger.add_anomaly(coverage_item_id, "malformed_discovery_published_at")
+                if coverage_ledger._item(coverage_item_id)["classification"] is None:
+                    coverage_ledger.classify(
+                        coverage_item_id, "unresolved", reason="malformed_discovery_published_at",
+                    )
                 continue
 
             if backfill:
                 end_dt = _parse_iso_date(end_date_s)
                 if not end_dt:
+                    coverage_ledger.set_in_scope(coverage_item_id, False)
+                    coverage_ledger.classify(
+                        coverage_item_id, "already-processed-verified",
+                        reason="outside_configured_discovery_window",
+                    )
                     continue
                 if pub_dt > end_dt:
+                    coverage_ledger.set_in_scope(coverage_item_id, False)
+                    coverage_ledger.classify(
+                        coverage_item_id, "already-processed-verified",
+                        reason="outside_configured_discovery_window",
+                    )
                     continue
                 if start_date_s:
                     start_dt = _parse_iso_date(start_date_s)
                     if start_dt and pub_dt < start_dt:
+                        coverage_ledger.set_in_scope(coverage_item_id, False)
+                        coverage_ledger.classify(
+                            coverage_item_id, "already-processed-verified",
+                            reason="outside_configured_discovery_window",
+                        )
                         continue
             elif not channel_empty_backfill and cursor_dt and pub_dt <= cursor_dt:
+                queue_records = coverage_ledger._items_by_video_id.get(vid, ())
+                prior_queue_classification = next((
+                    item for item in queue_records
+                    if item["source"] == "queue" and item["classification"] is not None
+                ), None)
+                if prior_queue_classification:
+                    coverage_ledger.classify(
+                        coverage_item_id,
+                        prior_queue_classification["classification"],
+                        reason="verified_existing_queue_row",
+                        status=prior_queue_classification["status"],
+                    )
+                elif vid in done_v_ids:
+                    status = str(output_status_by_vid.get(vid, "") or "").strip()
+                    classification = _coverage_classification_for_status(
+                        status, already_processed=True,
+                    )
+                    coverage_ledger.classify(
+                        coverage_item_id, classification,
+                        reason="verified_output_df_status", status=status,
+                    )
+                    if classification == "unresolved":
+                        channel_cursor_safe = False
+                else:
+                    coverage_ledger.classify(
+                        coverage_item_id, "unresolved",
+                        reason="cursor_filtered_without_durable_record",
+                    )
+                    channel_cursor_safe = False
                 continue
 
             if not discovered_dt_max or pub_dt > discovered_dt_max:
                 discovered_dt_max = pub_dt
 
-            vid = str(e.get("video_id") or "").strip()
-            if not vid:
-                continue
-            if vid in seen_discovery_ids:
-                continue
-            seen_discovery_ids.add(vid)
             if vid in done_v_ids:
                 retry_unpublished = (
                     cid in channel_requeue_unpublished
@@ -1040,13 +1486,32 @@ def build_queue_and_get_candidates(
                 )
                 retry_live_replay = output_status_by_vid.get(vid, "") == LIVE_SCHEDULED_STATUS
                 if not retry_unpublished and not retry_live_replay:
+                    if vid not in queue_video_ids:
+                        status = str(output_status_by_vid.get(vid, "") or "").strip()
+                        classification = _coverage_classification_for_status(
+                            status, already_processed=True,
+                        )
+                        coverage_ledger.classify_video_id(
+                            vid, classification, reason="verified_output_df_status", status=status,
+                        )
+                        if classification == "unresolved":
+                            channel_cursor_safe = False
                     continue
             if vid in queue_video_ids:
                 continue
+            if coverage_ledger._item(coverage_item_id)["anomaly"]:
+                continue
             filtered_entries.append(e)
 
-        if discovered_dt_max and (not last_discovered_s or discovered_dt_max > (_parse_iso_date(last_discovered_s) or datetime.min)):
-            ch["last_discovered_published_at"] = discovered_dt_max.strftime("%Y-%m-%dT%H:%M:%SZ")
+        if not channel_cursor_safe and discovery_report is not None:
+            blocked = discovery_report.setdefault("cursor_blocked_channels", [])
+            if cid not in blocked:
+                blocked.append(cid)
+
+        if channel_cursor_safe and discovered_dt_max and (
+            not last_discovered_s or discovered_dt_max > (_parse_iso_date(last_discovered_s) or datetime.min)
+        ):
+            discovered_cursor_updates[cid] = discovered_dt_max.strftime("%Y-%m-%dT%H:%M:%SZ")
 
         if not filtered_entries:
             logger.info("channel_crawl:   accepted 0 videos after dedupe/date/output filters for cid=%s", cid)
@@ -1143,17 +1608,16 @@ def build_queue_and_get_candidates(
             cid,
         )
 
-    # persist channel cursor updates
-    save_channel_df(base_path, channels)
-
     if discovered_rows:
         add_df = pd.DataFrame(discovered_rows)
         queue_df = pd.concat([queue_df, add_df], ignore_index=True)
 
     # Final queue dedupe by video_id (keep first discovered row)
     if len(queue_df) > 0:
-        queue_df["video_id"] = queue_df["video_id"].astype(str).str.strip()
-        queue_df = queue_df[queue_df["video_id"] != ""]
+        queue_df["video_id"] = queue_df["video_id"].map(coverage_ledger.normalize_video_id)
+        queue_df = queue_df[queue_df["video_id"].map(
+            lambda value: bool(VIDEO_ID_PATTERN.fullmatch(value))
+        )]
         queue_df = queue_df.drop_duplicates(subset=["video_id"], keep="first")
         # Backfill usage_channel for rows with empty (from channel_df by channel_id)
         if "usage_channel" not in queue_df.columns:
@@ -1181,11 +1645,78 @@ def build_queue_and_get_candidates(
         known = q_cids.isin(cid_to_obsidian.keys())
         queue_df["obsidian"] = queue_df["obsidian"].where(~known, q_cids.map(cid_to_obsidian)).fillna("")
 
-    save_crawl_queue_df(base_path, queue_df)
+    queue_persisted = False
+    cursors_persisted = False
+    queue_save_error = None
+    try:
+        # The queue is the durable record of discovered sources. Commit and
+        # read it back before moving the discovery cursor past those sources.
+        save_crawl_queue_df(base_path, queue_df)
+        persisted_queue = load_crawl_queue_df(base_path)
+        expected_ids = set(queue_df["video_id"].astype(str).str.strip()) if len(queue_df) else set()
+        persisted_ids = (
+            set(persisted_queue["video_id"].astype(str).str.strip())
+            if persisted_queue is not None and len(persisted_queue) and "video_id" in persisted_queue.columns
+            else set()
+        )
+        if persisted_ids != expected_ids:
+            raise RuntimeError(
+                f"crawl queue readback mismatch: expected {len(expected_ids)} video IDs, "
+                f"read {len(persisted_ids)}"
+            )
+        queue_persisted = True
+    except Exception as exc:
+        queue_save_error = exc
+        logger.warning("channel_crawl: queue persistence/readback failed; discovery cursors not advanced: %s: %s",
+                       type(exc).__name__, exc)
+
+    if queue_persisted:
+        for ch in channels:
+            cid = str(ch.get("channel_id") or "").strip()
+            if cid in discovered_cursor_updates:
+                ch["last_discovered_published_at"] = discovered_cursor_updates[cid]
+        try:
+            # This save intentionally follows the verified queue commit. If the
+            # process stops before or during this write, the next run safely
+            # rediscovers and deduplicates the already-persisted queue rows.
+            save_channel_df(base_path, channels)
+            cursors_persisted = True
+        except Exception as exc:
+            logger.warning("channel_crawl: channel cursor save failed after queue commit: %s: %s",
+                           type(exc).__name__, exc)
+            queue_save_error = exc
+
+    discovery_complete = False
+    if discovery_report is not None:
+        discovery_report["queue_persisted"] = queue_persisted
+        discovery_report["cursors_persisted"] = cursors_persisted
+        if not queue_persisted or not cursors_persisted:
+            discovery_report["queue_persistence_error"] = (
+                f"{type(queue_save_error).__name__}: {queue_save_error}"
+                if queue_save_error else "queue or cursor persistence did not complete"
+            )
+            for cid in discovered_cursor_updates:
+                if cid not in discovery_report["channels_failed"]:
+                    discovery_report["channels_failed"].append(cid)
+                if cid not in discovery_report["cursor_blocked_channels"]:
+                    discovery_report["cursor_blocked_channels"].append(cid)
+            discovery_complete = False
+        else:
+            discovery_report["queue_persisted"] = True
+            discovery_complete = bool(
+                discovery_report.get("channel_count", 0) > 0 and
+                discovery_report.get("channels_succeeded", 0) == discovery_report.get("channel_count", 0) and
+                not discovery_report.get("channels_failed") and
+                int(discovery_report.get("channel_unresolved", 0)) == 0
+            )
+        discovery_report["discovery_complete"] = discovery_complete
 
     candidates_df = select_process_candidates(
         queue_df, max_retries, config.get("LIVE_RETRY_MIN_INTERVAL_MIN", 60)
     )
+    if discovery_report is not None:
+        _sync_coverage_report(discovery_report)
+        discovery_report["complete"] = bool(discovery_complete and coverage_ledger.is_complete())
     logger.info(
         "channel_crawl: queue persisted. total=%d, candidates=%d",
         len(queue_df),
@@ -1205,6 +1736,137 @@ def build_queue_and_get_candidates(
                 r.get("retry_count", 0),
             )
     return queue_df, candidates_df, shorts_rows_for_output_df
+
+
+def _coverage_ledger_for_report(report: Dict[str, Any]) -> BatchCoverageLedger:
+    ledger = report.get("coverage_ledger")
+    if not isinstance(ledger, BatchCoverageLedger):
+        ledger = BatchCoverageLedger()
+        report["coverage_ledger"] = ledger
+    return ledger
+
+
+def _declare_inventory_queue_rows(report: Dict[str, Any], queue_df) -> None:
+    """Declare every raw queue row before reconciliation, cleanup, or dedupe."""
+    ledger = _coverage_ledger_for_report(report)
+    if report.get("_queue_scope_declared"):
+        return
+    seen = set()
+    if queue_df is not None and len(queue_df) > 0:
+        for row_index, row in queue_df.iterrows():
+            video_id = ledger.normalize_video_id(row.get("video_id"))
+            anomaly = ""
+            duplicate = bool(video_id and VIDEO_ID_PATTERN.fullmatch(video_id) and video_id in seen)
+            if duplicate:
+                anomaly = "duplicate_queue_video_id"
+            elif video_id and VIDEO_ID_PATTERN.fullmatch(video_id):
+                seen.add(video_id)
+            elif not video_id:
+                anomaly = "blank_queue_video_id"
+            else:
+                anomaly = "malformed_queue_video_id"
+            ledger.declare(
+                "queue", video_id, row_index=row_index, anomaly=anomaly,
+                anomaly_is_extra_unresolved=duplicate,
+            )
+    report["_queue_scope_declared"] = True
+    _sync_coverage_report(report)
+
+
+def _add_channel_unresolved(report: Dict[str, Any], count: int = 1) -> None:
+    count = max(0, int(count or 0))
+    if not count:
+        return
+    report["channel_unresolved"] = int(report.get("channel_unresolved", 0) or 0) + count
+    report["unresolved"] = int(report.get("unresolved", 0) or 0) + count
+
+
+def _sync_coverage_report(report: Dict[str, Any]) -> None:
+    """Publish monotonic ledger counters and union scope without replacing evidence."""
+    ledger = _coverage_ledger_for_report(report)
+    report["coverage_anomalies"] = max(
+        int(report.get("coverage_anomalies", 0) or 0), ledger.anomaly_count,
+    )
+    report["coverage_unresolved"] = max(
+        int(report.get("coverage_unresolved", 0) or 0), ledger.unresolved_count,
+    )
+    report["queue_scope_unresolved"] = max(
+        int(report.get("queue_scope_unresolved", 0) or 0), ledger.extra_unresolved(),
+    )
+    report["unresolved"] = max(
+        int(report.get("unresolved", 0) or 0),
+        int(report.get("channel_unresolved", 0) or 0) + ledger.unresolved_count,
+    )
+    report["coverage_pending"] = ledger.pending_count()
+    report["coverage_complete"] = ledger.is_complete()
+    existing_ids = set(report.get("queue_scope_video_ids") or ())
+    existing_ids.update(ledger.scoped_video_ids())
+    report["queue_scope_video_ids"] = sorted(existing_ids)
+    existing_outcomes = dict(report.get("queue_scope_outcomes") or {})
+    retry_exhausted = set(report.get("retry_exhausted_video_ids") or ())
+    for item in ledger.items:
+        video_id = item["video_id"]
+        if not item["in_scope"] or not VIDEO_ID_PATTERN.fullmatch(video_id):
+            continue
+        status = item.get("status") or ""
+        if status:
+            existing_outcomes[video_id] = status
+            if status == "retry_exhausted":
+                retry_exhausted.add(video_id)
+        elif item["classification"] == "failed" and item.get("reason") == "retry_exhausted":
+            existing_outcomes[video_id] = "retry_exhausted"
+            retry_exhausted.add(video_id)
+    report["queue_scope_outcomes"] = existing_outcomes
+    report["retry_exhausted_video_ids"] = sorted(retry_exhausted)
+
+
+def _record_inventory_queue_scope(
+    report: Dict[str, Any], queue_df, max_retries: int, output_df=None,
+) -> None:
+    """Classify queue declarations from reconciled queue and durable output state."""
+    ledger = _coverage_ledger_for_report(report)
+    _declare_inventory_queue_rows(report, queue_df)
+    output_status_by_vid = {}
+    if output_df is not None and {"v_id", "status"}.issubset(getattr(output_df, "columns", ())):
+        output_ids = output_df["v_id"].map(ledger.normalize_video_id)
+        output_status_by_vid = dict(zip(output_ids, output_df["status"]))
+    if queue_df is not None and len(queue_df) > 0:
+        def _retry_count(value):
+            try:
+                return max(0, int(float(value)))
+            except (TypeError, ValueError, OverflowError):
+                return 0
+
+        for row_index, row in queue_df.iterrows():
+            video_id = ledger.normalize_video_id(row.get("video_id"))
+            if not VIDEO_ID_PATTERN.fullmatch(video_id):
+                continue
+            state = str(row.get("status") or "").strip().casefold()
+            status = ""
+            if state == "done":
+                status = str(output_status_by_vid.get(video_id, "") or "").strip()
+                if not status:
+                    status = "unresolved"
+            elif state == "failed" and _retry_count(row.get("retry_count")) >= max_retries:
+                status = "retry_exhausted"
+            elif state in {
+                "success", "already_existed", "oversized_file", SHORTS_STATUS, "short",
+                VIDEO_UNAVAILABLE_STATUS, SKIPPED_AUTO_SUBS_ONLY_STATUS,
+            }:
+                status = state
+            elif state not in {"queued", "failed"}:
+                status = state or "unresolved"
+            if not status:
+                continue
+            classification = _coverage_classification_for_status(
+                status, already_processed=(state == "done"),
+            )
+            ledger.classify_source_row(
+                "queue", row_index, classification,
+                reason=("retry_exhausted" if status == "retry_exhausted" else "queue_output_status"),
+                status=status,
+            )
+    _sync_coverage_report(report)
 
 
 def update_channel_last_processed(

@@ -80,6 +80,7 @@ from preprocess_backend import create_transcript_preprocessor, TranscriptPreproc
 from llm_responses import call_responses, ResponsesCallError
 from runtime_resources import device_compute_route, get_device_semaphore
 from p03_state_backup import backup_state
+from scripts.drive_yt_summary.manifest import build_inventory_record, reconcile_inventory_scope, utc_now_iso
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -818,9 +819,9 @@ def load_dataframes(data_root: str) -> Tuple[pd.DataFrame, pd.DataFrame]:
         
         logger.info(f"Loading input dataframe: {input_df_path}")
         input_df = _read_csv_with_retry(input_df_path, encoding='cp949')
-        
-        if 'url' not in input_df.columns:
-            error_msg = "Input dataframe must have 'url' column"
+        missing = sorted({"url", "date"} - set(input_df.columns))
+        if missing:
+            error_msg = f"Input dataframe missing required columns: {', '.join(missing)}"
             logger.error(f"[ERROR] ValueError - {error_msg}")
             logger.error(f"  Columns found: {list(input_df.columns)}")
             raise ValueError(error_msg)
@@ -844,6 +845,9 @@ def load_dataframes(data_root: str) -> Tuple[pd.DataFrame, pd.DataFrame]:
         if os.path.exists(output_df_path):
             logger.info(f"Loading output dataframe: {output_df_path}")
             output_df = _read_csv_with_retry(output_df_path)
+            _validate_inventory_state_columns(
+                output_df, {"date", "url", "v_id", "status"}, "output_df", output_df_path
+            )
             logger.info(f"  Loaded {len(output_df)} existing records")
         else:
             logger.info(f"Output file not found, creating new: {output_df_path}")
@@ -922,6 +926,9 @@ def load_output_df_only(data_root: str) -> pd.DataFrame:
     output_df_path = os.path.join(data_root, 'output_df_new.csv')
     if os.path.exists(output_df_path):
         output_df = _read_csv_with_retry(output_df_path)
+        _validate_inventory_state_columns(
+            output_df, {"date", "url", "v_id", "status"}, "output_df", output_df_path
+        )
         logger.info(f"Loaded output dataframe: {output_df_path} ({len(output_df)} records)")
     else:
         output_df = pd.DataFrame(columns=['date', 'url', 'v_id', 'status'])
@@ -944,19 +951,30 @@ def get_url_list(input_df: pd.DataFrame, output_df: pd.DataFrame) -> List[str]:
 def get_input_urls_for_channel_crawl(data_root: str, output_df: pd.DataFrame) -> List[str]:
     """
     When CHANNEL_CRAWL=true: load input_df.csv if present and return URLs not yet in output_df.
-    Returns [] if input_df.csv missing or invalid (so channel-only mode is unchanged).
+    Returns [] if input_df.csv contains no rows. Missing/read/schema failures propagate
+    because they leave the manual portion of discovery scope unknown.
     """
     input_df_path = os.path.join(data_root, 'input_df.csv')
     if not os.path.exists(input_df_path):
-        return []
+        raise channel_crawl.CoverageStateReadError(
+            "input_df", input_df_path, FileNotFoundError("state file is missing")
+        )
     try:
         input_df = _read_csv_with_retry(input_df_path, encoding='cp949')
-        if input_df.empty or 'url' not in input_df.columns:
+        _validate_inventory_state_columns(input_df, {"url", "date"}, "input_df", input_df_path)
+        if input_df.empty:
             return []
         return get_url_list(input_df, output_df)
     except Exception as e:
-        logger.warning("Channel crawl: could not load input_df for merge (%s). Using channel URLs only.", e)
-        return []
+        raise channel_crawl.CoverageStateReadError("input_df", input_df_path, e) from e
+
+
+def _validate_inventory_state_columns(frame, required_columns, state_name: str, path: str) -> None:
+    """Reject padded or partial CSV headers before they can shrink inventory scope."""
+    missing = sorted(set(required_columns) - set(getattr(frame, "columns", ())))
+    if missing:
+        cause = ValueError(f"{state_name} missing required columns: {', '.join(missing)}")
+        raise channel_crawl.CoverageStateReadError(state_name, path, cause) from cause
 
 # Prompt templates
 def build_token_query(retention_min: int, retention_max: int, *, auto_subs: bool = False) -> str:
@@ -1999,19 +2017,199 @@ def process_videos(config: dict):
     # Load configuration
     base_path = config['BASE_PATH']
     data_root = config['DATA_ROOT']
+    run_id = datetime.now().strftime("%Y%m%d%H%M%S") + "-" + uuid.uuid4().hex[:8]
+    inventory_coverage_ledger = channel_crawl.BatchCoverageLedger()
+    run_started_at = utc_now_iso()
+    api_backend = os.getenv(
+        "P03_DRIVE_BACKEND", "api" if sys.platform.startswith("linux") else "desktop"
+    ).strip().lower() == "api"
+    inventory_sink = None
+    inventory_start_written = False
+    inventory_cutoff = None
+    inventory_counts = {"unresolved": 0}
+    inventory_incomplete_reasons = set()
+
+    def _mark_inventory_incomplete(reason):
+        reason = str(reason or "").strip()
+        if reason and reason not in inventory_incomplete_reasons:
+            inventory_incomplete_reasons.add(reason)
+            inventory_counts["unresolved"] += 1
+
+    def _mark_discovery_state_failure(reason):
+        _mark_inventory_incomplete(reason)
+        inventory_discovery["complete"] = False
+        inventory_discovery["discovery_complete"] = False
+
+    # Missing files are not empty-state evidence. Continue where possible so
+    # the run can recover, but preserve the missing source as an incomplete
+    # coverage reason. Existing files are validated by their typed readers.
+    state_paths = {
+        "input_df": os.path.join(data_root, "input_df.csv"),
+        "output_df": os.path.join(data_root, "output_df_new.csv"),
+        "manual_ledger": os.path.join(data_root, "manual_input_status.csv"),
+    }
+    if config.get("CHANNEL_CRAWL"):
+        state_paths.update({
+            "channel_df": os.path.join(data_root, channel_crawl.CHANNEL_DF_FILENAME),
+            "crawl_queue": os.path.join(data_root, channel_crawl.CRAWL_QUEUE_FILENAME),
+        })
+    for state_name, state_path in state_paths.items():
+        if not os.path.isfile(state_path):
+            _mark_inventory_incomplete(f"{state_name}_missing")
+
+    if api_backend:
+        try:
+            inventory_cutoff = (channel_crawl.inventory_cutoff_snapshot(data_root, config)
+                                if config.get("CHANNEL_CRAWL") else {
+                                    "mode": "manual_selection",
+                                    "manual_since": (os.getenv("P03_MANUAL_SINCE") or "").strip() or None,
+                                    "sheet_import_since": (os.getenv("P03_SHEET_IMPORT_SINCE") or "").strip() or None,
+                                    "selected_max": config.get("MAX_VIDEOS"),
+                                })
+        except Exception as exc:
+            inventory_cutoff = {"mode": "unavailable"}
+            logger.warning("Could not snapshot the inventory discovery cutoff: %s: %s",
+                           type(exc).__name__, exc)
+            _mark_inventory_incomplete("discovery_cutoff_read_failed")
+        try:
+            inventory_sink = config.get("DRIVE_API_SINK")
+            if inventory_sink is None:
+                from drive_api_sink import DriveApiSink
+                inventory_sink = DriveApiSink()
+                config["DRIVE_API_SINK"] = inventory_sink
+            if callable(getattr(inventory_sink, "write_inventory", None)):
+                provisional_inventory = build_inventory_record(
+                    producer_run_id=run_id,
+                    coverage_started_at=run_started_at,
+                    cutoff=inventory_cutoff,
+                    discovery_complete=False,
+                    completed=False,
+                    manifest_readback_verified=False,
+                    all_successes_present=False,
+                )
+                stored = inventory_sink.write_inventory(provisional_inventory, start=True)
+                inventory_start_written = True
+                logger.info("Started incomplete canonical manifest inventory run %s (revision=%s)",
+                            run_id, stored.get("inventory_revision"))
+        except Exception as exc:
+            logger.error("Could not start canonical manifest inventory coverage: %s: %s",
+                         type(exc).__name__, exc)
+            _mark_inventory_incomplete("inventory_start_write_failed")
+
+    def _finish_manifest_inventory(*, completed, counts, discovery_report):
+        coverage_ledger = (discovery_report or {}).get("coverage_ledger")
+        if isinstance(coverage_ledger, channel_crawl.BatchCoverageLedger):
+            coverage_ledger.classify_pending_as_unresolved()
+            channel_crawl._sync_coverage_report(discovery_report)
+            discovery_complete = bool(discovery_report.get(
+                "discovery_complete", discovery_report.get("complete"),
+            ))
+            discovery_report["complete"] = bool(
+                discovery_complete and coverage_ledger.is_complete()
+            )
+        else:
+            discovery_complete = bool(discovery_report and discovery_report.get("complete"))
+        if not api_backend or inventory_sink is None or not callable(getattr(inventory_sink, "write_inventory", None)):
+            return
+        cutoff = (discovery_report.get("cutoff") if discovery_report else None)
+        scope_ids = set(inventory_scope_video_ids)
+        outcomes = dict((discovery_report or {}).get("queue_scope_outcomes") or {})
+        outcomes.update(inventory_outcomes)
+        if discovery_report:
+            scope_ids.update(discovery_report.get("queue_scope_video_ids") or ())
+            for video_id in discovery_report.get("retry_exhausted_video_ids") or ():
+                outcomes.setdefault(str(video_id), "retry_exhausted")
+        reconciled = reconcile_inventory_scope(
+            scope_ids,
+            outcomes,
+            extra_unresolved=(
+                int(counts.get("unresolved", 0)) +
+                int((discovery_report or {}).get("channel_unresolved", 0)) +
+                int((discovery_report or {}).get("queue_scope_unresolved", 0))
+            ),
+        )
+        final_counts = {key: reconciled[key] for key in ("succeeded", "failed", "unresolved")}
+        incomplete_reasons = set(inventory_incomplete_reasons)
+        if not reconciled.get("count_partition_verified"):
+            incomplete_reasons.add("inventory_count_partition_failed")
+        if not discovery_complete:
+            incomplete_reasons.add("channel_discovery_incomplete")
+        if final_counts["failed"]:
+            incomplete_reasons.add("source_processing_failed")
+        if final_counts["unresolved"] and not incomplete_reasons:
+            incomplete_reasons.add("unresolved_source_coverage")
+        record = build_inventory_record(
+            producer_run_id=run_id,
+            coverage_started_at=run_started_at,
+            cutoff=cutoff,
+            succeeded=final_counts["succeeded"],
+            failed=final_counts["failed"],
+            unresolved=final_counts["unresolved"],
+            scope_count=reconciled["scope_count"],
+            manifest_succeeded=reconciled["manifest_succeeded"],
+            coverage_state_valid=(
+                not inventory_incomplete_reasons and
+                (not isinstance(coverage_ledger, channel_crawl.BatchCoverageLedger)
+                 or coverage_ledger.is_complete())
+            ),
+            count_partition_verified=reconciled.get("count_partition_verified", False),
+            discovery_complete=discovery_complete,
+            all_successes_present=False,
+            manifest_readback_verified=False,
+            completed=completed,
+            now=utc_now_iso() if completed else None,
+        )
+        record["incomplete_reason"] = "; ".join(sorted(incomplete_reasons)) or None
+        record["source_counts"]["terminal_skipped"] = reconciled["terminal_skipped"]
+        try:
+            stored = inventory_sink.write_inventory(
+                record,
+                start=not inventory_start_written,
+                success_video_ids=reconciled["success_video_ids"],
+            )
+            logger.info("Canonical manifest inventory coverage: complete=%s discovery_complete=%s "
+                        "succeeded=%s failed=%s unresolved=%s revision=%s",
+                        stored.get("inventory_complete"), stored.get("discovery_complete"),
+                        (stored.get("source_counts") or {}).get("succeeded"),
+                        (stored.get("source_counts") or {}).get("failed"),
+                        (stored.get("source_counts") or {}).get("unresolved"),
+                        stored.get("inventory_revision"))
+        except Exception as exc:
+            logger.error("Canonical manifest inventory coverage write failed: %s: %s",
+                         type(exc).__name__, exc)
+
+    inventory_discovery = {
+        "enabled": bool(config.get("CHANNEL_CRAWL")),
+        # No channel discovery is required for a manual-only selected scope.
+        "complete": not bool(config.get("CHANNEL_CRAWL")),
+        "discovery_complete": not bool(config.get("CHANNEL_CRAWL")),
+        "unresolved": 0,
+        "cutoff": inventory_cutoff,
+        "queue_scope_video_ids": [],
+        "queue_scope_outcomes": {},
+        "retry_exhausted_video_ids": [],
+        "queue_scope_unresolved": 0,
+        "coverage_ledger": inventory_coverage_ledger,
+        "_coverage_ledger_created_at_batch": True,
+    }
+    inventory_scope_video_ids = set()
+    inventory_outcomes = {}
     if os.getenv("P03_SHEET_IMPORT_ENABLED", "0").strip() == "1":
         since = (os.getenv("P03_SHEET_IMPORT_SINCE") or "").strip()
         if not import_manual_urls_from_sheet._valid_date(since):
             logger.warning("Manual Google Sheet import skipped: P03_SHEET_IMPORT_SINCE must be a valid YYYY-MM-DD date")
+            _mark_inventory_incomplete("sheet_import_cutoff_invalid")
         else:
             sa_key = (os.getenv("P03_GOOGLE_SA_JSON") or "").strip()
             if not sa_key or not os.path.isfile(sa_key):
                 logger.warning("Manual Google Sheet import skipped: P03_GOOGLE_SA_JSON key file is missing")
+                _mark_inventory_incomplete("sheet_import_credentials_unavailable")
             else:
                 try:
                     import_manual_urls_from_sheet.import_from_sheet(data_root, since=since)
                 except Exception as exc:
                     logger.warning("Manual Google Sheet import failed; continuing batch: %s: %s", type(exc).__name__, exc)
+                    _mark_inventory_incomplete("sheet_import_failed")
     work_path = config.get('WORK_PATH') or base_path
     if work_path != base_path:
         logger.info("WORK_PATH set: audio, yt_subs, and prompt/logs use local path (iCloud sync avoided): %s", work_path)
@@ -2063,7 +2261,14 @@ def process_videos(config: dict):
     crawl_queue_df = None
     shorts_recorded_count = 0
     if config.get('CHANNEL_CRAWL'):
-        output_df = load_output_df_only(data_root)
+        try:
+            output_df = load_output_df_only(data_root)
+        except Exception as exc:
+            logger.warning("Could not read output_df state for channel coverage: %s", exc)
+            _mark_discovery_state_failure("output_df_read_failed")
+            _finish_manifest_inventory(completed=False, counts=inventory_counts,
+                                       discovery_report=inventory_discovery)
+            raise
         logger.info("Channel crawl: building persistent queue from channel_df.csv...")
         try:
             crawl_queue_df, candidate_df, shorts_rows = channel_crawl.build_queue_and_get_candidates(
@@ -2071,6 +2276,7 @@ def process_videos(config: dict):
                 config,
                 output_df,
                 has_drive_canonical=lambda vid: _has_drive_canonical_for_video(vid, config, base_path),
+                discovery_report=inventory_discovery,
             )
             if shorts_rows:
                 shorts_df = pd.DataFrame(shorts_rows)
@@ -2083,6 +2289,15 @@ def process_videos(config: dict):
                         shorts_recorded_count = len(shorts_df)
                         output_df = pd.concat([output_df, shorts_df], ignore_index=True)
                         _save_output_df_with_retry(output_df, output_df_path)
+                        for video_id in shorts_df["v_id"].astype(str).str.strip():
+                            if not video_id:
+                                continue
+                            inventory_scope_video_ids.add(video_id)
+                            inventory_outcomes[video_id] = channel_crawl.SHORTS_STATUS
+                            inventory_coverage_ledger.classify_video_id(
+                                video_id, "success-verified", reason="shorts_output_persisted",
+                                status=channel_crawl.SHORTS_STATUS,
+                            )
                         logger.info(
                             "Channel crawl: recorded %d shorts as status=%s to output_df",
                             len(shorts_df),
@@ -2110,6 +2325,24 @@ def process_videos(config: dict):
             # ValueError/UnicodeError 계열 메시지 출력
             error_msg = str(e) if e else "Configuration error"
             logger.error("[ERROR] Channel crawl config: %s", error_msg)
+            _finish_manifest_inventory(
+                completed=False,
+                counts=inventory_counts,
+                discovery_report=inventory_discovery,
+            )
+            return
+        except Exception as e:
+            state_name = getattr(e, "state_name", "channel_discovery")
+            reason = f"{state_name}_read_failed" if state_name.endswith("df") or state_name in {
+                "crawl_queue", "input_df"
+            } else "channel_discovery_failed"
+            logger.error("Channel crawl state/discovery failed: %s: %s", type(e).__name__, e)
+            _mark_discovery_state_failure(reason)
+            _finish_manifest_inventory(
+                completed=False,
+                counts=inventory_counts,
+                discovery_report=inventory_discovery,
+            )
             return
         logger.info(f"Channel crawl: queue selection completed. {len(url_list)} candidate videos")
         if url_list:
@@ -2118,13 +2351,40 @@ def process_videos(config: dict):
             for i in range(preview_n):
                 logger.info("  [%d] %s", i + 1, url_list[i])
     else:
-        input_df, output_df = load_dataframes(data_root)
+        try:
+            input_df, output_df = load_dataframes(data_root)
+        except Exception:
+            _mark_inventory_incomplete("manual_input_read_failed")
+            _finish_manifest_inventory(
+                completed=False,
+                counts=inventory_counts,
+                discovery_report=inventory_discovery,
+            )
+            raise
         url_list = []
 
     # Manual input_df URLs are canonicalized and merged by video ID in both run modes.
     # Channel candidates win so their discovered metadata and policies are retained.
     manual_ledger_path = os.path.join(data_root, "manual_input_status.csv")
-    manual_ledger = manual_video_input.read_ledger(manual_ledger_path)
+    try:
+        manual_ledger = manual_video_input.read_ledger(manual_ledger_path, require_schema=True)
+    except Exception:
+        _mark_inventory_incomplete("manual_ledger_read_failed")
+        _finish_manifest_inventory(
+            completed=False,
+            counts=inventory_counts,
+            discovery_report=inventory_discovery,
+        )
+        raise
+    unknown_ledger_statuses = {
+        str(status or "").strip().casefold()
+        for status in manual_ledger.status
+        if str(status or "").strip().casefold() not in
+        {value.casefold() for value in manual_video_input.LEDGER_STATUSES}
+    }
+    if unknown_ledger_statuses:
+        logger.warning("Manual ledger contains unknown statuses: %s", sorted(unknown_ledger_statuses))
+        _mark_inventory_incomplete("manual_ledger_unknown_status")
 
     def _writeback_manual_sheet() -> None:
         current = None
@@ -2159,14 +2419,17 @@ def process_videos(config: dict):
         manual_video_input.save_ledger(manual_ledger, manual_ledger_path)
     except Exception as retry_setup_exc:
         logger.warning("Manual pending Drive retry unavailable: %s", retry_setup_exc)
+        _mark_inventory_incomplete("manual_pending_drive_state_unavailable")
     input_path = os.path.join(data_root, "input_df.csv")
     manual_rows = []
     manual_df = pd.DataFrame(columns=["url", "date"])
     if os.path.exists(input_path):
         try:
             manual_df = _read_csv_with_retry(input_path, encoding="cp949")
+            _validate_inventory_state_columns(manual_df, {"url", "date"}, "input_df", input_path)
         except Exception as exc:
             logger.warning("Could not load manual input URLs: %s", exc)
+            _mark_inventory_incomplete("manual_input_read_failed")
     cutoff = (os.getenv("P03_MANUAL_SINCE") or "").strip()
     if not cutoff or not import_manual_urls_from_sheet._valid_date(cutoff):
         logger.warning("P03_MANUAL_SINCE is unset or invalid; manual queue admits only sheet-imported rows marked %s", manual_video_input.IMPORTER_MARKER_COLUMN)
@@ -2177,6 +2440,8 @@ def process_videos(config: dict):
     except ValueError:
         logger.warning("Invalid P03_MANUAL_MAX; using default 5")
         manual_max = 5
+    inventory_cutoff = {**(inventory_cutoff or {}), "manual_max": manual_max}
+    inventory_discovery["cutoff"] = inventory_cutoff
     manual_ledger = manual_video_input.skip_historical_processing(
         manual_ledger, manual_df, cutoff)
     terminal_manual_ids = manual_video_input.terminal_manual_ids(
@@ -2185,6 +2450,9 @@ def process_videos(config: dict):
         data_root, manual_df, cutoff, manual_max, output_df, manual_ledger,
         exclude_ids=terminal_manual_ids, return_processed=True)
     if processed_video_ids is None:
+        # The admission scope is unknown. Preserve the failure in inventory
+        # coverage instead of turning an unreadable source set into an empty set.
+        _mark_inventory_incomplete("manual_processed_state_read_failed")
         processed_video_ids = set()
     historical_records = [
         (str(row.get("video_id", "")), "skipped_historical", "skipped_historical", str(row.get("model", "")),
@@ -2202,6 +2470,7 @@ def process_videos(config: dict):
                 registry_exc,
             )
             manual_rows = []
+            _mark_inventory_incomplete("manual_historical_state_persist_failed")
     max_manual_retries = int(config.get("CRAWL_QUEUE_MAX_RETRIES", 3) or 3)
     manual_duration_map = {}
     manual_video_channel_ids = {}
@@ -2228,6 +2497,7 @@ def process_videos(config: dict):
                     manual_video_channel_ids[vid] = str(snippet["channelId"])
     except Exception as policy_exc:
         logger.warning("Manual video policy metadata unavailable; applying available metadata only: %s", policy_exc)
+        _mark_inventory_incomplete("manual_policy_metadata_read_failed")
     shorts_threshold = int(float(config.get("FILTERING_SHORTS_MINUTES", 3) or 0) * 60)
     manual_urls, manual_ledger = manual_video_input.prepare_manual_queue(
         manual_rows, url_list, output_df, manual_ledger, max_manual_retries,
@@ -2249,8 +2519,30 @@ def process_videos(config: dict):
         direct_input_set = {url for _, url, _ in manual_urls}
         url_from_input_set = set(direct_input_set)
         logger.info("Added %d canonical manual video URL(s) by video ID", len(manual_urls))
+
+    # Declare the whole discovered/manual pending scope before VIDEO_ID_FILTER or
+    # MAX_VIDEOS can defer some work. Deferred items stay unresolved at finalization.
+    declared_batch_ids = set()
+    for row_index, url in enumerate(url_list):
+        try:
+            video_id = str(stt.extract_youtube_id(url) or "").strip()
+        except (ValueError, TypeError):
+            video_id = ""
+        if video_id:
+            inventory_scope_video_ids.add(video_id)
+        duplicate = bool(video_id and video_id in declared_batch_ids)
+        if video_id:
+            declared_batch_ids.add(video_id)
+        inventory_coverage_ledger.declare(
+            "batch_url", video_id, row_index=row_index,
+            anomaly=("duplicate_batch_video_id" if duplicate else ""),
+            anomaly_is_extra_unresolved=duplicate,
+        )
+    inventory_scope_video_ids.update(str(vid).strip() for vid, _, _ in manual_urls if str(vid).strip())
     
     wanted_video_id = config.get("VIDEO_ID_FILTER")
+    inventory_cutoff = {**(inventory_cutoff or {}), "video_id_filter": wanted_video_id or None}
+    inventory_discovery["cutoff"] = inventory_cutoff
     if wanted_video_id:
         url_list = [u for u in url_list if stt.extract_youtube_id(u) == wanted_video_id]
         if not url_list:
@@ -2261,6 +2553,11 @@ def process_videos(config: dict):
     if not url_list:
         logger.info("No videos to process. All videos have been processed.")
         _writeback_manual_sheet()
+        _finish_manifest_inventory(
+            completed=True,
+            counts=inventory_counts,
+            discovery_report=inventory_discovery,
+        )
         return
 
     _run_batch_cleanup(config, dry_run_legacy=True)
@@ -2335,7 +2632,6 @@ def process_videos(config: dict):
     if disable_tqdm:
         tqdm_kw["disable"] = True
 
-    run_id = datetime.now().strftime("%Y%m%d%H%M%S") + "-" + uuid.uuid4().hex[:8]
     set_pipeline_context(run_id=run_id, worker_id="w0")
     work_path_for_claim = config.get('WORK_PATH') or base_path
     claim_mgr = ClaimManager(work_path_for_claim)
@@ -2404,6 +2700,21 @@ def process_videos(config: dict):
         return claim_vid
 
     api_storage_failure = False
+    def _record_inventory_result(result: VideoProcessResult) -> None:
+        status = str(result.status or "").strip()
+        video_id = str(result.video_id or "").strip()
+        if re.fullmatch(r"[A-Za-z0-9_-]{11}", video_id):
+            inventory_scope_video_ids.add(video_id)
+            inventory_outcomes[video_id] = status
+            classification = channel_crawl._coverage_classification_for_status(
+                status, already_processed=(status.casefold() == "already_existed"),
+            )
+            inventory_coverage_ledger.classify_video_id(
+                video_id, classification, reason="processing_result_persisted", status=status,
+            )
+        else:
+            inventory_counts["unresolved"] += 1
+
     def _finalize_result(result: VideoProcessResult, v_url: str, claim_vid: str, i: int, pbar) -> None:
         nonlocal output_df, crawl_queue_df, consecutive_failures, counter, last_success_time, api_storage_failure
         if result.video_id in {vid for vid, _, _ in manual_urls} and result.status == "success" and not result.metadata_updates.get("drive_verified"):
@@ -2413,6 +2724,7 @@ def process_videos(config: dict):
         state_writer.apply(result)
         output_df = state_writer.get_output_df()
         crawl_queue_df = state_writer.get_crawl_queue_df()
+        _record_inventory_result(result)
         if result.video_id in {vid for vid, _, _ in manual_urls}:
             ledger_status = ""
             ledger_drive_state = ""
@@ -2632,7 +2944,10 @@ def process_videos(config: dict):
 
     if config.get('CHANNEL_CRAWL'):
         try:
-            channel_crawl.update_channel_last_processed_from_queue(data_root, crawl_queue_df)
+            channel_crawl.update_channel_last_processed_from_queue(
+                data_root, crawl_queue_df,
+                exclude_channel_ids=inventory_discovery.get("cursor_blocked_channels", []),
+            )
             logger.info("Updated channel_df.csv last_processed_published_at from crawl queue(done).")
         except Exception as e:
             logger.warning(f"Failed to update channel_df: {e}")
@@ -2763,6 +3078,12 @@ def process_videos(config: dict):
             logger.info(f"\nFailed URLs saved to: {failed_urls_file}")
         except Exception as e:
             logger.warning(f"Failed to save failed URLs file: {str(e)}")
+
+    _finish_manifest_inventory(
+        completed=True,
+        counts=inventory_counts,
+        discovery_report=inventory_discovery,
+    )
 
 def main(argv=None):
     """Main entry point."""
