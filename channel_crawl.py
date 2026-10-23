@@ -1046,6 +1046,7 @@ def build_queue_and_get_candidates(
 
     discovered_rows: List[Dict[str, Any]] = []
     shorts_rows_for_output_df: List[Dict[str, str]] = []
+    discovered_cursor_updates: Dict[str, str] = {}
     now_iso = _now_iso()
 
     for idx, ch in enumerate(channels, start=1):
@@ -1194,7 +1195,7 @@ def build_queue_and_get_candidates(
         if channel_cursor_safe and discovered_dt_max and (
             not last_discovered_s or discovered_dt_max > (_parse_iso_date(last_discovered_s) or datetime.min)
         ):
-            ch["last_discovered_published_at"] = discovered_dt_max.strftime("%Y-%m-%dT%H:%M:%SZ")
+            discovered_cursor_updates[cid] = discovered_dt_max.strftime("%Y-%m-%dT%H:%M:%SZ")
 
         if not filtered_entries:
             logger.info("channel_crawl:   accepted 0 videos after dedupe/date/output filters for cid=%s", cid)
@@ -1291,17 +1292,6 @@ def build_queue_and_get_candidates(
             cid,
         )
 
-    # persist channel cursor updates
-    save_channel_df(base_path, channels)
-
-    if discovery_report is not None:
-        discovery_report["complete"] = bool(
-            discovery_report.get("channel_count", 0) > 0 and
-            discovery_report.get("channels_succeeded", 0) == discovery_report.get("channel_count", 0) and
-            not discovery_report.get("channels_failed") and
-            int(discovery_report.get("unresolved", 0)) == 0
-        )
-
     if discovered_rows:
         add_df = pd.DataFrame(discovered_rows)
         queue_df = pd.concat([queue_df, add_df], ignore_index=True)
@@ -1337,7 +1327,69 @@ def build_queue_and_get_candidates(
         known = q_cids.isin(cid_to_obsidian.keys())
         queue_df["obsidian"] = queue_df["obsidian"].where(~known, q_cids.map(cid_to_obsidian)).fillna("")
 
-    save_crawl_queue_df(base_path, queue_df)
+    queue_persisted = False
+    cursors_persisted = False
+    queue_save_error = None
+    try:
+        # The queue is the durable record of discovered sources. Commit and
+        # read it back before moving the discovery cursor past those sources.
+        save_crawl_queue_df(base_path, queue_df)
+        persisted_queue = load_crawl_queue_df(base_path)
+        expected_ids = set(queue_df["video_id"].astype(str).str.strip()) if len(queue_df) else set()
+        persisted_ids = (
+            set(persisted_queue["video_id"].astype(str).str.strip())
+            if persisted_queue is not None and len(persisted_queue) and "video_id" in persisted_queue.columns
+            else set()
+        )
+        if persisted_ids != expected_ids:
+            raise RuntimeError(
+                f"crawl queue readback mismatch: expected {len(expected_ids)} video IDs, "
+                f"read {len(persisted_ids)}"
+            )
+        queue_persisted = True
+    except Exception as exc:
+        queue_save_error = exc
+        logger.warning("channel_crawl: queue persistence/readback failed; discovery cursors not advanced: %s: %s",
+                       type(exc).__name__, exc)
+
+    if queue_persisted:
+        for ch in channels:
+            cid = str(ch.get("channel_id") or "").strip()
+            if cid in discovered_cursor_updates:
+                ch["last_discovered_published_at"] = discovered_cursor_updates[cid]
+        try:
+            # This save intentionally follows the verified queue commit. If the
+            # process stops before or during this write, the next run safely
+            # rediscovers and deduplicates the already-persisted queue rows.
+            save_channel_df(base_path, channels)
+            cursors_persisted = True
+        except Exception as exc:
+            logger.warning("channel_crawl: channel cursor save failed after queue commit: %s: %s",
+                           type(exc).__name__, exc)
+            queue_save_error = exc
+
+    if discovery_report is not None:
+        discovery_report["queue_persisted"] = queue_persisted
+        discovery_report["cursors_persisted"] = cursors_persisted
+        if not queue_persisted or not cursors_persisted:
+            discovery_report["queue_persistence_error"] = (
+                f"{type(queue_save_error).__name__}: {queue_save_error}"
+                if queue_save_error else "queue or cursor persistence did not complete"
+            )
+            for cid in discovered_cursor_updates:
+                if cid not in discovery_report["channels_failed"]:
+                    discovery_report["channels_failed"].append(cid)
+                if cid not in discovery_report["cursor_blocked_channels"]:
+                    discovery_report["cursor_blocked_channels"].append(cid)
+            discovery_report["complete"] = False
+        else:
+            discovery_report["queue_persisted"] = True
+            discovery_report["complete"] = bool(
+                discovery_report.get("channel_count", 0) > 0 and
+                discovery_report.get("channels_succeeded", 0) == discovery_report.get("channel_count", 0) and
+                not discovery_report.get("channels_failed") and
+                int(discovery_report.get("unresolved", 0)) == 0
+            )
 
     candidates_df = select_process_candidates(
         queue_df, max_retries, config.get("LIVE_RETRY_MIN_INTERVAL_MIN", 60)

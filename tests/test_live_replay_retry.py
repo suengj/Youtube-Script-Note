@@ -218,6 +218,94 @@ def test_incomplete_discovery_preserves_cursor_for_next_run(tmp_path, monkeypatc
     assert "missed00001" in set(second_queue["video_id"].astype(str))
 
 
+def _setup_cursor_recovery_fixture(tmp_path, monkeypatch):
+    channel_id = "UC" + "a" * 22
+    uploads_id = "UU" + "a" * 22
+    old_cursor = "2026-10-20T00:00:00Z"
+    cc.save_channel_df(str(tmp_path), [{
+        "channel_url": f"https://www.youtube.com/channel/{channel_id}",
+        "channel_name": "Channel", "usage_channel": "Channel", "channel_id": channel_id,
+        "uploads_playlist_id": uploads_id,
+        "last_processed_published_at": old_cursor,
+        "last_discovered_published_at": "",
+    }])
+    discovered = [{"video_id": "retry000001", "url": "https://youtu.be/retry000001",
+                   "published_at": "2026-10-23T00:00:00Z"}]
+    calls = []
+
+    def fetch(_key, _cid, uploads_id=None, cursor_dt=None, discovery_status=None):
+        calls.append(cursor_dt)
+        return discovered, "Channel", uploads_id
+
+    monkeypatch.setattr(cc, "fetch_channel_via_api", fetch)
+    config = {"YOUTUBE_API_KEY": "fixture", "FILTERING_SHORTS_MINUTES": 0}
+    output = pd.DataFrame(columns=["v_id", "status"])
+    return channel_id, old_cursor, calls, config, output
+
+
+def test_queue_write_failure_keeps_cursor_and_rediscovers_next_run(tmp_path, monkeypatch):
+    channel_id, old_cursor, calls, config, output = _setup_cursor_recovery_fixture(tmp_path, monkeypatch)
+    real_save_queue = cc.save_crawl_queue_df
+    save_calls = 0
+
+    def fail_first_queue_write(root, queue):
+        nonlocal save_calls
+        save_calls += 1
+        if save_calls == 1:
+            raise OSError("synthetic queue write failure")
+        return real_save_queue(root, queue)
+
+    monkeypatch.setattr(cc, "save_crawl_queue_df", fail_first_queue_write)
+    report = {}
+    first_queue, _, _ = cc.build_queue_and_get_candidates(str(tmp_path), config, output, discovery_report=report)
+
+    assert report["complete"] is False
+    assert report["queue_persisted"] is False
+    assert report["cursor_blocked_channels"] == [channel_id]
+    assert cc.load_channel_df(str(tmp_path))[0]["last_discovered_published_at"] == ""
+    assert len(first_queue) == 1
+
+    second_queue, _, _ = cc.build_queue_and_get_candidates(str(tmp_path), config, output, discovery_report=report)
+
+    assert calls == [cc._parse_iso_date(old_cursor), cc._parse_iso_date(old_cursor)]
+    assert report["complete"] is True
+    assert report["queue_persisted"] is True
+    assert second_queue["video_id"].astype(str).tolist() == ["retry000001"]
+    assert cc.load_channel_df(str(tmp_path))[0]["last_discovered_published_at"] == "2026-10-23T00:00:00Z"
+
+
+def test_interruption_after_queue_commit_rediscovers_and_dedupes(tmp_path, monkeypatch):
+    channel_id, old_cursor, calls, config, output = _setup_cursor_recovery_fixture(tmp_path, monkeypatch)
+    real_save_channel = cc.save_channel_df
+    channel_save_calls = 0
+
+    def interrupt_first_cursor_write(root, channels):
+        nonlocal channel_save_calls
+        channel_save_calls += 1
+        if channel_save_calls == 1:
+            raise RuntimeError("synthetic interruption before cursor save")
+        return real_save_channel(root, channels)
+
+    monkeypatch.setattr(cc, "save_channel_df", interrupt_first_cursor_write)
+    report = {}
+    first_queue, _, _ = cc.build_queue_and_get_candidates(str(tmp_path), config, output, discovery_report=report)
+
+    assert report["complete"] is False
+    assert report["queue_persisted"] is True
+    assert report["cursors_persisted"] is False
+    assert first_queue["video_id"].astype(str).tolist() == ["retry000001"]
+    assert cc.load_crawl_queue_df(str(tmp_path))["video_id"].astype(str).tolist() == ["retry000001"]
+    assert cc.load_channel_df(str(tmp_path))[0]["last_discovered_published_at"] == ""
+
+    second_queue, _, _ = cc.build_queue_and_get_candidates(str(tmp_path), config, output, discovery_report=report)
+
+    assert calls == [cc._parse_iso_date(old_cursor), cc._parse_iso_date(old_cursor)]
+    assert report["complete"] is True
+    assert second_queue["video_id"].astype(str).tolist() == ["retry000001"]
+    assert cc.load_crawl_queue_df(str(tmp_path))["video_id"].astype(str).tolist() == ["retry000001"]
+    assert cc.load_channel_df(str(tmp_path))[0]["last_discovered_published_at"] == "2026-10-23T00:00:00Z"
+
+
 def test_malformed_discovery_id_blocks_both_cursors_until_recovered(tmp_path, monkeypatch):
     channel_id = "UC" + "a" * 22
     uploads_id = "UU" + "a" * 22
