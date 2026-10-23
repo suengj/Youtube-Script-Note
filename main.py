@@ -2017,6 +2017,8 @@ def process_single_video(
 
 def process_videos(config: dict):
     """Main function to process all videos."""
+    run_started_monotonic = time.monotonic()
+    run_budget_seconds = float(os.getenv("P03_RUN_BUDGET_MIN", "100")) * 60
     logger.info("=" * 60)
     logger.info(f"Speech-to-Text v{APP_VERSION} - Starting video processing")
     logger.info("=" * 60)
@@ -2842,9 +2844,25 @@ def process_videos(config: dict):
             clear_video_context()
 
     worker_rr = 0
+    picked_videos = 0
+    budget_stopped = False
+
+    def _stop_for_run_budget(remaining):
+        nonlocal budget_stopped
+        if not budget_stopped and time.monotonic() - run_started_monotonic > run_budget_seconds:
+            budget_stopped = True
+            logger.info("budget reached: processed %d, remaining %d", picked_videos, remaining)
+        return budget_stopped
+
     with tqdm(total=len(url_list), desc="Processing videos", unit="video", **tqdm_kw) as pbar:
         if video_workers <= 1:
-            for i, v_url in enumerate(url_list):
+            next_pos = 0
+            while next_pos < len(url_list):
+                if _stop_for_run_budget(len(url_list) - next_pos):
+                    break
+                i, v_url = next_pos, url_list[next_pos]
+                next_pos += 1
+                picked_videos += 1
                 counter += 1
                 pbar.set_description(f"Processing: {v_url[:50]}...")
                 if consecutive_failures >= max_consecutive_failures:
@@ -2875,11 +2893,15 @@ def process_videos(config: dict):
                     if consecutive_failures >= max_consecutive_failures:
                         download_limiter.set_extended_block(extended_duration * failure_multiplier)
                         consecutive_failures = 0
-                    while submitted < len(url_list) and len(in_flight) < video_workers and not api_storage_failure:
+                    while (submitted < len(url_list) and len(in_flight) < video_workers
+                           and not api_storage_failure and not budget_stopped):
+                        if _stop_for_run_budget(len(url_list) - picked_videos):
+                            break
                         try:
                             i, v_url = next(url_iter2)
                         except StopIteration:
                             break
+                        picked_videos += 1
                         counter += 1
                         video_config = _video_config_for_url(v_url)
                         claim_vid = _claim_vid_for_url(v_url)
