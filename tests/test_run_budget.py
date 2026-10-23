@@ -388,7 +388,16 @@ def test_expired_run_budget_blocks_paid_work_from_all_recovery_paths(tmp_path, m
     assert client.calls == 0
 
 
-def test_chat_completion_retries_transient_500_with_origin_request_count(monkeypatch):
+@pytest.mark.parametrize("entrypoint,args", [
+    ("token_minimizer", ("role", "query", "transcript")),
+    ("response_text_4o", ("role", "query")),
+    ("response_text_o1", ("query",)),
+    ("response_text_o3", ("query",)),
+    ("response_text_o4", ("query",)),
+    ("response_text_5mini", ("query",)),
+    ("response_text_grok", ("role", "query")),
+])
+def test_production_chat_call_sites_keep_origin_main_request_count(monkeypatch, entrypoint, args):
     from types import SimpleNamespace
 
     import run_budget
@@ -406,14 +415,28 @@ def test_chat_completion_retries_transient_500_with_origin_request_count(monkeyp
 
     def create(**_kwargs):
         calls.append(1)
-        if len(calls) == 1:
-            raise HttpError("temporary server error")
-        return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content="ok"))])
+        raise HttpError("persistent server error")
 
     client = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=create)))
-    assert stt.token_minimizer("role", "query", "transcript", client) == "ok"
-    assert len(calls) == 2
-    assert delays == [0.5]
+    with pytest.raises(HttpError):
+        getattr(stt, entrypoint)(*args, client)
+    assert len(calls) == 3
+
+
+def test_production_retry_sites_use_zero_sdk_retries(monkeypatch):
+    """Application retry wrappers must not be multiplied by OpenAI SDK retries."""
+    import inspect
+
+    import main
+    import stt_function_v3 as stt
+
+    assert "max_retries=0" in inspect.getsource(main.initialize_clients)
+    assert "max_retries=0" in inspect.getsource(main._create_llm_provider_client)
+    assert "max_retries=0" in inspect.getsource(main.initialize_clients)
+    # Benchmarks are standalone tools and stay on origin/main call behavior.
+    for path in (ROOT / "benchmarks/llm/runner.py", ROOT / "benchmarks/llm/v5_single_pass.py"):
+        assert "run_budget" not in path.read_text(encoding="utf-8")
+    assert "run_budget.call_with_retries" in inspect.getsource(stt)
 
 
 def test_call_responses_preserves_origin_total_sdk_and_application_attempts(monkeypatch):
