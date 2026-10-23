@@ -12,6 +12,8 @@ from datetime import date, datetime, timezone
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
+from input_df_csv import normalize_input_df_columns
+
 VIDEO_ID_RE = re.compile(r"^[A-Za-z0-9_-]{11}$")
 LEDGER_COLUMNS = ["video_id", "canonical_url", "source_urls", "first_seen_at", "status", "reason", "attempts", "regen_attempts", "last_attempt_at", "done_at", "md_path", "md_sha256", "drive_verified", "model", "sheet_synced", "needs_manual_check"]
 LEDGER_STATUSES = {"new", "processing", "success", "retryable_failed", "pending_quarantine", "unsupported", "skipped_policy", "skipped_historical"}
@@ -127,6 +129,8 @@ def skip_historical_processing(ledger, input_df, cutoff: str | None):
     except ValueError:
         cutoff_date = None
     input_rows = {}
+    if input_df is not None:
+        normalize_input_df_columns(input_df)
     if input_df is not None and "url" in input_df.columns:
         for _, input_row in input_df.iterrows():
             value = input_row.get("url", "")

@@ -56,6 +56,7 @@ import stt_function_v3 as stt
 import channel_crawl
 import manual_video_input
 import processed_video_registry
+from input_df_csv import read_input_df
 from scripts import import_manual_urls_from_sheet
 from filename_utils import fit_filename, parse_note_name, validate_llm_suffix
 import run_lock
@@ -818,7 +819,10 @@ def load_dataframes(data_root: str) -> Tuple[pd.DataFrame, pd.DataFrame]:
             raise FileNotFoundError(error_msg)
         
         logger.info(f"Loading input dataframe: {input_df_path}")
-        input_df = _read_csv_with_retry(input_df_path, encoding='cp949')
+        input_df = read_input_df(
+            input_df_path,
+            read_csv=lambda path, **kwargs: _read_csv_with_retry(path, **kwargs),
+        )
         missing = sorted({"url", "date"} - set(input_df.columns))
         if missing:
             error_msg = f"Input dataframe missing required columns: {', '.join(missing)}"
@@ -837,7 +841,7 @@ def load_dataframes(data_root: str) -> Tuple[pd.DataFrame, pd.DataFrame]:
         raise
     except UnicodeDecodeError as e:
         logger.error(f"[ERROR] UnicodeDecodeError - Encoding issue: {input_df_path}")
-        logger.error(f"  Tried encoding: cp949")
+        logger.error("  Tried encodings: utf-8-sig, cp949")
         logger.error(f"  Solution: Check file encoding or convert to UTF-8")
         raise
     
@@ -960,7 +964,10 @@ def get_input_urls_for_channel_crawl(data_root: str, output_df: pd.DataFrame) ->
             "input_df", input_df_path, FileNotFoundError("state file is missing")
         )
     try:
-        input_df = _read_csv_with_retry(input_df_path, encoding='cp949')
+        input_df = read_input_df(
+            input_df_path,
+            read_csv=lambda path, **kwargs: _read_csv_with_retry(path, **kwargs),
+        )
         _validate_inventory_state_columns(input_df, {"url", "date"}, "input_df", input_df_path)
         if input_df.empty:
             return []
@@ -2425,7 +2432,10 @@ def process_videos(config: dict):
     manual_df = pd.DataFrame(columns=["url", "date"])
     if os.path.exists(input_path):
         try:
-            manual_df = _read_csv_with_retry(input_path, encoding="cp949")
+            manual_df = read_input_df(
+                input_path,
+                read_csv=lambda path, **kwargs: _read_csv_with_retry(path, **kwargs),
+            )
             _validate_inventory_state_columns(manual_df, {"url", "date"}, "input_df", input_path)
         except Exception as exc:
             logger.warning("Could not load manual input URLs: %s", exc)

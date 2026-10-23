@@ -11,7 +11,7 @@ sys.path.insert(0, str(ROOT))
 
 import manual_video_input as mvi  # noqa: E402
 import processed_video_registry as pvr  # noqa: E402
-from scripts.import_manual_urls_from_sheet import import_rows  # noqa: E402
+from scripts.import_manual_urls_from_sheet import import_rows, _read_frame  # noqa: E402
 
 
 def _make_empty_registry(root):
@@ -310,6 +310,34 @@ def test_ineligible_processing_rows_become_terminal_without_attempt_or_success_c
     _, after_queue = mvi.prepare_manual_queue(["https://youtu.be/success0001"], [], pd.DataFrame(), updated,
                                                processed_video_ids={"success0001"})
     pd.testing.assert_series_equal(after_queue[after_queue.video_id == "success0001"].iloc[0], success_before)
+
+
+def test_input_df_utf8_bom_korean_category_skips_historical_processing(tmp_path):
+    path = tmp_path / "input_df.csv"
+    path.write_text(
+        "\ufeff date ,url,category\n2025-01-01,https://youtu.be/oldvideo001,채널 크롤\n",
+        encoding="utf-8-sig",
+    )
+
+    frame, encoding = _read_frame(path)
+    ledger = mvi.read_ledger("/missing/manual.csv")
+    ledger = mvi.upsert_ledger(ledger, video_id="oldvideo001", status="processing", attempted=True)
+    updated = mvi.skip_historical_processing(ledger, frame, "2026-01-01")
+
+    assert encoding == "utf-8-sig"
+    assert "date" in frame.columns
+    assert frame.loc[0, "category"] == "채널 크롤"
+    assert updated.loc[0, "status"] == "skipped_historical"
+
+
+def test_input_df_cp949_fallback_still_reads_korean_category(tmp_path):
+    path = tmp_path / "input_df.csv"
+    path.write_bytes("date,url,category\n2026-10-01,https://youtu.be/newvideo001,수동\n".encode("cp949"))
+
+    frame, encoding = _read_frame(path)
+
+    assert encoding == "cp949"
+    assert frame.loc[0, "category"] == "수동"
 
 
 def test_skipped_historical_is_terminal_even_if_cutoff_moves_and_input_row_reappears():
