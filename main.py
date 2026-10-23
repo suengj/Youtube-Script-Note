@@ -55,6 +55,7 @@ if sys.stderr.encoding != 'utf-8':
 import stt_function_v3 as stt
 import channel_crawl
 import manual_video_input
+import processed_video_registry
 from scripts import import_manual_urls_from_sheet
 from filename_utils import fit_filename, parse_note_name, validate_llm_suffix
 import run_lock
@@ -2144,13 +2145,48 @@ def process_videos(config: dict):
         logger.warning("Manual pending Drive retry unavailable: %s", retry_setup_exc)
     input_path = os.path.join(data_root, "input_df.csv")
     manual_rows = []
+    manual_df = pd.DataFrame(columns=["url", "date"])
     if os.path.exists(input_path):
         try:
             manual_df = _read_csv_with_retry(input_path, encoding="cp949")
-            if "url" in manual_df.columns:
-                manual_rows = [str(u).strip() for u in manual_df["url"].tolist() if str(u).strip()]
         except Exception as exc:
             logger.warning("Could not load manual input URLs: %s", exc)
+    cutoff = (os.getenv("P03_MANUAL_SINCE") or "").strip()
+    if not cutoff or not import_manual_urls_from_sheet._valid_date(cutoff):
+        logger.warning("P03_MANUAL_SINCE is unset or invalid; manual queue admits only sheet-imported rows marked %s", manual_video_input.IMPORTER_MARKER_COLUMN)
+    try:
+        manual_max = int(os.getenv("P03_MANUAL_MAX", "5"))
+        if manual_max < 0:
+            raise ValueError
+    except ValueError:
+        logger.warning("Invalid P03_MANUAL_MAX; using default 5")
+        manual_max = 5
+    manual_rows, _ = manual_video_input.select_manual_input_rows(
+        manual_df, cutoff, manual_max)
+    processed_video_ids = processed_video_registry.processed_ids(
+        os.path.join(data_root, processed_video_registry.REGISTRY_NAME))
+    if processed_video_ids is None:
+        logger.warning("processed_videos.csv is missing; manual queue is fail-closed")
+        manual_rows = []
+        processed_video_ids = set()
+    else:
+        try:
+            sheet_ids = processed_video_registry.read_sheet_marked_ids()
+            processed_video_ids = processed_video_registry.reconcile_sheet_marked(
+                os.path.join(data_root, processed_video_registry.REGISTRY_NAME), sheet_ids)
+        except Exception as exc:
+            logger.warning("Google Sheet processed markers unavailable; using registry-only queue guard: %s", exc)
+    manual_ledger = manual_video_input.skip_historical_processing(
+        manual_ledger, manual_df, cutoff)
+    historical_records = [
+        (str(row.get("video_id", "")), "skipped_historical", "skipped_historical", str(row.get("model", "")),
+         str(row.get("first_seen_at", "")))
+        for _, row in manual_ledger.iterrows()
+        if str(row.get("status", "")) == "skipped_historical"
+    ]
+    if historical_records:
+        processed_video_registry.merge_records(
+            os.path.join(data_root, processed_video_registry.REGISTRY_NAME), historical_records)
     max_manual_retries = int(config.get("CRAWL_QUEUE_MAX_RETRIES", 3) or 3)
     manual_duration_map = {}
     manual_video_channel_ids = {}
@@ -2182,7 +2218,9 @@ def process_videos(config: dict):
         manual_rows, url_list, output_df, manual_ledger, max_manual_retries,
         duration_map=manual_duration_map, shorts_threshold_seconds=shorts_threshold,
         channel_auto_sub_only=manual_channel_auto_sub_only,
-        video_channel_ids=manual_video_channel_ids)
+        video_channel_ids=manual_video_channel_ids,
+        processed_video_ids=processed_video_ids)
+    url_list = manual_video_input.exclude_skipped_historical_urls(url_list, manual_ledger)
     manual_auto_subs_only_ids = {
         vid for vid, channel_id in manual_video_channel_ids.items()
         if manual_channel_auto_sub_only.get(str(channel_id).strip(), False)
@@ -2361,6 +2399,9 @@ def process_videos(config: dict):
         output_df = state_writer.get_output_df()
         crawl_queue_df = state_writer.get_crawl_queue_df()
         if result.video_id in {vid for vid, _, _ in manual_urls}:
+            ledger_status = ""
+            ledger_drive_state = ""
+            ledger_model = str(result.metadata_updates.get("model", ""))
             try:
                 md_path = result.output_md_path or ""
                 md_exists = md_path.startswith("drive-api:") or os.path.isfile(md_path)
@@ -2369,6 +2410,7 @@ def process_videos(config: dict):
                     md_exists=md_exists,
                     drive_disabled=os.getenv("P03_DRIVE_SYNC_ENABLED", "1").strip() == "0",
                     drive_verified=bool(result.metadata_updates.get("drive_verified")))
+                ledger_status, ledger_drive_state = status, drive_state
                 manual_ledger = manual_video_input.read_ledger(manual_ledger_path)
                 manual_ledger = manual_video_input.upsert_ledger(
                     manual_ledger, video_id=result.video_id,
@@ -2380,8 +2422,22 @@ def process_videos(config: dict):
                                if md_path and os.path.isfile(md_path) else ""))
                 manual_video_input.save_ledger(manual_ledger, manual_ledger_path)
             except Exception as ledger_exc:
-                # output_df is already durable; its success row remains the dedupe guard.
+                # Keep the result visible even if manual-specific persistence fails.
                 logger.error("Manual input ledger write failed for %s: %s", result.video_id, ledger_exc)
+            if ledger_status == "success" and ledger_drive_state == "verified":
+                try:
+                    processed_video_registry.record_success(
+                        data_root, result.video_id, source="manual_success", status=ledger_status,
+                        model=ledger_model)
+                except Exception as registry_exc:
+                    logger.error("Processed video registry write failed for %s: %s", result.video_id, registry_exc)
+        elif result.status == "success" and result.video_id and result.video_id != "unknown":
+            try:
+                processed_video_registry.record_success(
+                    data_root, result.video_id, source="channel_success", status="success",
+                    model=str(result.metadata_updates.get("model", "")))
+            except Exception as registry_exc:
+                logger.error("Processed video registry write failed for %s: %s", result.video_id, registry_exc)
         if claim_vid:
             claim_mgr.release(claim_vid)
         elif result.video_id and result.video_id != "unknown":
@@ -2755,6 +2811,11 @@ def main(argv=None):
                 pass
         
         process_videos(config)
+        try:
+            from p03_processed_video_backup import backup_processed_registry
+            backup_processed_registry(config.get("DATA_ROOT", config.get("BASE_PATH", ".")))
+        except Exception as exc:
+            logger.warning("P03_PROCESSED_REGISTRY_BACKUP_FAILED: %s: %s", type(exc).__name__, exc)
         backup_enabled = os.getenv("P03_STATE_BACKUP", "1" if (sys.platform.startswith("linux") and
                                     os.getenv("P03_DRIVE_BACKEND", "api").strip().lower() == "api") else "0").strip().lower()
         if backup_enabled in {"1", "true", "yes", "on"}:

@@ -8,18 +8,126 @@ import os
 import re
 import tempfile
 import time
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
 VIDEO_ID_RE = re.compile(r"^[A-Za-z0-9_-]{11}$")
 LEDGER_COLUMNS = ["video_id", "canonical_url", "source_urls", "first_seen_at", "status", "reason", "attempts", "regen_attempts", "last_attempt_at", "done_at", "md_path", "md_sha256", "drive_verified", "model", "sheet_synced", "needs_manual_check"]
-LEDGER_STATUSES = {"new", "processing", "success", "retryable_failed", "pending_quarantine", "unsupported", "skipped_policy"}
+LEDGER_STATUSES = {"new", "processing", "success", "retryable_failed", "pending_quarantine", "unsupported", "skipped_policy", "skipped_historical"}
 MAX_REGEN_ATTEMPTS = 2
 SHEET_ID = "1iRtWdbbJGM8EY1K0jDXkt36IImQM-BmhDoufsFOjRKI"
 SHEET_TAB = "YT Link"
 SHEET_HEADERS = ("URL", "Source", "Download 여부")
 SHEETS_SCOPE = "https://www.googleapis.com/auth/spreadsheets"
+IMPORTER_MARKER_COLUMN = "manual_imported"
+HISTORICAL_SKIP_REASON = "historical input_df row before manual cutoff; owner: already processed"
+
+
+def parse_input_date(value) -> date | None:
+    """Parse input_df dates in the legacy dotted or ISO form."""
+    raw = str(value or "").strip()
+    match = re.fullmatch(r"(\d{4})[.-](\d{1,2})[.-](\d{1,2})", raw)
+    if not match:
+        return None
+    try:
+        return date(*(int(part) for part in match.groups()))
+    except ValueError:
+        return None
+
+
+def select_manual_input_rows(input_df, cutoff: str | None, max_rows: int = 5):
+    """Return eligible rows in newest-first order, plus all eligible video IDs.
+
+    When cutoff is absent or invalid, only rows explicitly marked by the sheet
+    importer are eligible. The caller owns warning logging for that fallback.
+    """
+    import pandas as pd
+
+    valid_cutoff = None
+    try:
+        if cutoff:
+            valid_cutoff = date.fromisoformat(str(cutoff).strip())
+            if valid_cutoff.isoformat() != str(cutoff).strip():
+                valid_cutoff = None
+    except ValueError:
+        pass
+    has_cutoff = valid_cutoff is not None
+    eligible = []
+    eligible_ids = set()
+    if input_df is None or "url" not in input_df.columns:
+        return [], eligible_ids
+    for ordinal, (_, row) in enumerate(input_df.iterrows()):
+        url = str(row.get("url", "") or "").strip()
+        if not url:
+            continue
+        if has_cutoff:
+            row_date = parse_input_date(row.get("date", ""))
+            if row_date is None or row_date < valid_cutoff:
+                continue
+            rank_date = row_date
+        else:
+            marker = str(row.get(IMPORTER_MARKER_COLUMN, "") or "").strip().lower()
+            if marker not in {"1", "true", "yes", "y"}:
+                continue
+            rank_date = parse_input_date(row.get("date", "")) or date.min
+        item = normalize_youtube_url(url)
+        if item["kind"] == "video":
+            eligible_ids.add(item["video_id"])
+        eligible.append((rank_date, item.get("video_id") or url, ordinal, url))
+    # Newest date first. Stable tie breakers make queue membership reproducible.
+    eligible.sort(key=lambda item: (-item[0].toordinal(), item[1], item[3], item[2]))
+    unique = []
+    seen = set()
+    for item in eligible:
+        identity = item[1]
+        if identity in seen:
+            continue
+        seen.add(identity)
+        unique.append(item)
+    limit = max(0, int(max_rows))
+    return [item[3] for item in unique[:limit]], eligible_ids
+
+
+def skip_historical_processing(ledger, input_df, cutoff: str | None):
+    """Permanently skip processing ledger rows whose input date predates cutoff."""
+    try:
+        cutoff_date = date.fromisoformat(str(cutoff).strip()) if cutoff else None
+        if cutoff_date and cutoff_date.isoformat() != str(cutoff).strip():
+            cutoff_date = None
+    except ValueError:
+        cutoff_date = None
+    input_rows = {}
+    if input_df is not None and "url" in input_df.columns:
+        for _, input_row in input_df.iterrows():
+            value = input_row.get("url", "")
+            item = normalize_youtube_url(value)
+            if item["kind"] == "video":
+                input_rows[item["video_id"]] = input_row
+    for idx, row in ledger.iterrows():
+        status = str(row.get("status", ""))
+        if status == "deferred_backfill":
+            ledger.at[idx, "status"] = "skipped_historical"
+            ledger.at[idx, "reason"] = HISTORICAL_SKIP_REASON
+            continue
+        if status != "processing":
+            continue
+        vid = str(row.get("video_id", ""))
+        input_row = input_rows.get(vid)
+        row_date = parse_input_date(input_row.get("date", "")) if input_row is not None else None
+        if cutoff_date and row_date and row_date < cutoff_date:
+            ledger.at[idx, "status"] = "skipped_historical"
+            ledger.at[idx, "reason"] = HISTORICAL_SKIP_REASON
+    return ledger
+
+
+def exclude_skipped_historical_urls(urls, ledger):
+    """Remove terminal historical IDs from any queue, including channel candidates."""
+    historical_ids = set(ledger.loc[
+        ledger.status.astype(str) == "skipped_historical", "video_id"
+    ].astype(str)) if len(ledger) else set()
+    return [url for url in urls
+            if normalize_youtube_url(url).get("video_id") not in historical_ids]
 
 
 def normalize_youtube_url(value: str) -> dict:
@@ -75,6 +183,10 @@ def read_ledger(path: str | Path):
     for col in LEDGER_COLUMNS:
         if col not in df.columns:
             df[col] = ""
+    # Migrate the earlier, non-terminal name without making those rows runnable.
+    legacy = df.status.astype(str) == "deferred_backfill"
+    df.loc[legacy, "status"] = "skipped_historical"
+    df.loc[legacy, "reason"] = HISTORICAL_SKIP_REASON
     return df[LEDGER_COLUMNS]
 
 
@@ -129,19 +241,18 @@ def upsert_ledger(df, *, video_id: str, canonical_url: str = "", source_url: str
 
 def prepare_manual_queue(manual_rows, channel_urls, output_df, ledger, max_retries: int = 3,
                          *, duration_map=None, shorts_threshold_seconds: int = 0,
-                         channel_auto_sub_only=None, video_channel_ids=None):
+                         channel_auto_sub_only=None, video_channel_ids=None,
+                         processed_video_ids=None):
     """Return unique canonical manual items and the ledger with pre-run decisions recorded."""
+    if processed_video_ids is None:
+        logging.getLogger(__name__).warning("processed_videos.csv is unavailable; manual queue is fail-closed")
+        return [], ledger
     channel_ids = set()
     for url in channel_urls:
         item = normalize_youtube_url(url)
         if item["kind"] == "video":
             channel_ids.add(item["video_id"])
-    output_statuses = {}
-    if output_df is not None and "v_id" in output_df.columns and "status" in output_df.columns:
-        for _, row in output_df.iterrows():
-            vid = str(row.get("v_id", "")).strip()
-            if vid:
-                output_statuses.setdefault(vid, []).append(str(row.get("status", "")).strip())
+    processed_video_ids = set(processed_video_ids)
     queued, seen = [], set()
     for source_url in manual_rows:
         source_url = str(source_url or "").strip()
@@ -154,6 +265,8 @@ def prepare_manual_queue(manual_rows, channel_urls, output_df, ledger, max_retri
                                    status="unsupported", reason=item["reason"])
             continue
         vid = item["video_id"]
+        if vid in processed_video_ids:
+            continue
         prior = ledger[ledger.video_id.astype(str) == vid]
         prior_status = str(prior.iloc[-1].get("status") or "") if len(prior) else ""
         if prior_status == "unsupported":
@@ -161,7 +274,6 @@ def prepare_manual_queue(manual_rows, channel_urls, output_df, ledger, max_retri
                                    source_url=source_url, status="unsupported",
                                    reason=str(prior.iloc[-1].get("reason") or "previously classified unsupported"))
             continue
-        output_status = output_statuses.get(vid, [""])[-1]
         duration_iso = (duration_map or {}).get(vid, "")
         if shorts_threshold_seconds > 0 and duration_iso:
             from channel_crawl import _parse_duration_to_seconds
@@ -171,16 +283,6 @@ def prepare_manual_queue(manual_rows, channel_urls, output_df, ledger, max_retri
                                        source_url=source_url, status="skipped_policy",
                                        reason=f"Shorts duration policy: {seconds}s <= {shorts_threshold_seconds}s")
                 continue
-        if prior_status == "success":
-            ledger = upsert_ledger(ledger, video_id=vid, canonical_url=item["canonical_url"],
-                                   source_url=source_url, status="success",
-                                   reason="already verified by manual ledger")
-            continue
-        if "success" in output_statuses.get(vid, []) and prior_status != "retryable_failed":
-            ledger = upsert_ledger(ledger, video_id=vid, canonical_url=item["canonical_url"],
-                                   source_url=source_url, status="skipped_policy",
-                                   reason="already has an output success without manual Drive verification evidence")
-            continue
         if prior_status == "pending_quarantine":
             continue
         pending_drive = (prior_status == "retryable_failed" and
@@ -226,11 +328,6 @@ def prepare_manual_queue(manual_rows, channel_urls, output_df, ledger, max_retri
                                            source_url=source_url, status="processing",
                                            reason="manual ownership retained; selected channel candidate will process once",
                                            attempted=True)
-            continue
-        if output_status in {"passed_shorts", "live_scheduled", "video_unavailable", "skipped_auto_subs_only", "oversized_file"}:
-            ledger = upsert_ledger(ledger, video_id=vid, canonical_url=item["canonical_url"],
-                                   source_url=source_url, status="unsupported",
-                                   reason=f"prior terminal pipeline status: {output_status}")
             continue
         if prior_status == "retryable_failed" and regen_pending:
             if vid not in seen:

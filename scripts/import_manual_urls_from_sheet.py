@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import logging
 import os
 import sys
 import tempfile
@@ -11,8 +12,10 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
-from manual_video_input import (SHEET_ID, SHEET_TAB, normalize_youtube_url, read_ledger,
-                                build_sheets_service, read_sheet_rows, VIDEO_ID_RE)  # noqa: E402
+from manual_video_input import (SHEET_ID, SHEET_TAB, normalize_youtube_url,
+                                build_sheets_service, read_sheet_rows)  # noqa: E402
+from processed_video_registry import (processed_ids, read_registry, reconcile_sheet_marked,
+                                      sheet_marked_ids)  # noqa: E402
 
 def _read_sheet_rows(spreadsheet_id: str = SHEET_ID, tab: str = SHEET_TAB):
     service = build_sheets_service()
@@ -68,6 +71,18 @@ def import_rows(rows, input_path: Path, data_root: Path, *, since: str | None = 
     missing = [h for h in ("URL", "Source", "Download 여부") if h not in headers]
     if missing:
         raise ValueError("Google Sheet row 1 is missing required header(s): " + ", ".join(missing))
+    registry = processed_ids(Path(data_root) / "processed_videos.csv")
+    if registry is None:
+        logging.getLogger(__name__).warning("processed_videos.csv is missing; sheet import is fail-closed")
+        return {"new": 0, "deferred": 0, "already_processed": 0,
+                "video": 0, "channel": 0, "playlist": 0, "unsupported": 0, "total": 0}
+    try:
+        sheet_ids = sheet_marked_ids(rows[header_idx:], normalize_youtube_url)
+    except Exception as exc:
+        logging.getLogger(__name__).warning("Google Sheet marker read is unavailable; refusing new imports: %s", exc)
+        return {"new": 0, "deferred": 0, "already_processed": 0,
+                "video": 0, "channel": 0, "playlist": 0, "unsupported": 0, "total": 0}
+    registry = reconcile_sheet_marked(Path(data_root) / "processed_videos.csv", sheet_ids)
     url_i = next(i for i, h in enumerate(headers) if h.casefold() == "url")
     def col(name):
         return next((i for i, h in enumerate(headers) if h.casefold() == name.casefold()), None)
@@ -92,50 +107,20 @@ def import_rows(rows, input_path: Path, data_root: Path, *, since: str | None = 
     input_df, encoding = _read_frame(input_path)
     if "url" not in input_df.columns:
         raise ValueError("input_df.csv must have a url column")
-    existing_ids = {normalize_youtube_url(u)["video_id"] for u in input_df["url"] if normalize_youtube_url(u)["kind"] == "video"}
-    out_path = data_root / "output_df_new.csv"
-    out = _read_frame(out_path)[0] if out_path.exists() else pd.DataFrame(columns=["v_id", "url", "status"])
-    ledger = read_ledger(data_root / "manual_input_status.csv")
-    ledger_ids = set(ledger.video_id.astype(str))
-    ledger_status = dict(zip(ledger.video_id.astype(str), ledger.status.astype(str)))
-    output_ids = set()
-    output_success = set()
-    for _, row in out.iterrows():
-        row_ids = set()
-        for name in ("v_id", "video_id", "id"):
-            if name in out.columns and str(row.get(name, "")).strip():
-                value = str(row[name]).strip()
-                candidate = normalize_youtube_url(value)
-                if candidate["kind"] == "video":
-                    row_ids.add(candidate["video_id"])
-                elif VIDEO_ID_RE.fullmatch(value):
-                    row_ids.add(value)
-        for name in ("url", "video_url", "source_url"):
-            if name in out.columns and str(row.get(name, "")).strip():
-                candidate = normalize_youtube_url(str(row[name]).strip())
-                if candidate["kind"] == "video":
-                    row_ids.add(candidate["video_id"])
-        if row_ids:
-            output_ids.update(row_ids)
-            if str(row.get("status", "")).strip().lower() == "success":
-                output_success.update(row_ids)
-    sheet_downloaded_ids = {
-        rec["norm"]["video_id"] for rec in records
-        if rec["norm"]["kind"] == "video" and rec["downloaded"]
-    }
     new = []
     seen = set()
     already_success = already_queued = already_processed = 0
+    registry_frame = read_registry(Path(data_root) / "processed_videos.csv")
+    registry_rows = {str(row.video_id): row for _, row in registry_frame.iterrows()}
     for rec in records:
         n = rec["norm"]
         if n["kind"] != "video":
             continue
         vid = n["video_id"]
-        if rec["downloaded"] or vid in sheet_downloaded_ids:
+        if vid in registry or vid in seen:
             already_processed += 1
-        elif vid in output_ids or vid in ledger_ids or vid in existing_ids or vid in seen:
-            already_processed += 1
-            if vid in output_success or ledger_status.get(vid) == "success":
+            registry_row = registry_rows.get(vid)
+            if registry_row is not None and str(registry_row.last_status).strip().lower() in {"success", "manual_success", "channel_success"}:
                 already_success += 1
             else:
                 already_queued += 1
@@ -148,6 +133,18 @@ def import_rows(rows, input_path: Path, data_root: Path, *, since: str | None = 
     if max_new is not None:
         new = new[:max(0, int(max_new))]
     deferred = eligible_count - len(new)
+    # Existing input_df rows are pending work, not processed evidence. Avoid
+    # appending the same pending row again while keeping the registry as the
+    # sole authority for processed status.
+    input_ids = {normalize_youtube_url(value)["video_id"] for value in input_df["url"]
+                 if normalize_youtube_url(value)["kind"] == "video"}
+    append_rows = []
+    for rec in new:
+        if rec["norm"]["video_id"] in input_ids:
+            already_queued += 1
+        else:
+            append_rows.append(rec)
+    new = append_rows
     print(f"total rows: {len(records)}")
     print(f"video: {counts['video']}")
     print(f"channel: {counts['channel']}")
@@ -160,9 +157,12 @@ def import_rows(rows, input_path: Path, data_root: Path, *, since: str | None = 
     print(f"deferred: {deferred}")
     if dry_run:
         return {"new": len(new), "deferred": deferred, "already_processed": already_processed, **counts, "total": len(records)}
+    if new and "manual_imported" not in input_df.columns:
+        input_df["manual_imported"] = ""
     for rec in new:
         row = {c: "" for c in input_df.columns}
         row["url"] = rec["url"]
+        row["manual_imported"] = "true"
         if "date" in row:
             row["date"] = rec["date"]
         for c, val in (("title", rec["title"]), ("source", rec["source"])):
@@ -178,6 +178,10 @@ def import_from_sheet(data_root: str | Path, *, spreadsheet_id: str | None = Non
                       dry_run: bool = False):
     """Fetch the configured Sheet and append unseen video IDs under data_root."""
     root = Path(data_root)
+    if processed_ids(root / "processed_videos.csv") is None:
+        logging.getLogger(__name__).warning("processed_videos.csv is missing; sheet import is fail-closed")
+        return {"new": 0, "deferred": 0, "already_processed": 0,
+                "video": 0, "channel": 0, "playlist": 0, "unsupported": 0, "total": 0}
     if max_new := os.getenv("P03_SHEET_IMPORT_MAX"):
         try:
             max_new = int(max_new)
@@ -187,10 +191,18 @@ def import_from_sheet(data_root: str | Path, *, spreadsheet_id: str | None = Non
             raise ValueError("P03_SHEET_IMPORT_MAX must be a non-negative integer")
     else:
         max_new = 5
-    rows = _read_sheet_rows(
-        spreadsheet_id or os.getenv("P03_GOOGLE_SHEET_ID", SHEET_ID),
-        tab or os.getenv("P03_GOOGLE_SHEET_TAB", SHEET_TAB),
-    )
+    try:
+        rows = _read_sheet_rows(
+            spreadsheet_id or os.getenv("P03_GOOGLE_SHEET_ID", SHEET_ID),
+            tab or os.getenv("P03_GOOGLE_SHEET_TAB", SHEET_TAB),
+        )
+    except Exception as exc:
+        # Registry state remains the local processed-ID authority, but a failed
+        # sheet read cannot establish which new rows are safe to import.
+        logging.getLogger(__name__).warning(
+            "Google Sheet read failed; using registry-only processed checks and importing nothing: %s", exc)
+        return {"new": 0, "deferred": 0, "already_processed": 0,
+                "video": 0, "channel": 0, "playlist": 0, "unsupported": 0, "total": 0}
     return import_rows(rows, root / "input_df.csv", root, since=since, max_new=max_new, dry_run=dry_run)
 
 
