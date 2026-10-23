@@ -523,6 +523,105 @@ def test_process_videos_runs_unregistered_manual_video_through_existing_path(
     assert "temporary network failure" in ledger.iloc[0].reason
 
 
+def test_historical_registry_parse_failure_disables_manual_but_runs_channel_jobs(
+        tmp_path, monkeypatch, caplog):
+    import main
+    from pipeline_models import VideoProcessResult
+
+    data = tmp_path / "data"
+    data.mkdir()
+    _make_empty_registry(data)
+    (data / "input_df.csv").write_text(
+        "date,url,category\n2020-01-01,https://youtu.be/manualold01,manual\n",
+        encoding="cp949",
+    )
+    historical_ledger = mvi.read_ledger(data / "manual_input_status.csv")
+    historical_ledger = mvi.upsert_ledger(
+        historical_ledger, video_id="manualold01", canonical_url="https://www.youtube.com/watch?v=manualold01",
+        source_url="https://youtu.be/manualold01", status="skipped_historical")
+    mvi.save_ledger(historical_ledger, data / "manual_input_status.csv")
+    base, md = tmp_path / "base", tmp_path / "md"
+    base.mkdir()
+    md.mkdir()
+    channel_url = "https://www.youtube.com/watch?v=channel00001"
+    candidate_df = pd.DataFrame([{
+        "url": channel_url, "published_at": "2026-10-01", "channel_id": "UCchannel",
+        "usage_channel": "", "video_id": "channel00001", "default_audio_lang": "",
+        "auto_sub_only": "", "obsidian": "",
+    }])
+    seen = []
+    original_read_registry = main.processed_video_registry.read_registry
+    original_merge_records = main.processed_video_registry.merge_records
+    merge_calls = []
+
+    def fail_registry_parse_during_historical_merge(path, records):
+        merge_calls.append((path, records))
+        main.processed_video_registry.read_registry = lambda _path: (_ for _ in ()).throw(
+            ValueError("injected registry parse failure"))
+        try:
+            return original_merge_records(path, records)
+        finally:
+            main.processed_video_registry.read_registry = original_read_registry
+
+    class Writer:
+        def __init__(self, **kwargs):
+            self.df = kwargs["output_df"]
+        def apply(self, result):
+            self.df.loc[len(self.df)] = {"date": "2026-10-22", "url": result.source_url,
+                                         "v_id": result.video_id, "status": result.status}
+            main._save_output_df_with_retry(self.df, str(data / "output_df_new.csv"), na_rep="")
+        def get_output_df(self): return self.df
+        def get_crawl_queue_df(self): return None
+
+    class Claims:
+        def __init__(self, *_): pass
+        def recover_all_stale(self): return []
+        def try_claim(self, *_args, **_kwargs): return True
+        def release(self, *_): pass
+
+    def fake_process(**kwargs):
+        seen.append((kwargs["v_url"], kwargs["config"].get("from_input")))
+        return VideoProcessResult(video_id="channel00001", source_url=kwargs["v_url"],
+                                  status="download_failed", retryable=True,
+                                  error_message="temporary network failure")
+
+    monkeypatch.setattr(main, "initialize_clients", lambda config: (None, None, None))
+    monkeypatch.setattr(main.processed_video_registry, "merge_records", fail_registry_parse_during_historical_merge)
+    monkeypatch.setattr(main.processed_video_registry, "read_sheet_marked_ids", lambda: set())
+    monkeypatch.setattr(main, "load_output_df_only", lambda _root: pd.DataFrame(columns=["v_id", "url", "status"]))
+    monkeypatch.setattr(main.channel_crawl, "build_queue_and_get_candidates",
+                        lambda *_args, **_kwargs: (None, candidate_df, []))
+    monkeypatch.setattr(main.channel_crawl, "load_channel_df", lambda _root: [])
+    monkeypatch.setattr(main, "create_transcript_preprocessor", lambda *args: object())
+    monkeypatch.setattr(main, "SharedStateWriter", Writer)
+    monkeypatch.setattr(main, "ClaimManager", Claims)
+    monkeypatch.setattr(main, "process_single_video", fake_process)
+    monkeypatch.setattr(main, "_run_batch_cleanup", lambda *args, **kwargs: None)
+    monkeypatch.setattr(main.time, "sleep", lambda *_: None)
+    monkeypatch.setenv("P03_DRIVE_BACKEND", "desktop")
+    monkeypatch.setenv("P03_DRIVE_SYNC_ENABLED", "0")
+    monkeypatch.setenv("P03_MANUAL_SINCE", "2026-01-01")
+    monkeypatch.delenv("P03_SHEET_IMPORT_ENABLED", raising=False)
+    config = {
+        "BASE_PATH": str(base), "DATA_ROOT": str(data), "WORK_PATH": str(base),
+        "HF_HOME": str(tmp_path / "hf"), "OUTPUT_MD_PATH": str(md),
+        "CHANNEL_CRAWL": True, "YOUTUBE_API_KEY": "test-key", "VIDEO_WORKERS": 1,
+        "MIN_WAIT_BETWEEN_VIDEOS": 0, "MAX_WAIT_BETWEEN_VIDEOS": 0,
+        "EXTENDED_WAIT_INTERVAL": 100, "EXTENDED_WAIT_DURATION": 0,
+        "MAX_CONSECUTIVE_FAILURES": 2, "FAILURE_WAIT_MULTIPLIER": 1,
+        "CRAWL_QUEUE_MAX_RETRIES": 2,
+    }
+
+    main.process_videos(config)
+
+    assert len(merge_calls) == 1
+    assert seen == [(channel_url, None)]
+    assert "injected registry parse failure" in caplog.text
+    assert "manual admission is disabled for this run" in caplog.text
+    ledger = mvi.read_ledger(data / "manual_input_status.csv")
+    assert ledger.loc[ledger.video_id == "manualold01", "status"].iloc[0] == "skipped_historical"
+
+
 class FakeSheets:
     def __init__(self, headers, rows, *, mismatch=False):
         self.headers = headers

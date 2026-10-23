@@ -2193,8 +2193,15 @@ def process_videos(config: dict):
         if str(row.get("status", "")) == "skipped_historical"
     ]
     if historical_records:
-        processed_video_registry.merge_records(
-            os.path.join(data_root, processed_video_registry.REGISTRY_NAME), historical_records)
+        try:
+            processed_video_registry.merge_records(
+                os.path.join(data_root, processed_video_registry.REGISTRY_NAME), historical_records)
+        except Exception as registry_exc:
+            logger.warning(
+                "Historical manual registry persistence failed; manual admission is disabled for this run: %s",
+                registry_exc,
+            )
+            manual_rows = []
     max_manual_retries = int(config.get("CRAWL_QUEUE_MAX_RETRIES", 3) or 3)
     manual_duration_map = {}
     manual_video_channel_ids = {}
