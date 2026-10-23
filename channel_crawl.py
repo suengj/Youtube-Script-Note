@@ -164,9 +164,11 @@ def _resolve_handle_to_channel_id(handle: str) -> Optional[str]:
     return None
 
 
-def _parse_iso_date(s: Optional[str]) -> Optional[datetime]:
-    """Parse ISO 8601 date string to datetime. Returns None on failure."""
-    if not s or not s.strip():
+def _parse_iso_date(s: Any) -> Optional[datetime]:
+    """Parse an ISO 8601 string or datetime; return None for unsupported values."""
+    if isinstance(s, datetime):
+        return s.replace(tzinfo=None)
+    if not isinstance(s, str) or not s.strip():
         return None
     s = s.strip()
     for fmt in ("%Y-%m-%dT%H:%M:%S%z", "%Y-%m-%dT%H:%M:%SZ", "%Y-%m-%dT%H:%M:%S.%fZ", "%Y-%m-%d"):
@@ -586,7 +588,7 @@ def select_process_candidates(
     min_interval = max(0.0, float(live_retry_min_interval_min)) * 60
     if min_interval:
         is_live_retry = cand["last_error"].astype(str).str.strip() == LIVE_SCHEDULED_STATUS
-        attempted = cand["last_attempted_at"].astype(str).map(_parse_iso_date)
+        attempted = cand["last_attempted_at"].map(_parse_iso_date)
         recent = attempted.map(lambda dt: bool(dt and (now - dt).total_seconds() < min_interval))
         cand = cand[~(is_live_retry & recent)]
     if len(cand) == 0:

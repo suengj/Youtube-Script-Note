@@ -44,6 +44,18 @@ def test_live_stays_retryable_without_incrementing_retry_count():
     assert reconciled.iloc[0]["last_error"] == "live_scheduled"
 
 
+def test_live_candidate_with_nan_last_attempted_at_is_kept():
+    queue = _queue_row(last_error="live_scheduled", last_attempted_at=float("nan"))
+
+    candidates = cc.select_process_candidates(queue, max_retries=3)
+
+    assert candidates["video_id"].tolist() == [VIDEO_ID]
+
+
+def test_parse_iso_date_returns_none_for_nan():
+    assert cc._parse_iso_date(float("nan")) is None
+
+
 def test_later_vod_success_completes_queue_and_is_written_once():
     output = pd.DataFrame(columns=["date", "url", "v_id", "status"])
     saved = []
