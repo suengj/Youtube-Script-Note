@@ -10,7 +10,21 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 import manual_video_input as mvi  # noqa: E402
+import processed_video_registry as pvr  # noqa: E402
 from scripts.import_manual_urls_from_sheet import import_rows  # noqa: E402
+
+
+def _make_empty_registry(root):
+    pvr.write_registry(pd.DataFrame(columns=pvr.REGISTRY_COLUMNS), pvr.registry_path(root))
+
+
+@pytest.fixture(autouse=True)
+def _default_registry_for_queue_unit_tests(monkeypatch):
+    original = mvi.prepare_manual_queue
+    def with_empty_registry(*args, **kwargs):
+        kwargs.setdefault("processed_video_ids", set())
+        return original(*args, **kwargs)
+    monkeypatch.setattr(mvi, "prepare_manual_queue", with_empty_registry)
 
 
 @pytest.mark.parametrize("url", [
@@ -56,12 +70,13 @@ def test_ledger_atomic_schema_and_upsert(tmp_path):
 def test_importer_locates_headers_and_preserves_existing_rows_idempotently(tmp_path, capsys):
     data = tmp_path / "data"
     data.mkdir()
+    _make_empty_registry(data)
     input_path = data / "input_df.csv"
     input_path.write_text("date,url,category,title,source\n2024-01-01,https://youtu.be/zzzzzzzzzzz,old,Old title,manual\n", encoding="cp949")
     rows = [
         ["Updated/Published Time/", "URL", "Title", "Source", "Download 여부"],
-        ["2025-01-01", "https://www.youtube.com/watch?v=abcdefghijk&si=a", "First", "Pocket", ""],
-        ["2025-01-02", "https://youtu.be/abcdefghijk", "Duplicate", "Zapier", ""],
+        ["2025-01-01", "https://www.youtube.com/watch?v=abcdefghijk&si=a", "First", "", ""],
+        ["2025-01-02", "https://youtu.be/abcdefghijk", "Duplicate", "", ""],
         ["2025-01-03", "https://youtube.com/@handle", "Channel", "Pocket", ""],
         ["2025-01-04", "https://youtube.com/playlist?list=PL123", "List", "Pocket", ""],
         ["2025-01-05", "https://elsewhere.invalid/", "Bad", "Pocket", ""],
@@ -72,15 +87,18 @@ def test_importer_locates_headers_and_preserves_existing_rows_idempotently(tmp_p
     assert len(frame) == 2
     assert frame.iloc[0]["url"].endswith("zzzzzzzzzzz")
     assert frame.iloc[1]["date"] == "2025-01-01"
-    assert frame.iloc[1]["title"] == "First" and frame.iloc[1]["source"] == "Pocket"
+    assert frame.iloc[1]["title"] == "First" and frame.iloc[1]["source"] == ""
     assert import_rows(rows, input_path, data)["new"] == 0
 
 
 def test_importer_reports_success_and_queued_ids(tmp_path, capsys):
     data = tmp_path / "data"
     data.mkdir()
+    _make_empty_registry(data)
     (data / "input_df.csv").write_text("date,url\n,https://youtu.be/queued00001\n", encoding="cp949")
     pd.DataFrame([{"v_id": "success0001", "url": "u", "status": "success"}]).to_csv(data / "output_df_new.csv", index=False)
+    pvr.build_registry(data, include_sheet=False)
+    pvr.merge_records(pvr.registry_path(data), [("queued00001", "sheet_marked", "sheet_marked", "")])
     rows = [["URL", "Source", "Download 여부", "Title"],
             ["https://youtu.be/success0001", "", "", "Success"],
             ["https://youtu.be/queued00001", "", "", "Queued"],
@@ -95,10 +113,12 @@ def test_importer_reports_success_and_queued_ids(tmp_path, capsys):
 def test_importer_does_not_treat_historical_channel_failure_as_queued(tmp_path):
     data = tmp_path / "data"
     data.mkdir()
+    _make_empty_registry(data)
     input_path = data / "input_df.csv"
     input_path.write_text("date,url\n", encoding="cp949")
     pd.DataFrame([{"v_id": "failed00001", "url": "https://youtu.be/failed00001", "status": "download_failed"}]).to_csv(
         data / "output_df_new.csv", index=False)
+    pvr.build_registry(data, include_sheet=False)
     rows = [["URL", "Source", "Download 여부"], ["https://youtu.be/failed00001", "", ""]]
     result = import_rows(rows, input_path, data)
     assert result["new"] == 0
@@ -109,6 +129,7 @@ def test_importer_does_not_treat_historical_channel_failure_as_queued(tmp_path):
 def test_importer_skips_rows_without_parseable_cutoff_date(tmp_path):
     data = tmp_path / "data"
     data.mkdir()
+    _make_empty_registry(data)
     rows = [["Updated/Published Time/", "URL", "Source", "Download 여부"],
             ["", "https://youtu.be/emptydate01", "", ""],
             ["not-a-date", "https://youtu.be/baddate0001", "", ""],
@@ -121,9 +142,11 @@ def test_importer_skips_rows_without_parseable_cutoff_date(tmp_path):
 def test_importer_download_column_marks_row_processed(tmp_path):
     data = tmp_path / "data"
     data.mkdir()
+    _make_empty_registry(data)
     rows = [["URL", "Source", "Download 여부"],
             ["https://youtu.be/downld00001", "", "done"],
             ["https://youtu.be/freshvid001", "", ""]]
+    pvr.merge_records(pvr.registry_path(data), [("downld00001", "sheet_marked", "sheet_marked", "")])
     result = import_rows(rows, data / "input_df.csv", data, dry_run=True)
     assert result["new"] == 1 and result["already_processed"] == 1
 
@@ -131,9 +154,11 @@ def test_importer_download_column_marks_row_processed(tmp_path):
 def test_importer_download_marker_applies_to_duplicate_video_id(tmp_path):
     data = tmp_path / "data"
     data.mkdir()
+    _make_empty_registry(data)
     rows = [["URL", "Source", "Download 여부"],
             ["https://youtu.be/downld00001", "", "done"],
             ["https://www.youtube.com/watch?v=downld00001&si=other", "", ""]]
+    pvr.merge_records(pvr.registry_path(data), [("downld00001", "sheet_marked", "sheet_marked", "")])
     result = import_rows(rows, data / "input_df.csv", data, dry_run=True)
     assert result["new"] == 0 and result["already_processed"] == 2
 
@@ -141,9 +166,11 @@ def test_importer_download_marker_applies_to_duplicate_video_id(tmp_path):
 def test_importer_matches_any_output_record_using_normalized_url(tmp_path):
     data = tmp_path / "data"
     data.mkdir()
+    _make_empty_registry(data)
     (data / "input_df.csv").write_text("date,url\n", encoding="cp949")
     pd.DataFrame([{"url": "https://www.youtube.com/watch?v=outmatch001&si=abc",
                    "status": "download_failed"}]).to_csv(data / "output_df_new.csv", index=False)
+    pvr.build_registry(data, include_sheet=False)
     rows = [["URL", "Source", "Download 여부"],
             ["https://youtu.be/outmatch001", "", ""],
             ["https://youtu.be/freshvid001", "", ""]]
@@ -154,9 +181,11 @@ def test_importer_matches_any_output_record_using_normalized_url(tmp_path):
 def test_importer_uses_output_url_when_v_id_is_invalid(tmp_path):
     data = tmp_path / "data"
     data.mkdir()
+    _make_empty_registry(data)
     (data / "input_df.csv").write_text("date,url\n", encoding="cp949")
     pd.DataFrame([{"v_id": "unknown", "url": "https://youtu.be/outmatch001",
                    "status": "download_failed"}]).to_csv(data / "output_df_new.csv", index=False)
+    pvr.build_registry(data, include_sheet=False)
     rows = [["URL", "Source", "Download 여부"], ["https://youtu.be/outmatch001", "", ""]]
 
     result = import_rows(rows, data / "input_df.csv", data, dry_run=True)
@@ -168,6 +197,7 @@ def test_importer_uses_output_url_when_v_id_is_invalid(tmp_path):
 def test_importer_caps_newest_eligible_rows_and_reports_deferred(tmp_path, capsys):
     data = tmp_path / "data"
     data.mkdir()
+    _make_empty_registry(data)
     rows = [["Updated/Published Time/", "URL", "Source", "Download 여부"],
             ["2025-01-01", "https://youtu.be/oldvid00001", "", ""],
             ["2025-02-01", "https://youtu.be/midvid00001", "", ""],
@@ -176,7 +206,138 @@ def test_importer_caps_newest_eligible_rows_and_reports_deferred(tmp_path, capsy
     frame = pd.read_csv(data / "input_df.csv", encoding="cp949", dtype=str)
     assert result["new"] == 1 and result["deferred"] == 2
     assert frame.iloc[0].url.endswith("newvid00001")
+    assert frame.iloc[0].manual_imported == "true"
     assert "deferred: 2" in capsys.readouterr().out
+
+
+def test_importer_treats_skipped_historical_ledger_id_as_already_processed(tmp_path):
+    data = tmp_path / "data"
+    data.mkdir()
+    _make_empty_registry(data)
+    (data / "input_df.csv").write_text("date,url\n", encoding="cp949")
+    pd.DataFrame([{"video_id": "oldvideo001", "status": "skipped_historical",
+                   "reason": mvi.HISTORICAL_SKIP_REASON}]).to_csv(
+        data / "manual_input_status.csv", index=False)
+    pvr.build_registry(data, include_sheet=False)
+
+    result = import_rows([["URL", "Source", "Download 여부"],
+                          ["https://youtu.be/oldvideo001", "", ""]],
+                         data / "input_df.csv", data)
+
+    assert result["new"] == 0
+    assert result["already_processed"] == 1
+    assert len(pd.read_csv(data / "input_df.csv", encoding="cp949", dtype=str)) == 0
+
+
+def test_manual_input_selection_parses_supported_dates_and_caps_newest_deterministically():
+    frame = pd.DataFrame([
+        {"date": "2026.10.7", "url": "https://youtu.be/oldvideo001"},
+        {"date": "2026-10-22", "url": "https://youtu.be/newvideo001"},
+        {"date": "2026.10.22", "url": "https://youtu.be/tievideo001"},
+        {"date": "2026-10-06", "url": "https://youtu.be/belowcutoff"},
+        {"date": "not-a-date", "url": "https://youtu.be/baddate0001"},
+    ])
+    queued, eligible_ids = mvi.select_manual_input_rows(frame, "2026-10-07", 2)
+    assert queued == ["https://youtu.be/newvideo001", "https://youtu.be/tievideo001"]
+    assert eligible_ids == {"oldvideo001", "newvideo001", "tievideo001"}
+
+
+def test_manual_input_selection_without_valid_cutoff_requires_importer_marker():
+    frame = pd.DataFrame([
+        {"date": "2026-10-22", "url": "https://youtu.be/ordinary001"},
+        {"date": "2026.10.7", "url": "https://youtu.be/imported001", "manual_imported": "true"},
+    ])
+    assert mvi.select_manual_input_rows(frame, None, 5)[0] == ["https://youtu.be/imported001"]
+    assert mvi.select_manual_input_rows(frame, "invalid", 5)[0] == ["https://youtu.be/imported001"]
+
+
+def test_manual_input_cap_is_applied_after_processed_ids_are_excluded():
+    frame = pd.DataFrame([
+        {"date": f"2026-10-{day:02d}", "url": f"https://youtu.be/video{day:06d}"}
+        for day in range(1, 7)
+    ])
+
+    queued, _ = mvi.select_manual_input_rows(
+        frame, "2026-10-01", 1,
+        exclude_ids={f"video{day:06d}" for day in range(2, 7)})
+
+    assert queued == ["https://youtu.be/video000001"]
+
+
+@pytest.mark.parametrize("status", ["success", "skipped_historical"])
+def test_terminal_ledger_is_processed_with_stale_registry_and_is_not_rewritten(status):
+    ledger = mvi.read_ledger("/missing/manual.csv")
+    ledger = mvi.upsert_ledger(ledger, video_id="success0001", status=status,
+                               reason="verified success", attempted=True)
+    before = ledger.iloc[0].copy()
+
+    queued, updated = mvi.prepare_manual_queue(
+        ["https://youtu.be/success0001"], [], pd.DataFrame(), ledger,
+        processed_video_ids=set())
+
+    assert queued == []
+    pd.testing.assert_series_equal(updated.iloc[0], before)
+
+
+def test_output_processed_ids_include_every_status_and_unknown_id_url_fallback():
+    frame = pd.DataFrame([
+        {"v_id": "downfail001", "url": "https://youtu.be/ignored0001", "status": "download_failed"},
+        {"v_id": "unknown", "url": "https://youtu.be/urlfallbac1", "status": "unknown"},
+    ])
+
+    assert pvr.output_processed_ids(frame, mvi.normalize_youtube_url) == {
+        "downfail001", "urlfallbac1"}
+
+
+def test_ineligible_processing_rows_become_terminal_without_attempt_or_success_changes():
+    frame = pd.DataFrame([
+        {"date": "2025-01-01", "url": "https://youtu.be/oldvideo001"},
+        {"date": "2026-10-22", "url": "https://youtu.be/newvideo001"},
+    ])
+    ledger = mvi.read_ledger("/missing/manual.csv")
+    ledger = mvi.upsert_ledger(ledger, video_id="oldvideo001", status="processing", attempted=True)
+    ledger = mvi.upsert_ledger(ledger, video_id="newvideo001", status="processing", attempted=True)
+    ledger = mvi.upsert_ledger(ledger, video_id="success0001", status="success")
+    before_attempts = dict(zip(ledger.video_id, ledger.attempts))
+    updated = mvi.skip_historical_processing(ledger, frame, "2026-01-01")
+    old = updated[updated.video_id == "oldvideo001"].iloc[0]
+    assert old.status == "skipped_historical"
+    assert old.reason == mvi.HISTORICAL_SKIP_REASON
+    assert old.attempts == before_attempts["oldvideo001"]
+    assert updated.loc[updated.video_id == "newvideo001", "status"].iloc[0] == "processing"
+    assert updated.loc[updated.video_id == "success0001", "status"].iloc[0] == "success"
+    success_before = updated[updated.video_id == "success0001"].iloc[0].copy()
+    _, after_queue = mvi.prepare_manual_queue(["https://youtu.be/success0001"], [], pd.DataFrame(), updated,
+                                               processed_video_ids={"success0001"})
+    pd.testing.assert_series_equal(after_queue[after_queue.video_id == "success0001"].iloc[0], success_before)
+
+
+def test_skipped_historical_is_terminal_even_if_cutoff_moves_and_input_row_reappears():
+    ledger = mvi.read_ledger("/missing/manual.csv")
+    ledger = mvi.upsert_ledger(ledger, video_id="oldvideo001", status="skipped_historical",
+                               reason=mvi.HISTORICAL_SKIP_REASON, attempted=True)
+    frame = pd.DataFrame([{"date": "2025-01-01", "url": "https://youtu.be/oldvideo001"}])
+    updated = mvi.skip_historical_processing(ledger, frame, "2024-01-01")
+    queued, updated = mvi.prepare_manual_queue(frame.url.tolist(), [], pd.DataFrame(), updated,
+                                               processed_video_ids={"oldvideo001"})
+    assert queued == []
+    assert len(updated) == 1
+    assert updated.iloc[0].status == "skipped_historical"
+    assert updated.iloc[0].reason == mvi.HISTORICAL_SKIP_REASON
+    assert updated.iloc[0].attempts == 1
+    assert mvi.exclude_skipped_historical_urls(
+        ["https://youtu.be/oldvideo001", "https://youtu.be/channelnew01"], updated
+    ) == ["https://youtu.be/channelnew01"]
+
+
+def test_legacy_deferred_backfill_ledger_rows_migrate_to_terminal_status(tmp_path):
+    path = tmp_path / "manual_input_status.csv"
+    path.write_text("video_id,status,reason\noldvideo001,deferred_backfill,old reason\n", encoding="utf-8")
+
+    ledger = mvi.read_ledger(path)
+
+    assert ledger.iloc[0].status == "skipped_historical"
+    assert ledger.iloc[0].reason == mvi.HISTORICAL_SKIP_REASON
 
 
 def test_retry_limit_uses_attempt_count(tmp_path):
@@ -196,11 +357,12 @@ def test_manual_queue_dedupes_by_id_preserves_channel_processing_and_skips_succe
     ]
     output = pd.DataFrame([{"v_id": "success0001", "status": "success"}])
     ledger = mvi.read_ledger("/missing/manual.csv")
-    queued, ledger = mvi.prepare_manual_queue(rows, ["https://youtube.com/live/chan0000001"], output, ledger, 2)
+    queued, ledger = mvi.prepare_manual_queue(rows, ["https://youtube.com/live/chan0000001"], output, ledger, 2,
+                                              processed_video_ids={"success0001"})
     assert [item[0] for item in queued] == ["abcdefghijk", "chan0000001"]
     assert ledger.loc[ledger.video_id == "chan0000001", "status"].iloc[0] == "processing"
     assert [item[0] for item in queued].count("chan0000001") == 1
-    assert ledger.loc[ledger.video_id == "success0001", "status"].iloc[0] == "skipped_policy"
+    assert not (ledger.video_id == "success0001").any()
     assert ledger.loc[ledger.status == "unsupported", "reason"].str.contains("playlist").any()
 
 
@@ -275,6 +437,7 @@ def test_process_videos_runs_unregistered_manual_video_through_existing_path(
 
     data = tmp_path / "data"
     data.mkdir()
+    _make_empty_registry(data)
     (data / "input_df.csv").write_text("date,url,category\n2026-10-01,https://youtu.be/abcdefghijk?si=variant,manual\n", encoding="cp949")
     base, md = tmp_path / "base", tmp_path / "md"
     base.mkdir()
@@ -312,6 +475,7 @@ def test_process_videos_runs_unregistered_manual_video_through_existing_path(
             raise RuntimeError("sheet unavailable")
 
     monkeypatch.setattr(main, "initialize_clients", lambda config: (None, None, None))
+    monkeypatch.setattr(main.processed_video_registry, "read_sheet_marked_ids", lambda: set())
     monkeypatch.setattr(main.channel_crawl, "load_channel_df",
                         lambda root: registry_roots.append(root) or [])
     monkeypatch.setattr(main, "create_transcript_preprocessor", lambda *args: object())
@@ -323,6 +487,7 @@ def test_process_videos_runs_unregistered_manual_video_through_existing_path(
     monkeypatch.setattr(main.time, "sleep", lambda *_: None)
     monkeypatch.setenv("P03_DRIVE_BACKEND", "desktop")
     monkeypatch.setenv("P03_DRIVE_SYNC_ENABLED", "0")
+    monkeypatch.setenv("P03_MANUAL_SINCE", "2026-10-01")
     if sheet_enabled:
         monkeypatch.setenv("P03_SHEET_IMPORT_ENABLED", "1")
         if cutoff is None:
@@ -356,6 +521,105 @@ def test_process_videos_runs_unregistered_manual_video_through_existing_path(
     ledger = mvi.read_ledger(data / "manual_input_status.csv")
     assert ledger.iloc[0].status == "retryable_failed"
     assert "temporary network failure" in ledger.iloc[0].reason
+
+
+def test_historical_registry_parse_failure_disables_manual_but_runs_channel_jobs(
+        tmp_path, monkeypatch, caplog):
+    import main
+    from pipeline_models import VideoProcessResult
+
+    data = tmp_path / "data"
+    data.mkdir()
+    _make_empty_registry(data)
+    (data / "input_df.csv").write_text(
+        "date,url,category\n2020-01-01,https://youtu.be/manualold01,manual\n",
+        encoding="cp949",
+    )
+    historical_ledger = mvi.read_ledger(data / "manual_input_status.csv")
+    historical_ledger = mvi.upsert_ledger(
+        historical_ledger, video_id="manualold01", canonical_url="https://www.youtube.com/watch?v=manualold01",
+        source_url="https://youtu.be/manualold01", status="skipped_historical")
+    mvi.save_ledger(historical_ledger, data / "manual_input_status.csv")
+    base, md = tmp_path / "base", tmp_path / "md"
+    base.mkdir()
+    md.mkdir()
+    channel_url = "https://www.youtube.com/watch?v=channel00001"
+    candidate_df = pd.DataFrame([{
+        "url": channel_url, "published_at": "2026-10-01", "channel_id": "UCchannel",
+        "usage_channel": "", "video_id": "channel00001", "default_audio_lang": "",
+        "auto_sub_only": "", "obsidian": "",
+    }])
+    seen = []
+    original_read_registry = main.processed_video_registry.read_registry
+    original_merge_records = main.processed_video_registry.merge_records
+    merge_calls = []
+
+    def fail_registry_parse_during_historical_merge(path, records):
+        merge_calls.append((path, records))
+        main.processed_video_registry.read_registry = lambda _path: (_ for _ in ()).throw(
+            ValueError("injected registry parse failure"))
+        try:
+            return original_merge_records(path, records)
+        finally:
+            main.processed_video_registry.read_registry = original_read_registry
+
+    class Writer:
+        def __init__(self, **kwargs):
+            self.df = kwargs["output_df"]
+        def apply(self, result):
+            self.df.loc[len(self.df)] = {"date": "2026-10-22", "url": result.source_url,
+                                         "v_id": result.video_id, "status": result.status}
+            main._save_output_df_with_retry(self.df, str(data / "output_df_new.csv"), na_rep="")
+        def get_output_df(self): return self.df
+        def get_crawl_queue_df(self): return None
+
+    class Claims:
+        def __init__(self, *_): pass
+        def recover_all_stale(self): return []
+        def try_claim(self, *_args, **_kwargs): return True
+        def release(self, *_): pass
+
+    def fake_process(**kwargs):
+        seen.append((kwargs["v_url"], kwargs["config"].get("from_input")))
+        return VideoProcessResult(video_id="channel00001", source_url=kwargs["v_url"],
+                                  status="download_failed", retryable=True,
+                                  error_message="temporary network failure")
+
+    monkeypatch.setattr(main, "initialize_clients", lambda config: (None, None, None))
+    monkeypatch.setattr(main.processed_video_registry, "merge_records", fail_registry_parse_during_historical_merge)
+    monkeypatch.setattr(main.processed_video_registry, "read_sheet_marked_ids", lambda: set())
+    monkeypatch.setattr(main, "load_output_df_only", lambda _root: pd.DataFrame(columns=["v_id", "url", "status"]))
+    monkeypatch.setattr(main.channel_crawl, "build_queue_and_get_candidates",
+                        lambda *_args, **_kwargs: (None, candidate_df, []))
+    monkeypatch.setattr(main.channel_crawl, "load_channel_df", lambda _root: [])
+    monkeypatch.setattr(main, "create_transcript_preprocessor", lambda *args: object())
+    monkeypatch.setattr(main, "SharedStateWriter", Writer)
+    monkeypatch.setattr(main, "ClaimManager", Claims)
+    monkeypatch.setattr(main, "process_single_video", fake_process)
+    monkeypatch.setattr(main, "_run_batch_cleanup", lambda *args, **kwargs: None)
+    monkeypatch.setattr(main.time, "sleep", lambda *_: None)
+    monkeypatch.setenv("P03_DRIVE_BACKEND", "desktop")
+    monkeypatch.setenv("P03_DRIVE_SYNC_ENABLED", "0")
+    monkeypatch.setenv("P03_MANUAL_SINCE", "2026-01-01")
+    monkeypatch.delenv("P03_SHEET_IMPORT_ENABLED", raising=False)
+    config = {
+        "BASE_PATH": str(base), "DATA_ROOT": str(data), "WORK_PATH": str(base),
+        "HF_HOME": str(tmp_path / "hf"), "OUTPUT_MD_PATH": str(md),
+        "CHANNEL_CRAWL": True, "YOUTUBE_API_KEY": "test-key", "VIDEO_WORKERS": 1,
+        "MIN_WAIT_BETWEEN_VIDEOS": 0, "MAX_WAIT_BETWEEN_VIDEOS": 0,
+        "EXTENDED_WAIT_INTERVAL": 100, "EXTENDED_WAIT_DURATION": 0,
+        "MAX_CONSECUTIVE_FAILURES": 2, "FAILURE_WAIT_MULTIPLIER": 1,
+        "CRAWL_QUEUE_MAX_RETRIES": 2,
+    }
+
+    main.process_videos(config)
+
+    assert len(merge_calls) == 1
+    assert seen == [(channel_url, None)]
+    assert "injected registry parse failure" in caplog.text
+    assert "manual admission is disabled for this run" in caplog.text
+    ledger = mvi.read_ledger(data / "manual_input_status.csv")
+    assert ledger.loc[ledger.video_id == "manualold01", "status"].iloc[0] == "skipped_historical"
 
 
 class FakeSheets:
