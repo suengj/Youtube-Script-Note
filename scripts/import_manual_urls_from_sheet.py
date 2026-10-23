@@ -14,6 +14,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 from manual_video_input import (SHEET_ID, SHEET_TAB, normalize_youtube_url,
                                 build_sheets_service, read_sheet_rows)  # noqa: E402
+from input_df_csv import read_input_df  # noqa: E402
 from processed_video_registry import (input_video_ids, processed_ids, processed_id_union,
                                       read_registry)  # noqa: E402
 
@@ -43,10 +44,7 @@ def _read_frame(path: Path):
     import pandas as pd
     if not path.exists():
         return pd.DataFrame(columns=["date", "url"]), "cp949"
-    try:
-        return pd.read_csv(path, encoding="cp949", dtype=str, keep_default_na=False), "cp949"
-    except UnicodeDecodeError:
-        return pd.read_csv(path, encoding="utf-8-sig", dtype=str, keep_default_na=False), "utf-8-sig"
+    return read_input_df(path, dtype=str, keep_default_na=False, return_encoding=True)
 
 
 def _write_frame_atomic(frame, path: Path, encoding: str) -> None:
