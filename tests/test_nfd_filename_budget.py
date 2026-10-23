@@ -32,6 +32,12 @@ CASES = [
 ]
 
 
+@pytest.fixture(autouse=True)
+def explicit_desktop_manifest_writer(monkeypatch):
+    monkeypatch.setenv("P03_DRIVE_BACKEND", "desktop")
+    monkeypatch.setenv("P03_MANIFEST_WRITER", "desktop")
+
+
 def _b(s: str, form: str) -> int:
     return len(ud.normalize(form, s).encode("utf-8"))
 

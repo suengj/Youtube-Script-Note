@@ -13,11 +13,12 @@ import pytest
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from drive_api_sink import DriveApiSink, DriveUploadError, MANIFEST_FILE_ID, SUMMARY_FOLDER_ID
+from drive_api_sink import DriveApiSink, DriveUploadError, INVENTORY_FILE_NAME, MANIFEST_FILE_ID, SUMMARY_FOLDER_ID
 from scripts.drive_yt_summary.manifest import (
     build_inventory_record,
     merge_manifest_source,
     parse_manifest_yaml,
+    reconcile_inventory_scope,
     serialize_manifest_yaml,
 )
 
@@ -44,14 +45,18 @@ def _install_fake_media(monkeypatch):
 
 
 class _FakeDrive:
-    def __init__(self, *, manifest=True, corrupt_manifest_readback=False):
+    def __init__(self, *, manifest=True, corrupt_manifest_readback=False, corrupt_inventory_readback=False):
         self.items = {}
         self.next_id = 10
         self.manifest_update_count = 0
         self.created_manifest_count = 0
         self.corrupt_manifest_readback = corrupt_manifest_readback
+        self.corrupt_manifest_after_update_count = None
+        self.corrupt_inventory_readback = corrupt_inventory_readback
+        self.created_inventory_count = 0
         self.manifest_get_count = 0
         self.on_second_manifest_get = None
+        self.on_after_manifest_update = None
         if manifest:
             self._set_manifest({"version": 1, "generated_at": "legacy", "items": []}, revision="1")
 
@@ -95,6 +100,8 @@ class _FakeDrive:
             self.items[file_id] = item
             if body.get("name") == "manifest.yaml":
                 self.created_manifest_count += 1
+            if body.get("name") == INVENTORY_FILE_NAME:
+                self.created_inventory_count += 1
             return {"id": file_id}
         return _Request(run)
 
@@ -110,6 +117,9 @@ class _FakeDrive:
                 item["headRevisionId"] = str(int(item.get("headRevisionId", "0")) + 1)
                 if fileId == MANIFEST_FILE_ID:
                     self.manifest_update_count += 1
+                    if self.on_after_manifest_update:
+                        hook, self.on_after_manifest_update = self.on_after_manifest_update, None
+                        hook()
             return {"id": fileId}
         return _Request(run)
 
@@ -129,8 +139,13 @@ class _FakeDrive:
     def get_media(self, fileId):
         def run():
             payload = self.items[fileId].get("data", b"")
-            if fileId == MANIFEST_FILE_ID and self.corrupt_manifest_readback and self.manifest_update_count:
+            if (fileId == MANIFEST_FILE_ID and self.corrupt_manifest_readback and self.manifest_update_count and
+                    (self.corrupt_manifest_after_update_count is None or
+                     self.manifest_update_count > self.corrupt_manifest_after_update_count)):
                 return payload + b"\n# corrupt readback"
+            if (self.items[fileId].get("name") == INVENTORY_FILE_NAME and
+                    self.corrupt_inventory_readback):
+                return payload + b" "
             return payload
         return _Request(run)
 
@@ -186,6 +201,22 @@ def test_legacy_item_is_not_timestamp_backfilled_or_rewritten_for_same_hash():
     manifest_item = sink.read_manifest()["items"][0]
     assert manifest_item == legacy
     assert drive.manifest_update_count == updates
+
+
+def test_recovered_existing_content_revision_keeps_actual_revision_time_unknown():
+    original = {"file": "title_abcdefghijk.md", "title": "old", "hash": hashlib.sha256(b"old").hexdigest(),
+                "revision": 4, "video_id": "abcdefghijk", "content_revision_at": "2026-10-01T00:00:00Z"}
+    recovered, change, changed = merge_manifest_source(
+        {"version": 1, "items": [original]}, file=original["file"], title="new",
+        content_hash=hashlib.sha256(b"new recovered bytes").hexdigest(), video_id="abcdefghijk",
+        drive_file_id="drive-source", recovered=True, now="2026-10-23T12:00:00Z",
+    )
+    item = recovered["items"][0]
+    assert changed is True
+    assert change["action"] == "revised"
+    assert item["revision"] == 5
+    assert "content_revision_at" not in item
+    assert item["recovered_at"] == "2026-10-23T12:00:00Z"
 
 
 def test_dedupe_repairs_missing_manifest_entry_as_recovered_unknown_finalization():
@@ -255,25 +286,44 @@ def test_head_revision_or_md5_change_before_update_remerges_latest_document():
     assert {item["video_id"] for item in items} == {"abcdefghijk", "lmnopqrst"}
 
 
+def test_post_update_clobber_is_detected_and_missing_pre_read_items_are_restored():
+    drive = _FakeDrive()
+    old_item = {"file": "old_abcdefghijk.md", "title": "Old", "hash": hashlib.sha256(b"old").hexdigest(),
+                "revision": 1, "video_id": "abcdefghijk", "drive_file_id": "old-drive-id"}
+    drive._set_manifest({"version": 1, "items": [old_item]}, revision="1")
+    sink = DriveApiSink(drive)
+
+    def racing_writer_drops_pre_read_item():
+        current = parse_manifest_yaml(drive.items[MANIFEST_FILE_ID]["data"])
+        current["items"] = [item for item in current["items"] if item.get("drive_file_id") != "old-drive-id"]
+        drive._set_manifest(current, revision=str(int(drive.items[MANIFEST_FILE_ID]["headRevisionId"]) + 1))
+
+    drive.on_after_manifest_update = racing_writer_drops_pre_read_item
+    _merge(sink, file="local_lmnopqrst.md", video_id="lmnopqrst", summary=b"local", drive_file_id="local-id")
+    items = sink.read_manifest()["items"]
+    assert {item.get("drive_file_id") for item in items} == {"old-drive-id", "local-id"}
+
+
 @pytest.mark.parametrize(
-    "kwargs, expected",
+    "kwargs",
     [
-        ({"succeeded": 1, "failed": 0, "unresolved": 0, "discovery_complete": True,
-          "all_successes_present": True, "manifest_readback_verified": True, "completed": True}, True),
-        ({"succeeded": 1, "failed": 1, "unresolved": 0, "discovery_complete": True,
-          "all_successes_present": True, "manifest_readback_verified": True, "completed": True}, False),
-        ({"succeeded": 1, "failed": 0, "unresolved": 0, "discovery_complete": False,
-          "all_successes_present": True, "manifest_readback_verified": True, "completed": True}, False),
-        ({"succeeded": 1, "failed": 0, "unresolved": 0, "discovery_complete": True,
-          "all_successes_present": True, "manifest_readback_verified": True, "completed": False}, False),
+        {"succeeded": 1, "failed": 0, "unresolved": 0, "discovery_complete": True,
+         "all_successes_present": True, "manifest_readback_verified": True, "completed": True},
+        {"succeeded": 1, "failed": 1, "unresolved": 0, "discovery_complete": True,
+         "all_successes_present": True, "manifest_readback_verified": True, "completed": True},
+        {"succeeded": 1, "failed": 0, "unresolved": 0, "discovery_complete": False,
+         "all_successes_present": True, "manifest_readback_verified": True, "completed": True},
+        {"succeeded": 1, "failed": 0, "unresolved": 0, "discovery_complete": True,
+         "all_successes_present": True, "manifest_readback_verified": True, "completed": False},
     ],
 )
-def test_inventory_completeness_requires_full_verified_scope(kwargs, expected):
+def test_inventory_manifest_record_never_self_asserts_completion(kwargs):
     record = build_inventory_record(
         producer_run_id="run-1", coverage_started_at="2026-10-23T00:00:00Z", cutoff={"after": "cursor"},
         now="2026-10-23T00:01:00Z", **kwargs,
     )
-    assert record["inventory_complete"] is expected
+    assert record["inventory_complete"] is False
+    assert record["manifest_readback_verified"] is False
     assert record["coverage_completed_at"] == ("2026-10-23T00:01:00Z" if kwargs["completed"] else None)
 
 
@@ -293,9 +343,92 @@ def test_inventory_write_is_readback_verified_and_revision_monotonic():
     final = sink.write_inventory(completed, success_video_ids=["abcdefghijk"])
     assert final["inventory_revision"] == 1
     assert final["inventory_complete"] is True
+    assert final["inventory_file_readback_verified"] is True
+    manifest_inventory = sink.read_manifest()["inventory"]
+    assert manifest_inventory["inventory_complete"] is False
+    assert manifest_inventory["manifest_readback_verified"] is False
+    evidence = sink.read_inventory_evidence()
+    assert evidence["inventory"]["inventory_complete"] is True
+    assert evidence["manifest_sha256"] == hashlib.sha256(drive.items[MANIFEST_FILE_ID]["data"]).hexdigest()
+    assert drive.created_inventory_count == 1
+    sink.write_inventory(completed, success_video_ids=["abcdefghijk"])
+    assert drive.created_inventory_count == 1
     next_run = {**started, "producer_run_id": "run-2"}
     second = sink.write_inventory(next_run, start=True)
     assert second["inventory_revision"] == 2
+
+
+def test_manifest_readback_failure_never_publishes_completion_evidence():
+    drive = _FakeDrive()
+    sink = DriveApiSink(drive)
+    started = build_inventory_record(producer_run_id="run-1", coverage_started_at="2026-10-23T00:00:00Z",
+                                     cutoff={"mode": "channel_cursor"}, completed=False)
+    sink.write_inventory(started, start=True)
+    drive.corrupt_manifest_readback = True
+    drive.corrupt_manifest_after_update_count = drive.manifest_update_count
+    final = build_inventory_record(
+        producer_run_id="run-1", coverage_started_at=started["coverage_started_at"], cutoff=started["cutoff"],
+        succeeded=0, discovery_complete=True, completed=True, now="2026-10-23T00:01:00Z",
+    )
+    with pytest.raises(DriveUploadError, match="readback"):
+        sink.write_inventory(final)
+    assert drive.created_inventory_count == 0
+    assert parse_manifest_yaml(drive.items[MANIFEST_FILE_ID]["data"])["inventory"]["inventory_complete"] is False
+
+
+def test_inventory_file_readback_failure_cannot_be_trusted():
+    drive = _FakeDrive(corrupt_inventory_readback=True)
+    sink = DriveApiSink(drive)
+    _merge(sink, file="title_abcdefghijk.md", video_id="abcdefghijk", summary=b"success")
+    started = build_inventory_record(producer_run_id="run-1", coverage_started_at="2026-10-23T00:00:00Z",
+                                     cutoff={"mode": "channel_cursor"}, completed=False)
+    sink.write_inventory(started, start=True)
+    complete = build_inventory_record(
+        producer_run_id="run-1", coverage_started_at=started["coverage_started_at"], cutoff=started["cutoff"],
+        succeeded=1, discovery_complete=True, all_successes_present=True, completed=True,
+        now="2026-10-23T00:01:00Z",
+    )
+    with pytest.raises(DriveUploadError, match="inventory evidence"):
+        sink.write_inventory(complete, success_video_ids=["abcdefghijk"])
+    assert sink.read_manifest()["inventory"]["inventory_complete"] is False
+    with pytest.raises(DriveUploadError, match="inventory evidence verification failed"):
+        sink.read_inventory_evidence()
+
+
+def test_inventory_scope_counts_claimed_deferred_and_retry_exhausted_sources():
+    reconciled = reconcile_inventory_scope(
+        {"success0001", "claim000001", "limit000001", "retry000001", "failed00001", "skip000001"},
+        {
+            "success0001": "success",
+            "retry000001": "retry_exhausted",
+            "failed00001": "file_error",
+            "skip000001": "passed_shorts",
+        },
+    )
+    assert reconciled["succeeded"] == 1
+    assert reconciled["failed"] == 2
+    assert reconciled["unresolved"] == 2  # active claim and max-video deferral
+    assert reconciled["terminal_skipped"] == 1
+    assert reconciled["success_video_ids"] == {"success0001"}
+
+
+def test_retry_exhausted_queue_rows_are_declared_even_when_not_candidates():
+    import pandas as pd
+    import channel_crawl
+
+    queue = pd.DataFrame([
+        {"video_id": "retry000001", "status": "failed", "retry_count": 3},
+        {"video_id": "claim000001", "status": "queued", "retry_count": 0},
+    ])
+    report = {}
+    channel_crawl._record_inventory_queue_scope(report, queue, max_retries=3)
+    assert report["queue_scope_video_ids"] == ["claim000001", "retry000001"]
+    assert report["retry_exhausted_video_ids"] == ["retry000001"]
+    reconciled = reconcile_inventory_scope(
+        report["queue_scope_video_ids"], {report["retry_exhausted_video_ids"][0]: "retry_exhausted"}
+    )
+    assert reconciled["failed"] == 1
+    assert reconciled["unresolved"] == 1
 
 
 @pytest.mark.parametrize(("failed_channel", "expected_complete"), [(None, True), ("UC" + "b" * 22, False)])

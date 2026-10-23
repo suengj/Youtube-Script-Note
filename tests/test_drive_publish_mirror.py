@@ -21,6 +21,8 @@ CONTENT = "---\nformat_version: 4.1\ntitle: 제목\n---\n\n# 제목\n\n본문 �
 
 @pytest.fixture
 def env(tmp_path, monkeypatch):
+    monkeypatch.setenv("P03_DRIVE_BACKEND", "desktop")
+    monkeypatch.setenv("P03_MANIFEST_WRITER", "desktop")
     drive = tmp_path / "YT_summary"
     (drive / "source").mkdir(parents=True)
     vault = tmp_path / "vault"

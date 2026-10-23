@@ -18,13 +18,16 @@ from scripts.drive_yt_summary.manifest import (
     parse_manifest_yaml,
     serialize_manifest_yaml,
     set_manifest_inventory,
+    verify_inventory_evidence,
 )
 
 SOURCE_FOLDER_ID = "1777fpf3nO2-4ISKAt_3D1ipiwgJddYY-"
 SUMMARY_FOLDER_ID = "1S-sGDHvkSC1tTKWPYWiSgxmGN2Fz7Clu"
 MANIFEST_FILE_ID = "1NUIcUNlEyYwjHVngghwNlmh4VKiIk7oW"
+INVENTORY_FILE_NAME = "manifest.inventory.json"
 TOKEN_ENV = "P03_DRIVE_TOKEN_FILE"
 MANIFEST_FILE_ID_ENV = "P03_MANIFEST_FILE_ID"
+INVENTORY_FILE_ID_ENV = "P03_INVENTORY_FILE_ID"
 _MANIFEST_THREAD_LOCKS = {}
 _MANIFEST_THREAD_LOCKS_GUARD = threading.Lock()
 
@@ -35,6 +38,43 @@ class DriveUploadError(RuntimeError):
 
 def _sha(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
+
+
+def _manifest_item_tokens(item):
+    return {
+        (key, str(item.get(key) or "").strip())
+        for key in ("drive_file_id", "video_id", "file")
+        if str(item.get(key) or "").strip()
+    }
+
+
+def _manifest_retains_items(before_doc, after_doc):
+    after_tokens = [_manifest_item_tokens(item) for item in after_doc.get("items", [])]
+    return all(
+        any(_manifest_item_tokens(item) & tokens for tokens in after_tokens)
+        for item in before_doc.get("items", [])
+    )
+
+
+def _restore_missing_manifest_items(doc, prior_docs):
+    """Restore source items removed by an observed concurrent manifest revision."""
+    restored = dict(doc)
+    restored_items = [dict(item) for item in doc.get("items", [])]
+    restored["items"] = restored_items
+    tokens = [_manifest_item_tokens(item) for item in restored_items]
+    changed = False
+    for prior in prior_docs:
+        for key, value in prior.items():
+            if key != "items" and key not in restored:
+                restored[key] = value
+                changed = True
+        for item in prior.get("items", []):
+            item_tokens = _manifest_item_tokens(item)
+            if item_tokens and not any(item_tokens & current for current in tokens):
+                restored_items.append(dict(item))
+                tokens.append(item_tokens)
+                changed = True
+    return restored, changed
 
 
 class DriveApiSink:
@@ -114,28 +154,32 @@ class DriveApiSink:
     def _manifest_signature(meta):
         return (str(meta.get("headRevisionId") or ""), str(meta.get("md5Checksum") or ""))
 
-    def _modify_manifest(self, mutator, *, max_attempts=5):
+    def _modify_manifest(self, mutator, *, max_attempts=5, after_verified=None):
         """Locked read/merge/update with a last-moment revision/checksum check."""
         from googleapiclient.http import MediaIoBaseUpload
 
         with self._manifest_lock():
             last_conflict = False
+            preserved_docs = []
             for attempt in range(max_attempts):
                 meta = self._manifest_metadata()
                 try:
-                    _, doc = self._download_manifest(meta)
+                    current_payload, doc = self._download_manifest(meta)
                 except DriveUploadError as exc:
                     if "checksum does not match Drive metadata" in str(exc):
                         last_conflict = True
                         continue
                     raise
+                doc, restored_missing = _restore_missing_manifest_items(doc, preserved_docs)
                 try:
                     updated_doc, result, changed = mutator(doc)
                 except DriveUploadError:
                     raise
                 except Exception as exc:
                     raise DriveUploadError(f"canonical manifest merge failed: {type(exc).__name__}: {exc}") from exc
-                if not changed:
+                if not changed and not restored_missing:
+                    if after_verified:
+                        return after_verified(current_payload, doc, result)
                     return result
                 payload = serialize_manifest_yaml(updated_doc)
 
@@ -160,9 +204,29 @@ class DriveApiSink:
                     if isinstance(readback, str):
                         readback = readback.encode("utf-8")
                     readback = bytes(readback)
-                    if (_sha(readback) != _sha(payload) or
-                            hashlib.md5(readback).hexdigest() != readback_meta.get("md5Checksum")):
+                    readback_md5_valid = hashlib.md5(readback).hexdigest() == readback_meta.get("md5Checksum")
+                    if not readback_md5_valid:
                         raise DriveUploadError("canonical manifest SHA-256 readback verification failed")
+                    try:
+                        readback_doc = parse_manifest_yaml(readback)
+                    except Exception as exc:
+                        raise DriveUploadError("canonical manifest readback YAML is invalid") from exc
+                    expected_revision = str(latest_meta.get("headRevisionId") or "")
+                    observed_revision = str(readback_meta.get("headRevisionId") or "")
+                    revision_jump = bool(
+                        expected_revision.isdigit() and observed_revision.isdigit() and
+                        int(observed_revision) != int(expected_revision) + 1
+                    )
+                    if (revision_jump or not _manifest_retains_items(doc, readback_doc) or
+                            _sha(readback) != _sha(payload)):
+                        # A valid but unexpected readback indicates an external
+                        # writer raced the unconditional Drive update. Preserve all
+                        # observed rows and re-merge from the new head, bounded.
+                        preserved_docs.extend((doc, readback_doc))
+                        last_conflict = True
+                        continue
+                    if after_verified:
+                        return after_verified(readback, updated_doc, result)
                     return result
                 except DriveUploadError:
                     raise
@@ -202,7 +266,12 @@ class DriveApiSink:
         return {**change, "drive_file_id": drive_file_id}
 
     def write_inventory(self, inventory: dict, *, start=False, success_video_ids=()):
-        """Write run coverage to the same manifest and verify its exact bytes."""
+        """Write provisional inventory to the manifest and verified completion beside it.
+
+        The manifest never advertises completion. A separate JSON evidence file is
+        published only after exact manifest readback, and the caller receives a
+        complete record only after that evidence file also passes readback.
+        """
         incoming = dict(inventory)
         success_ids = {str(value).strip() for value in success_video_ids if str(value).strip()}
         source_counts = incoming.get("source_counts") or {}
@@ -220,23 +289,47 @@ class DriveApiSink:
             all_successes_present = (len(success_ids) == expected_success_count and success_ids.issubset(present))
             record = dict(incoming)
             record["all_successes_present"] = all_successes_present
-            # This flag describes verified producer readback for the inventory
-            # write below; the method returns only after SHA-256 has matched.
-            record["manifest_readback_verified"] = True
-            record["inventory_complete"] = bool(
-                record.get("batch_completed") and record.get("discovery_complete") and
-                int((record.get("source_counts") or {}).get("failed", 0)) == 0 and
-                int((record.get("source_counts") or {}).get("unresolved", 0)) == 0 and
-                all_successes_present and record["manifest_readback_verified"]
-            )
+            # A manifest cannot prove that its own bytes were read back. Keep its
+            # completion flags false in every state; completion lives in the
+            # separately checksummed evidence file below.
+            record["manifest_readback_verified"] = False
+            record["inventory_complete"] = False
             updated, stored_record = set_manifest_inventory(doc, record, start=start)
             return updated, stored_record, updated.get("inventory") != doc.get("inventory")
 
+        def publish_verified_evidence(manifest_payload, _doc, stored_record):
+            counts = stored_record.get("source_counts") or {}
+            complete = bool(
+                stored_record.get("batch_completed") and
+                stored_record.get("discovery_complete") and
+                int(counts.get("failed", 0)) == 0 and
+                int(counts.get("unresolved", 0)) == 0 and
+                stored_record.get("all_successes_present") and
+                len(success_ids) == expected_success_count
+            )
+            if not complete:
+                return stored_record
+            completed_record = dict(stored_record)
+            completed_record["manifest_readback_verified"] = True
+            completed_record["inventory_complete"] = True
+            evidence = {
+                "schema_version": 1,
+                "manifest_file_id": self.manifest_file_id,
+                "manifest_sha256": _sha(manifest_payload),
+                "inventory": completed_record,
+            }
+            self._upsert_inventory_evidence(evidence)
+            # This value is a return receipt, not a self-assertion stored in the
+            # artifact. Consumers independently verify the downloaded MD5/SHA and
+            # that manifest_sha256 names the current canonical bytes.
+            return {**completed_record, "inventory_file_readback_verified": True}
+
         try:
-            return self._modify_manifest(merge)
+            return self._modify_manifest(merge, after_verified=publish_verified_evidence)
         except DriveUploadError:
-            # If an attempted completion write could not be verified, make a
-            # best-effort corrective record that cannot assert full coverage.
+            # Best-effort clearing of the provisional state. If this corrective
+            # write fails, the separate evidence still fails its manifest hash
+            # match whenever the attempted manifest update changed the bytes.
             if not start:
                 failed_record = dict(incoming)
                 failed_record.update({
@@ -252,6 +345,127 @@ class DriveApiSink:
                 except Exception:
                     pass
             raise
+
+    def _inventory_metadata(self):
+        configured_id = (os.getenv(INVENTORY_FILE_ID_ENV) or "").strip()
+        try:
+            files = self._drive.files()
+            matches = []
+            page_token = None
+            while True:
+                kwargs = {
+                    "q": f"'{self.summary_folder_id}' in parents and name='{INVENTORY_FILE_NAME}' and trashed=false",
+                    "spaces": "drive", "pageSize": 1000,
+                    "fields": "nextPageToken,files(id,name,mimeType,parents,md5Checksum,headRevisionId)",
+                    "supportsAllDrives": True, "includeItemsFromAllDrives": True,
+                }
+                if page_token:
+                    kwargs["pageToken"] = page_token
+                response = files.list(**kwargs).execute()
+                matches.extend(
+                    item for item in response.get("files", [])
+                    if item.get("name") == INVENTORY_FILE_NAME and
+                    self.summary_folder_id in item.get("parents", [])
+                )
+                page_token = response.get("nextPageToken")
+                if not page_token:
+                    break
+        except Exception as exc:
+            raise DriveUploadError(f"inventory evidence search failed: {type(exc).__name__}") from exc
+        if len(matches) > 1:
+            raise DriveUploadError("multiple manifest inventory evidence files exist; refusing ambiguous completion")
+        if configured_id and (not matches or matches[0].get("id") != configured_id):
+            raise DriveUploadError("configured inventory evidence file ID does not match the unique sibling file")
+        if not matches:
+            return None
+        meta = matches[0]
+        if (meta.get("name") != INVENTORY_FILE_NAME or
+                meta.get("mimeType") != "application/json" or
+                self.summary_folder_id not in meta.get("parents", [])):
+            raise DriveUploadError("inventory evidence identity or parent verification failed")
+        return meta
+
+    def _upsert_inventory_evidence(self, evidence: dict):
+        """Create the sibling evidence once, then update its fixed Drive ID in place."""
+        from googleapiclient.http import MediaIoBaseUpload
+
+        payload = json.dumps(evidence, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        meta = self._inventory_metadata()
+        file_id = meta.get("id") if meta else ""
+        if (os.getenv(INVENTORY_FILE_ID_ENV) or "").strip() and not meta:
+            raise DriveUploadError("configured inventory evidence file ID is not present under the canonical parent")
+        if meta and (os.getenv(INVENTORY_FILE_ID_ENV) or "").strip() and file_id != os.getenv(INVENTORY_FILE_ID_ENV).strip():
+            raise DriveUploadError("configured inventory evidence file ID does not match Drive metadata")
+        try:
+            media = MediaIoBaseUpload(io.BytesIO(payload), mimetype="application/json", resumable=False)
+            if file_id:
+                self._drive.files().update(
+                    fileId=file_id,
+                    body={"name": INVENTORY_FILE_NAME},
+                    media_body=media,
+                    fields="id,md5Checksum,headRevisionId",
+                    supportsAllDrives=True,
+                ).execute()
+            else:
+                file_id = self._drive.files().create(
+                    body={
+                        "name": INVENTORY_FILE_NAME,
+                        "mimeType": "application/json",
+                        "parents": [self.summary_folder_id],
+                        "appProperties": {"p03_kind": "manifest_inventory", "manifest_file_id": self.manifest_file_id},
+                    },
+                    media_body=media,
+                    fields="id",
+                    supportsAllDrives=True,
+                ).execute()["id"]
+            read_meta = self._drive.files().get(
+                fileId=file_id,
+                fields="id,name,mimeType,parents,md5Checksum,headRevisionId",
+                supportsAllDrives=True,
+            ).execute()
+            readback = self._drive.files().get_media(fileId=file_id).execute()
+            if isinstance(readback, str):
+                readback = readback.encode("utf-8")
+            readback = bytes(readback)
+            if (read_meta.get("id") != file_id or read_meta.get("name") != INVENTORY_FILE_NAME or
+                    read_meta.get("mimeType") != "application/json" or
+                    self.summary_folder_id not in read_meta.get("parents", []) or
+                    hashlib.md5(readback).hexdigest() != read_meta.get("md5Checksum") or
+                    _sha(readback) != _sha(payload) or json.loads(readback.decode("utf-8")) != evidence):
+                raise DriveUploadError("inventory evidence SHA-256 readback verification failed")
+            # Catch duplicate creation by a non-cooperating first-time writer.
+            current = self._inventory_metadata()
+            if not current or current.get("id") != file_id:
+                raise DriveUploadError("inventory evidence file identity changed after write")
+            return file_id
+        except DriveUploadError:
+            raise
+        except Exception as exc:
+            raise DriveUploadError(f"inventory evidence update/readback failed: {type(exc).__name__}") from exc
+
+    def read_inventory_evidence(self):
+        """Read and verify the sibling evidence against the current manifest bytes."""
+        manifest_meta = self._manifest_metadata()
+        manifest_payload = self._drive.files().get_media(fileId=self.manifest_file_id).execute()
+        if isinstance(manifest_payload, str):
+            manifest_payload = manifest_payload.encode("utf-8")
+        manifest_payload = bytes(manifest_payload)
+        if hashlib.md5(manifest_payload).hexdigest() != manifest_meta.get("md5Checksum"):
+            raise DriveUploadError("canonical manifest download checksum does not match Drive metadata")
+        evidence_meta = self._inventory_metadata()
+        if not evidence_meta:
+            return None
+        evidence_payload = self._drive.files().get_media(fileId=evidence_meta["id"]).execute()
+        if isinstance(evidence_payload, str):
+            evidence_payload = evidence_payload.encode("utf-8")
+        try:
+            return verify_inventory_evidence(
+                manifest_payload, bytes(evidence_payload),
+                evidence_md5=evidence_meta.get("md5Checksum", ""),
+                expected_manifest_file_id=self.manifest_file_id,
+            )
+        except Exception as exc:
+            raise DriveUploadError(f"inventory evidence verification failed: {exc}") from exc
 
     @staticmethod
     def _build_service():

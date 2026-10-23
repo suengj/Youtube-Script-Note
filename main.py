@@ -80,7 +80,7 @@ from preprocess_backend import create_transcript_preprocessor, TranscriptPreproc
 from llm_responses import call_responses, ResponsesCallError
 from runtime_resources import device_compute_route, get_device_semaphore
 from p03_state_backup import backup_state
-from scripts.drive_yt_summary.manifest import build_inventory_record, utc_now_iso
+from scripts.drive_yt_summary.manifest import build_inventory_record, reconcile_inventory_scope, utc_now_iso
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -2045,29 +2045,47 @@ def process_videos(config: dict):
             logger.error("Could not start canonical manifest inventory coverage: %s: %s",
                          type(exc).__name__, exc)
 
-    def _finish_manifest_inventory(*, completed, counts, success_video_ids, discovery_report):
+    def _finish_manifest_inventory(*, completed, counts, discovery_report):
         if not api_backend or inventory_sink is None or not callable(getattr(inventory_sink, "write_inventory", None)):
             return
         discovery_complete = bool(discovery_report and discovery_report.get("complete"))
         cutoff = (discovery_report.get("cutoff") if discovery_report else None)
+        scope_ids = set(inventory_scope_video_ids)
+        outcomes = dict(inventory_outcomes)
+        if discovery_report:
+            scope_ids.update(discovery_report.get("queue_scope_video_ids") or ())
+            for video_id in discovery_report.get("retry_exhausted_video_ids") or ():
+                outcomes.setdefault(str(video_id), "retry_exhausted")
+        reconciled = reconcile_inventory_scope(
+            scope_ids,
+            outcomes,
+            extra_unresolved=(
+                int(counts.get("unresolved", 0)) +
+                int((discovery_report or {}).get("unresolved", 0)) +
+                int((discovery_report or {}).get("queue_scope_unresolved", 0))
+            ),
+        )
+        final_counts = {key: reconciled[key] for key in ("succeeded", "failed", "unresolved")}
         record = build_inventory_record(
             producer_run_id=run_id,
             coverage_started_at=run_started_at,
             cutoff=cutoff,
-            succeeded=counts.get("succeeded", 0),
-            failed=counts.get("failed", 0),
-            unresolved=counts.get("unresolved", 0) + int((discovery_report or {}).get("unresolved", 0)),
+            succeeded=final_counts["succeeded"],
+            failed=final_counts["failed"],
+            unresolved=final_counts["unresolved"],
             discovery_complete=discovery_complete,
             all_successes_present=False,
             manifest_readback_verified=False,
             completed=completed,
             now=utc_now_iso() if completed else None,
         )
+        record["source_counts"]["scope_count"] = reconciled["scope_count"]
+        record["source_counts"]["terminal_skipped"] = reconciled["terminal_skipped"]
         try:
             stored = inventory_sink.write_inventory(
                 record,
                 start=not inventory_start_written,
-                success_video_ids=success_video_ids,
+                success_video_ids=reconciled["success_video_ids"],
             )
             logger.info("Canonical manifest inventory coverage: complete=%s discovery_complete=%s "
                         "succeeded=%s failed=%s unresolved=%s revision=%s",
@@ -2086,9 +2104,13 @@ def process_videos(config: dict):
         "complete": not bool(config.get("CHANNEL_CRAWL")),
         "unresolved": 0,
         "cutoff": inventory_cutoff,
+        "queue_scope_video_ids": [],
+        "retry_exhausted_video_ids": [],
+        "queue_scope_unresolved": 0,
     }
-    inventory_counts = {"succeeded": 0, "failed": 0, "unresolved": 0}
-    inventory_success_video_ids = set()
+    inventory_counts = {"unresolved": 0}
+    inventory_scope_video_ids = set()
+    inventory_outcomes = {}
     if os.getenv("P03_SHEET_IMPORT_ENABLED", "0").strip() == "1":
         since = (os.getenv("P03_SHEET_IMPORT_SINCE") or "").strip()
         if not import_manual_urls_from_sheet._valid_date(since):
@@ -2166,6 +2188,11 @@ def process_videos(config: dict):
                 has_drive_canonical=lambda vid: _has_drive_canonical_for_video(vid, config, base_path),
                 discovery_report=inventory_discovery,
             )
+            for row in shorts_rows or []:
+                video_id = str(row.get("video_id") or "").strip()
+                if video_id:
+                    inventory_scope_video_ids.add(video_id)
+                    inventory_outcomes[video_id] = channel_crawl.SHORTS_STATUS
             if shorts_rows:
                 shorts_df = pd.DataFrame(shorts_rows)
                 if len(shorts_df) > 0:
@@ -2207,7 +2234,6 @@ def process_videos(config: dict):
             _finish_manifest_inventory(
                 completed=False,
                 counts=inventory_counts,
-                success_video_ids=inventory_success_video_ids,
                 discovery_report=inventory_discovery,
             )
             return
@@ -2277,6 +2303,8 @@ def process_videos(config: dict):
     except ValueError:
         logger.warning("Invalid P03_MANUAL_MAX; using default 5")
         manual_max = 5
+    inventory_cutoff = {**(inventory_cutoff or {}), "manual_max": manual_max}
+    inventory_discovery["cutoff"] = inventory_cutoff
     manual_ledger = manual_video_input.skip_historical_processing(
         manual_ledger, manual_df, cutoff)
     terminal_manual_ids = manual_video_input.terminal_manual_ids(
@@ -2349,8 +2377,21 @@ def process_videos(config: dict):
         direct_input_set = {url for _, url, _ in manual_urls}
         url_from_input_set = set(direct_input_set)
         logger.info("Added %d canonical manual video URL(s) by video ID", len(manual_urls))
+
+    # Declare the whole discovered/manual pending scope before VIDEO_ID_FILTER or
+    # MAX_VIDEOS can defer some work. Deferred items stay unresolved at finalization.
+    for url in url_list:
+        try:
+            video_id = str(stt.extract_youtube_id(url) or "").strip()
+        except (ValueError, TypeError):
+            video_id = ""
+        if video_id:
+            inventory_scope_video_ids.add(video_id)
+    inventory_scope_video_ids.update(str(vid).strip() for vid, _, _ in manual_urls if str(vid).strip())
     
     wanted_video_id = config.get("VIDEO_ID_FILTER")
+    inventory_cutoff = {**(inventory_cutoff or {}), "video_id_filter": wanted_video_id or None}
+    inventory_discovery["cutoff"] = inventory_cutoff
     if wanted_video_id:
         url_list = [u for u in url_list if stt.extract_youtube_id(u) == wanted_video_id]
         if not url_list:
@@ -2364,7 +2405,6 @@ def process_videos(config: dict):
         _finish_manifest_inventory(
             completed=True,
             counts=inventory_counts,
-            success_video_ids=inventory_success_video_ids,
             discovery_report=inventory_discovery,
         )
         return
@@ -2510,20 +2550,11 @@ def process_videos(config: dict):
 
     api_storage_failure = False
     def _record_inventory_result(result: VideoProcessResult) -> None:
-        status = str(result.status or "")
-        if status in {"success", "already_existed"}:
-            inventory_counts["succeeded"] += 1
-            video_id = str(result.video_id or "").strip()
-            if re.fullmatch(r"[A-Za-z0-9_-]{11}", video_id):
-                inventory_success_video_ids.add(video_id)
-            else:
-                inventory_counts["unresolved"] += 1
-        elif status in {
-            "error", "download_failed", "mlx_error", "captions_error", "SOURCE_UNAVAILABLE",
-            "source_unavailable", "api_error", "file_error", "NO_AUTO_CAPTION", "manual_review",
-            "durable_transcript_unreadable",
-        }:
-            inventory_counts["failed"] += 1
+        status = str(result.status or "").strip()
+        video_id = str(result.video_id or "").strip()
+        if re.fullmatch(r"[A-Za-z0-9_-]{11}", video_id):
+            inventory_scope_video_ids.add(video_id)
+            inventory_outcomes[video_id] = status
         else:
             inventory_counts["unresolved"] += 1
 
@@ -2756,7 +2787,10 @@ def process_videos(config: dict):
 
     if config.get('CHANNEL_CRAWL'):
         try:
-            channel_crawl.update_channel_last_processed_from_queue(data_root, crawl_queue_df)
+            channel_crawl.update_channel_last_processed_from_queue(
+                data_root, crawl_queue_df,
+                exclude_channel_ids=inventory_discovery.get("cursor_blocked_channels", []),
+            )
             logger.info("Updated channel_df.csv last_processed_published_at from crawl queue(done).")
         except Exception as e:
             logger.warning(f"Failed to update channel_df: {e}")
@@ -2891,7 +2925,6 @@ def process_videos(config: dict):
     _finish_manifest_inventory(
         completed=True,
         counts=inventory_counts,
-        success_video_ids=inventory_success_video_ids,
         discovery_report=inventory_discovery,
     )
 

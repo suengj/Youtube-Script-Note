@@ -126,8 +126,14 @@ def merge_manifest_source(
             "hash": content_hash,
             "revision": revision + 1,
             "video_id": video_id,
-            "content_revision_at": stamp,
         })
+        if recovered:
+            # The bytes were found during reconciliation, so the actual time this
+            # content revision occurred is unknown. Record when we recovered it.
+            item.pop("content_revision_at", None)
+            item["recovered_at"] = stamp
+        else:
+            item["content_revision_at"] = stamp
         if drive_file_id:
             item["drive_file_id"] = drive_file_id
         updated["items"][index] = item
@@ -170,10 +176,6 @@ def build_inventory_record(
     counts = {"succeeded": int(succeeded), "failed": int(failed), "unresolved": int(unresolved)}
     if any(value < 0 for value in counts.values()):
         raise ValueError("inventory source counts cannot be negative")
-    complete = bool(
-        completed and discovery_complete and counts["failed"] == 0 and
-        counts["unresolved"] == 0 and all_successes_present and manifest_readback_verified
-    )
     return {
         "inventory_revision": int(inventory_revision),
         "producer_run_id": str(producer_run_id),
@@ -182,10 +184,12 @@ def build_inventory_record(
         "cutoff": cutoff,
         "source_counts": counts,
         "discovery_complete": bool(discovery_complete),
-        "manifest_readback_verified": bool(manifest_readback_verified),
+        # These flags are only set in the detached completion evidence after the
+        # manifest bytes and that evidence file have both passed readback.
+        "manifest_readback_verified": False,
         "all_successes_present": bool(all_successes_present),
         "batch_completed": bool(completed),
-        "inventory_complete": complete,
+        "inventory_complete": False,
     }
 
 
@@ -210,7 +214,9 @@ def set_manifest_inventory(doc: dict, inventory: dict, *, start: bool) -> tuple[
             raise ValueError("manifest inventory revision is invalid")
         return revision
 
-    record = dict(inventory)
+    # The producer owns known coverage fields, but newer or consumer-specific
+    # metadata must survive a later producer run.
+    record = {**(current or {}), **inventory}
     if start:
         if current and current.get("producer_run_id") == record.get("producer_run_id"):
             revision = current_revision()
@@ -224,6 +230,84 @@ def set_manifest_inventory(doc: dict, inventory: dict, *, start: bool) -> tuple[
     updated = dict(doc)
     updated["inventory"] = record
     return updated, record
+
+
+def reconcile_inventory_scope(scope_video_ids, outcomes, *, extra_unresolved: int = 0):
+    """Count every declared source, including deferred and skipped queue rows.
+
+    Outcomes are keyed by source ID. Only a completed producer result is terminal;
+    active claims, max-video deferrals, and other missing outcomes remain unresolved.
+    Explicit retry-exhaustion remains a failure and therefore blocks completeness.
+    """
+    scope = {str(value).strip() for value in scope_video_ids if str(value).strip()}
+    normalized = {
+        str(video_id).strip(): str(status or "").strip().lower()
+        for video_id, status in (outcomes or {}).items()
+        if str(video_id).strip()
+    }
+    scope.update(normalized)
+    successes = {"success", "already_existed"}
+    failures = {
+        "error", "download_failed", "mlx_error", "captions_error", "source_unavailable",
+        "api_error", "file_error", "no_auto_caption", "manual_review",
+        "durable_transcript_unreadable", "retry_exhausted",
+    }
+    verified_skips = {
+        "passed_shorts", "short", "video_unavailable", "skipped_auto_subs_only", "oversized_file",
+    }
+    success_ids = {video_id for video_id in scope if normalized.get(video_id) in successes}
+    failed_ids = {video_id for video_id in scope if normalized.get(video_id) in failures}
+    terminal_ids = success_ids | failed_ids | {
+        video_id for video_id in scope if normalized.get(video_id) in verified_skips
+    }
+    unresolved = len(scope - terminal_ids) + max(0, int(extra_unresolved or 0))
+    return {
+        "succeeded": len(success_ids),
+        "failed": len(failed_ids),
+        "unresolved": unresolved,
+        "scope_count": len(scope) + max(0, int(extra_unresolved or 0)),
+        "terminal_skipped": len(terminal_ids - success_ids - failed_ids),
+        "success_video_ids": success_ids,
+    }
+
+
+def verify_inventory_evidence(
+    manifest_bytes: bytes,
+    evidence_bytes: bytes,
+    *,
+    evidence_md5: str = "",
+    expected_manifest_file_id: str = "",
+) -> dict:
+    """Return validated inventory evidence only when both downloads are intact.
+
+    Consumers must compare the evidence's manifest SHA-256 with the exact current
+    canonical manifest bytes and, when Drive metadata is available, verify the
+    evidence download against its metadata MD5.
+    """
+    import hashlib
+    import json
+
+    manifest_bytes = bytes(manifest_bytes)
+    evidence_bytes = bytes(evidence_bytes)
+    if evidence_md5 and hashlib.md5(evidence_bytes).hexdigest() != evidence_md5:
+        raise ValueError("inventory evidence download does not match Drive metadata")
+    evidence = json.loads(evidence_bytes.decode("utf-8"))
+    inventory = evidence.get("inventory") if isinstance(evidence, dict) else None
+    counts = (inventory or {}).get("source_counts") if isinstance(inventory, dict) else None
+    if not isinstance(inventory, dict) or not inventory.get("inventory_complete"):
+        raise ValueError("inventory evidence is incomplete")
+    if (not inventory.get("manifest_readback_verified") or not inventory.get("batch_completed") or
+            not inventory.get("discovery_complete") or not inventory.get("all_successes_present") or
+            not isinstance(counts, dict) or int(counts.get("failed", -1)) != 0 or
+            int(counts.get("unresolved", -1)) != 0):
+        raise ValueError("inventory evidence does not prove complete verified coverage")
+    if not inventory.get("coverage_completed_at") or int(inventory.get("inventory_revision", 0)) < 1:
+        raise ValueError("inventory evidence has no verified coverage end or revision")
+    if expected_manifest_file_id and evidence.get("manifest_file_id") != expected_manifest_file_id:
+        raise ValueError("inventory evidence references a different canonical manifest ID")
+    if evidence.get("manifest_sha256") != hashlib.sha256(manifest_bytes).hexdigest():
+        raise ValueError("inventory evidence does not match current manifest bytes")
+    return evidence
 
 
 def _date_from_relative_path(rel: str) -> Optional[str]:

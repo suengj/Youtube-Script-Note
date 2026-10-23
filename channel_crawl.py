@@ -428,7 +428,15 @@ def load_crawl_queue_df(base_path: str):
         for col in CRAWL_QUEUE_COLUMNS:
             if col not in df.columns:
                 df[col] = ""
-        return df[CRAWL_QUEUE_COLUMNS].copy()
+        df = df[CRAWL_QUEUE_COLUMNS].copy()
+        # CSV columns containing only blanks are inferred as float64 by pandas
+        # 3.x. SharedStateWriter later assigns timestamps and status strings into
+        # these columns, which raises instead of accepting the value. Every queue
+        # column except retry_count is a text field and stays mutable as object.
+        for col in CRAWL_QUEUE_COLUMNS:
+            if col != "retry_count":
+                df[col] = df[col].astype(object)
+        return df
     except Exception as e:
         logger.warning("crawl_queue: failed to read queue csv (%s). starting empty queue.", e)
         return pd.DataFrame(columns=CRAWL_QUEUE_COLUMNS)
@@ -637,7 +645,9 @@ def apply_result_to_queue(queue_df, video_id: str, status: str, error_msg: Optio
     return q
 
 
-def update_channel_last_processed_from_queue(base_path: str, queue_df=None) -> None:
+def update_channel_last_processed_from_queue(
+    base_path: str, queue_df=None, *, exclude_channel_ids=None
+) -> None:
     """
     Update channel_df.last_processed_published_at based on queue rows with status=done.
     """
@@ -652,7 +662,8 @@ def update_channel_last_processed_from_queue(base_path: str, queue_df=None) -> N
     q["status"] = q["status"].astype(str).str.strip()
     q["channel_id"] = q["channel_id"].astype(str).str.strip()
     q["published_at"] = q["published_at"].astype(str).str.strip()
-    done = q[q["status"] == "done"]
+    excluded = {str(value).strip() for value in (exclude_channel_ids or ()) if str(value).strip()}
+    done = q[(q["status"] == "done") & ~q["channel_id"].isin(excluded)]
     if len(done) == 0:
         return
 
@@ -670,6 +681,8 @@ def update_channel_last_processed_from_queue(base_path: str, queue_df=None) -> N
 
     for ch in rows:
         cid = ch.get("channel_id", "")
+        if cid in excluded:
+            continue
         if cid not in channel_max:
             continue
         current = _parse_iso_date((ch.get("last_processed_published_at") or "").strip())
@@ -949,6 +962,7 @@ def build_queue_and_get_candidates(
             "channel_count": len(channels),
             "channels_succeeded": 0,
             "channels_failed": [],
+            "cursor_blocked_channels": [],
             "unresolved": 0,
             "complete": False,
             "cutoff": inventory_cutoff_snapshot(base_path, config),
@@ -961,6 +975,8 @@ def build_queue_and_get_candidates(
             int(config.get("CRAWL_QUEUE_MAX_RETRIES", 3) or 3),
         )
         q = expire_live_replay_rows(q, config.get("LIVE_REPLAY_WAIT_HOURS", 72))
+        if discovery_report is not None:
+            _record_inventory_queue_scope(discovery_report, q, int(config.get("CRAWL_QUEUE_MAX_RETRIES", 3) or 3))
         save_crawl_queue_df(base_path, q)
         return q, select_process_candidates(
             q, int(config.get("CRAWL_QUEUE_MAX_RETRIES", 3)),
@@ -1006,6 +1022,9 @@ def build_queue_and_get_candidates(
     if queue_df is not None and len(queue_df) > 0 and "video_id" in queue_df.columns:
         queue_video_ids = set(queue_df["video_id"].astype(str).str.strip())
 
+    if discovery_report is not None:
+        _record_inventory_queue_scope(discovery_report, queue_df, max_retries)
+
     discovered_rows: List[Dict[str, Any]] = []
     shorts_rows_for_output_df: List[Dict[str, str]] = []
     now_iso = _now_iso()
@@ -1041,6 +1060,7 @@ def build_queue_and_get_candidates(
             )
             if discovery_report is not None:
                 discovery_report["channels_failed"].append(cid)
+                discovery_report["cursor_blocked_channels"].append(cid)
             continue
 
         cursor_dt = _parse_iso_date(last_discovered_s) if last_discovered_s else None
@@ -1050,6 +1070,7 @@ def build_queue_and_get_candidates(
             logger.warning("channel_df: invalid discovery cursor; skipping channel: %s", cid)
             if discovery_report is not None:
                 discovery_report["channels_failed"].append(cid)
+                discovery_report["cursor_blocked_channels"].append(cid)
             continue
         uploads_id = ch.get("uploads_playlist_id") or None
         if uploads_id and not _is_valid_uploads_playlist_id(uploads_id):
@@ -1093,11 +1114,13 @@ def build_queue_and_get_candidates(
         filtered_entries: List[Dict[str, Any]] = []
         seen_discovery_ids: set[str] = set()
         discovered_dt_max: Optional[datetime] = cursor_dt
+        channel_cursor_safe = bool(channel_discovery.get("complete"))
 
         for e in entries:
             pub_s = e.get("published_at") or ""
             pub_dt = _parse_iso_date(pub_s) if pub_s else None
             if not pub_dt:
+                channel_cursor_safe = False
                 if discovery_report is not None:
                     discovery_report["unresolved"] += 1
                 continue
@@ -1120,6 +1143,7 @@ def build_queue_and_get_candidates(
 
             vid = str(e.get("video_id") or "").strip()
             if not vid:
+                channel_cursor_safe = False
                 if discovery_report is not None:
                     discovery_report["unresolved"] += 1
                 continue
@@ -1140,7 +1164,14 @@ def build_queue_and_get_candidates(
                 continue
             filtered_entries.append(e)
 
-        if discovered_dt_max and (not last_discovered_s or discovered_dt_max > (_parse_iso_date(last_discovered_s) or datetime.min)):
+        if not channel_cursor_safe and discovery_report is not None:
+            blocked = discovery_report.setdefault("cursor_blocked_channels", [])
+            if cid not in blocked:
+                blocked.append(cid)
+
+        if channel_cursor_safe and discovered_dt_max and (
+            not last_discovered_s or discovered_dt_max > (_parse_iso_date(last_discovered_s) or datetime.min)
+        ):
             ch["last_discovered_published_at"] = discovered_dt_max.strftime("%Y-%m-%dT%H:%M:%SZ")
 
         if not filtered_entries:
@@ -1289,6 +1320,8 @@ def build_queue_and_get_candidates(
     candidates_df = select_process_candidates(
         queue_df, max_retries, config.get("LIVE_RETRY_MIN_INTERVAL_MIN", 60)
     )
+    if discovery_report is not None:
+        _record_inventory_queue_scope(discovery_report, queue_df, max_retries)
     logger.info(
         "channel_crawl: queue persisted. total=%d, candidates=%d",
         len(queue_df),
@@ -1308,6 +1341,26 @@ def build_queue_and_get_candidates(
                 r.get("retry_count", 0),
             )
     return queue_df, candidates_df, shorts_rows_for_output_df
+
+
+def _record_inventory_queue_scope(report: Dict[str, Any], queue_df, max_retries: int) -> None:
+    """Declare pending and retry-exhausted queue items in batch coverage scope."""
+    import pandas as pd
+
+    if queue_df is None or len(queue_df) == 0:
+        report["queue_scope_video_ids"] = []
+        report["retry_exhausted_video_ids"] = []
+        report["queue_scope_unresolved"] = 0
+        return
+    pending = queue_df[queue_df["status"].astype(str).str.strip().isin({"queued", "failed"})]
+    ids = pending["video_id"].astype(str).str.strip()
+    valid = ids.ne("") & ids.ne("nan") & ids.ne("None")
+    report["queue_scope_video_ids"] = sorted(set(ids[valid].tolist()))
+    retry_counts = pd.to_numeric(pending["retry_count"], errors="coerce").fillna(0)
+    exhausted = pending[(pending["status"].astype(str).str.strip() == "failed") & (retry_counts >= max_retries)]
+    exhausted_ids = exhausted["video_id"].astype(str).str.strip()
+    report["retry_exhausted_video_ids"] = sorted({value for value in exhausted_ids if value and value not in {"nan", "None"}})
+    report["queue_scope_unresolved"] = int((~valid).sum())
 
 
 def update_channel_last_processed(
