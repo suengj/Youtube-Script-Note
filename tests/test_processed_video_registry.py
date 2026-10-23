@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sys
+import threading
 from pathlib import Path
 
 import pandas as pd
@@ -46,6 +47,44 @@ def test_success_append_is_atomic_and_idempotent(tmp_path):
     assert len(frame) == 1
     assert frame.iloc[0].sources == "channel_success"
     assert frame.iloc[0].model == "gpt-test"
+
+
+def test_concurrent_registry_merges_serialize_read_modify_write(tmp_path, monkeypatch):
+    _empty_registry(tmp_path)
+    path = pvr.registry_path(tmp_path)
+    write_entered = threading.Event()
+    release_write = threading.Event()
+    second_done = threading.Event()
+    original_write = pvr._write_registry_unlocked
+
+    def pause_first_writer(frame, target):
+        if threading.current_thread().name == "registry-writer-a":
+            write_entered.set()
+            assert release_write.wait(5)
+        original_write(frame, target)
+
+    monkeypatch.setattr(pvr, "_write_registry_unlocked", pause_first_writer)
+
+    def merge_a():
+        pvr.merge_records(path, [("writeraaaa1", "channel_success", "success", "")])
+
+    def merge_b():
+        pvr.merge_records(path, [("writerbbbb1", "manual_success", "success", "")])
+        second_done.set()
+
+    first = threading.Thread(target=merge_a, name="registry-writer-a")
+    second = threading.Thread(target=merge_b, name="registry-writer-b")
+    first.start()
+    assert write_entered.wait(5)
+    second.start()
+    # The second RMW must wait until the first atomic replacement completes.
+    assert not second_done.wait(0.1)
+    release_write.set()
+    first.join(5)
+    second.join(5)
+
+    assert not first.is_alive() and not second.is_alive()
+    assert pvr.processed_ids(path) == {"writeraaaa1", "writerbbbb1"}
 
 
 def test_rebuild_is_idempotent_and_never_removes_existing_ids(tmp_path):
@@ -161,4 +200,4 @@ def test_manual_queue_uses_registry_as_processed_authority():
         ["https://youtu.be/abcdefghijk"], [],
         pd.DataFrame([{"v_id": "abcdefghijk", "status": "success"}]),
         mvi.read_ledger("/missing/ledger.csv"), processed_video_ids=set())
-    assert [item[0] for item in queued] == ["abcdefghijk"]
+    assert queued == []

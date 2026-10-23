@@ -251,6 +251,44 @@ def test_manual_input_selection_without_valid_cutoff_requires_importer_marker():
     assert mvi.select_manual_input_rows(frame, "invalid", 5)[0] == ["https://youtu.be/imported001"]
 
 
+def test_manual_input_cap_is_applied_after_processed_ids_are_excluded():
+    frame = pd.DataFrame([
+        {"date": f"2026-10-{day:02d}", "url": f"https://youtu.be/video{day:06d}"}
+        for day in range(1, 7)
+    ])
+
+    queued, _ = mvi.select_manual_input_rows(
+        frame, "2026-10-01", 1,
+        exclude_ids={f"video{day:06d}" for day in range(2, 7)})
+
+    assert queued == ["https://youtu.be/video000001"]
+
+
+@pytest.mark.parametrize("status", ["success", "skipped_historical"])
+def test_terminal_ledger_is_processed_with_stale_registry_and_is_not_rewritten(status):
+    ledger = mvi.read_ledger("/missing/manual.csv")
+    ledger = mvi.upsert_ledger(ledger, video_id="success0001", status=status,
+                               reason="verified success", attempted=True)
+    before = ledger.iloc[0].copy()
+
+    queued, updated = mvi.prepare_manual_queue(
+        ["https://youtu.be/success0001"], [], pd.DataFrame(), ledger,
+        processed_video_ids=set())
+
+    assert queued == []
+    pd.testing.assert_series_equal(updated.iloc[0], before)
+
+
+def test_output_processed_ids_include_every_status_and_unknown_id_url_fallback():
+    frame = pd.DataFrame([
+        {"v_id": "downfail001", "url": "https://youtu.be/ignored0001", "status": "download_failed"},
+        {"v_id": "unknown", "url": "https://youtu.be/urlfallbac1", "status": "unknown"},
+    ])
+
+    assert pvr.output_processed_ids(frame, mvi.normalize_youtube_url) == {
+        "downfail001", "urlfallbac1"}
+
+
 def test_ineligible_processing_rows_become_terminal_without_attempt_or_success_changes():
     frame = pd.DataFrame([
         {"date": "2025-01-01", "url": "https://youtu.be/oldvideo001"},

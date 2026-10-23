@@ -36,7 +36,7 @@ def parse_input_date(value) -> date | None:
         return None
 
 
-def select_manual_input_rows(input_df, cutoff: str | None, max_rows: int = 5):
+def select_manual_input_rows(input_df, cutoff: str | None, max_rows: int | None = 5, *, exclude_ids=None):
     """Return eligible rows in newest-first order, plus all eligible video IDs.
 
     When cutoff is absent or invalid, only rows explicitly marked by the sheet
@@ -85,8 +85,37 @@ def select_manual_input_rows(input_df, cutoff: str | None, max_rows: int = 5):
             continue
         seen.add(identity)
         unique.append(item)
-    limit = max(0, int(max_rows))
-    return [item[3] for item in unique[:limit]], eligible_ids
+    excluded = {str(value).strip() for value in (exclude_ids or ()) if str(value).strip()}
+    candidates = [item[3] for item in unique
+                  if normalize_youtube_url(item[3]).get("video_id") not in excluded]
+    if max_rows is not None:
+        candidates = candidates[:max(0, int(max_rows))]
+    return candidates, eligible_ids
+
+
+def terminal_manual_ids(ledger, max_retries: int = 3) -> set[str]:
+    """IDs already terminal or intentionally held from a new manual attempt."""
+    terminal_statuses = {"success", "skipped_historical", "unsupported", "skipped_policy", "pending_quarantine"}
+    result = set()
+    if ledger is None or not len(ledger):
+        return result
+    for _, row in ledger.iterrows():
+        vid = str(row.get("video_id", "")).strip()
+        if not vid:
+            continue
+        status = str(row.get("status", ""))
+        reason = str(row.get("reason", "") or "")
+        attempts = _attempt_count(row.get("attempts"))
+        regen_attempts = _attempt_count(row.get("regen_attempts"))
+        regen_pending = ("staged Markdown missing or hash mismatch" in reason or
+                         reason.startswith("regen attempt") or regen_attempts > 0)
+        if (status in terminal_statuses or
+                status == "retryable_failed" and (
+                    reason.startswith("pending_drive:") or reason == "regen cap reached" or
+                    regen_pending and regen_attempts >= MAX_REGEN_ATTEMPTS or
+                    not regen_pending and attempts >= max_retries)):
+            result.add(vid)
+    return result
 
 
 def skip_historical_processing(ledger, input_df, cutoff: str | None):
@@ -253,6 +282,15 @@ def prepare_manual_queue(manual_rows, channel_urls, output_df, ledger, max_retri
         if item["kind"] == "video":
             channel_ids.add(item["video_id"])
     processed_video_ids = set(processed_video_ids)
+    # Rebuild the owner-defined admission union here as well as in main so
+    # alternate callers cannot admit an ID just because the registry is stale.
+    import processed_video_registry
+    processed_video_ids |= processed_video_registry.output_processed_ids(
+        output_df, normalize_youtube_url)
+    if len(ledger):
+        processed_video_ids |= set(ledger.loc[
+            ledger.status.astype(str).isin(["success", "skipped_historical"]), "video_id"
+        ].astype(str))
     queued, seen = [], set()
     for source_url in manual_rows:
         source_url = str(source_url or "").strip()
@@ -269,6 +307,10 @@ def prepare_manual_queue(manual_rows, channel_urls, output_df, ledger, max_retri
             continue
         prior = ledger[ledger.video_id.astype(str) == vid]
         prior_status = str(prior.iloc[-1].get("status") or "") if len(prior) else ""
+        # Successful and historical rows are terminal owner records. Never
+        # rewrite them, even when a caller's registry snapshot is stale.
+        if prior_status in {"success", "skipped_historical"}:
+            continue
         if prior_status == "unsupported":
             ledger = upsert_ledger(ledger, video_id=vid, canonical_url=item["canonical_url"],
                                    source_url=source_url, status="unsupported",

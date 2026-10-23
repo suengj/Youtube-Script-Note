@@ -3,6 +3,9 @@ from __future__ import annotations
 
 import os
 import tempfile
+import fcntl
+import threading
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -11,6 +14,7 @@ import pandas as pd
 REGISTRY_NAME = "processed_videos.csv"
 REGISTRY_COLUMNS = ["video_id", "first_seen_at", "sources", "last_status", "model"]
 REGISTRY_SOURCES = {"output_df", "sheet_marked", "manual_success", "channel_success", "skipped_historical"}
+_REGISTRY_THREAD_LOCK = threading.Lock()
 
 
 def registry_path(data_root: str | Path) -> Path:
@@ -31,7 +35,21 @@ def read_registry(path: str | Path):
     return frame[REGISTRY_COLUMNS]
 
 
-def write_registry(frame, path: str | Path) -> None:
+@contextmanager
+def registry_lock(path: str | Path):
+    """Serialize all registry writers using a stable sidecar lock file."""
+    p = Path(path)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = p.with_name(p.name + ".lock")
+    with _REGISTRY_THREAD_LOCK, lock_path.open("a+b") as lock_file:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
+
+def _write_registry_unlocked(frame, path: str | Path) -> None:
     p = Path(path)
     p.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp = tempfile.mkstemp(prefix=p.name + ".", suffix=".tmp", dir=str(p.parent))
@@ -42,6 +60,12 @@ def write_registry(frame, path: str | Path) -> None:
     finally:
         if os.path.exists(tmp):
             os.unlink(tmp)
+
+
+def write_registry(frame, path: str | Path) -> None:
+    """Replace the registry under the shared writer lock."""
+    with registry_lock(path):
+        _write_registry_unlocked(frame, path)
 
 
 def processed_ids(path: str | Path) -> set[str] | None:
@@ -104,31 +128,49 @@ def _now() -> str:
 
 def merge_records(path: str | Path, records) -> None:
     """Merge (video_id, source, status, model, first_seen_at) records atomically."""
-    frame = read_registry(path)
-    if frame is None:
-        frame = pd.DataFrame(columns=REGISTRY_COLUMNS)
-    by_id = {str(row.video_id).strip(): row.to_dict() for _, row in frame.iterrows() if str(row.video_id).strip()}
-    now = _now()
-    for record in records:
-        video_id, source, status, model, *seen_at = record
-        video_id = str(video_id or "").strip()
-        source = str(source or "").strip()
-        if not video_id or video_id.lower() == "unknown" or source not in REGISTRY_SOURCES:
-            continue
-        row = by_id.get(video_id, {"video_id": video_id, "first_seen_at": (seen_at[0] if seen_at else "") or now,
-                                   "sources": "", "last_status": "", "model": ""})
-        sources = set(filter(None, str(row.get("sources", "")).split(";")))
-        sources.add(source)
-        row["sources"] = ";".join(sorted(sources))
-        if status not in (None, ""):
-            row["last_status"] = str(status)
-        if model not in (None, ""):
-            row["model"] = str(model)
-        if not row.get("first_seen_at"):
-            row["first_seen_at"] = (seen_at[0] if seen_at else "") or now
-        by_id[video_id] = row
-    merged = pd.DataFrame([by_id[key] for key in sorted(by_id)], columns=REGISTRY_COLUMNS)
-    write_registry(merged, path)
+    with registry_lock(path):
+        frame = read_registry(path)
+        if frame is None:
+            frame = pd.DataFrame(columns=REGISTRY_COLUMNS)
+        by_id = {str(row.video_id).strip(): row.to_dict() for _, row in frame.iterrows() if str(row.video_id).strip()}
+        now = _now()
+        for record in records:
+            video_id, source, status, model, *seen_at = record
+            video_id = str(video_id or "").strip()
+            source = str(source or "").strip()
+            if not video_id or video_id.lower() == "unknown" or source not in REGISTRY_SOURCES:
+                continue
+            row = by_id.get(video_id, {"video_id": video_id, "first_seen_at": (seen_at[0] if seen_at else "") or now,
+                                       "sources": "", "last_status": "", "model": ""})
+            sources = set(filter(None, str(row.get("sources", "")).split(";")))
+            sources.add(source)
+            row["sources"] = ";".join(sorted(sources))
+            if status not in (None, ""):
+                row["last_status"] = str(status)
+            if model not in (None, ""):
+                row["model"] = str(model)
+            if not row.get("first_seen_at"):
+                row["first_seen_at"] = (seen_at[0] if seen_at else "") or now
+            by_id[video_id] = row
+        merged = pd.DataFrame([by_id[key] for key in sorted(by_id)], columns=REGISTRY_COLUMNS)
+        _write_registry_unlocked(merged, path)
+
+
+def output_processed_ids(output_df, normalize) -> set[str]:
+    """IDs present in output_df, regardless of status, with URL fallback."""
+    ids = set()
+    if output_df is None or not len(output_df):
+        return ids
+    for _, row in output_df.iterrows():
+        vid = _video_id(row.get("v_id", ""), normalize)
+        if not vid:
+            for column in ("url", "video_url", "source_url"):
+                vid = _video_id(row.get(column, ""), normalize)
+                if vid:
+                    break
+        if vid:
+            ids.add(vid)
+    return ids
 
 
 def record_success(data_root: str | Path, video_id: str, *, source: str, status: str = "success", model: str = "") -> None:

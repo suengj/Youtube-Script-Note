@@ -2161,13 +2161,11 @@ def process_videos(config: dict):
     except ValueError:
         logger.warning("Invalid P03_MANUAL_MAX; using default 5")
         manual_max = 5
-    manual_rows, _ = manual_video_input.select_manual_input_rows(
-        manual_df, cutoff, manual_max)
     processed_video_ids = processed_video_registry.processed_ids(
         os.path.join(data_root, processed_video_registry.REGISTRY_NAME))
+    registry_available = processed_video_ids is not None
     if processed_video_ids is None:
         logger.warning("processed_videos.csv is missing; manual queue is fail-closed")
-        manual_rows = []
         processed_video_ids = set()
     else:
         try:
@@ -2178,6 +2176,22 @@ def process_videos(config: dict):
             logger.warning("Google Sheet processed markers unavailable; using registry-only queue guard: %s", exc)
     manual_ledger = manual_video_input.skip_historical_processing(
         manual_ledger, manual_df, cutoff)
+    # Union every owner-maintained processed source before the per-run cap so
+    # newer completed rows cannot crowd pending work out of every run.
+    processed_video_ids |= processed_video_registry.output_processed_ids(
+        output_df, manual_video_input.normalize_youtube_url)
+    if len(manual_ledger):
+        processed_video_ids |= set(manual_ledger.loc[
+            manual_ledger.status.astype(str).isin(["success", "skipped_historical"]), "video_id"
+        ].astype(str))
+    terminal_manual_ids = manual_video_input.terminal_manual_ids(
+        manual_ledger, int(config.get("CRAWL_QUEUE_MAX_RETRIES", 3) or 3))
+    if registry_available:
+        manual_rows, _ = manual_video_input.select_manual_input_rows(
+            manual_df, cutoff, manual_max,
+            exclude_ids=processed_video_ids | terminal_manual_ids)
+    else:
+        manual_rows = []
     historical_records = [
         (str(row.get("video_id", "")), "skipped_historical", "skipped_historical", str(row.get("model", "")),
          str(row.get("first_seen_at", "")))
