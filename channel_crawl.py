@@ -683,6 +683,7 @@ def fetch_channel_via_api(
     channel_id: str,
     uploads_id: Optional[str] = None,
     cursor_dt: Optional[datetime] = None,
+    discovery_status: Optional[Dict[str, Any]] = None,
 ) -> Tuple[List[Dict[str, Any]], str, str]:
     """
     Fetch channel uploads via YouTube Data API v3.
@@ -691,16 +692,23 @@ def fetch_channel_via_api(
     - cursor_dt: when set (non-backfill), stop paginating when all items on a page have published_at <= cursor_dt.
     """
     channel_title = ""
+    if discovery_status is not None:
+        discovery_status["complete"] = True
+        discovery_status["unresolved"] = int(discovery_status.get("unresolved", 0))
     if not uploads_id or not _is_valid_uploads_playlist_id(uploads_id):
         data = _api_request(api_key, "channels", {"part": "contentDetails,snippet", "id": channel_id})
         if not data or "items" not in data or not data["items"]:
             logger.warning(f"YouTube API: no channel found for {channel_id}")
+            if discovery_status is not None:
+                discovery_status["complete"] = False
             return [], "", ""
         item = data["items"][0]
         uploads_id = (item.get("contentDetails") or {}).get("relatedPlaylists", {}).get("uploads")
         channel_title = (item.get("snippet") or {}).get("title") or ""
         if not uploads_id:
             logger.warning(f"YouTube API: no uploads playlist for {channel_id}")
+            if discovery_status is not None:
+                discovery_status["complete"] = False
             return [], channel_title, ""
 
     entries = []
@@ -711,6 +719,8 @@ def fetch_channel_via_api(
             params["pageToken"] = page_token
         data = _api_request(api_key, "playlistItems", params)
         if not data or "items" not in data:
+            if discovery_status is not None:
+                discovery_status["complete"] = False
             break
         items = data.get("items", [])
         all_past_cursor = True
@@ -719,6 +729,8 @@ def fetch_channel_via_api(
             rid = sn.get("resourceId") or {}
             video_id = rid.get("videoId")
             if not video_id:
+                if discovery_status is not None:
+                    discovery_status["unresolved"] += 1
                 continue
             published = sn.get("publishedAt") or ""
             pub_dt = _parse_iso_date(published) if published else None
@@ -874,11 +886,48 @@ def get_url_list_from_channel_crawl(
     return url_list, meta_list
 
 
+def inventory_cutoff_snapshot(base_path: str, config: dict) -> dict:
+    """Capture the configured producer discovery boundary without external calls."""
+    backfill = bool(config.get("CHANNEL_BACKFILL") or False)
+    empty_cursor_backfill = {
+        channel_id.strip()
+        for channel_id in os.getenv("P03_CHANNEL_EMPTY_CURSOR_BACKFILL", "").split(",")
+        if channel_id.strip()
+    }
+    channels = load_channel_df(base_path)
+    cursors = {}
+    for channel in channels:
+        cid = str(channel.get("channel_id") or "").strip()
+        if not cid:
+            continue
+        last_discovered = (channel.get("last_discovered_published_at") or "").strip()
+        last_processed = (channel.get("last_processed_published_at") or "").strip()
+        empty_backfill = cid in empty_cursor_backfill and not last_discovered and not last_processed
+        effective_cursor = last_discovered if _parse_iso_date(last_discovered) else last_processed
+        effective_cursor_valid = bool(effective_cursor and _parse_iso_date(effective_cursor))
+        cursors[cid] = {
+            "exclusive_after": None if backfill or empty_backfill or not effective_cursor_valid else effective_cursor,
+            "empty_cursor_backfill": bool(empty_backfill),
+            "invalid_cursor": bool(not backfill and not empty_backfill and (last_discovered or last_processed)
+                                    and not effective_cursor_valid),
+        }
+    return {
+        "mode": "backfill" if backfill else "channel_cursor",
+        "backfill_start": (config.get("CHANNEL_START_DATE") or "").strip() or None,
+        "backfill_end": (config.get("CHANNEL_END_DATE") or "").strip() or None,
+        "channels": cursors,
+        "manual_since": (os.getenv("P03_MANUAL_SINCE") or "").strip() or None,
+        "sheet_import_since": (os.getenv("P03_SHEET_IMPORT_SINCE") or "").strip() or None,
+        "selected_max": config.get("MAX_VIDEOS"),
+    }
+
+
 def build_queue_and_get_candidates(
     base_path: str,
     config: dict,
     output_df,
     has_drive_canonical=None,
+    discovery_report: Optional[Dict[str, Any]] = None,
 ):
     """
     Channel crawl discovery -> queue persistence -> candidate selection.
@@ -893,6 +942,17 @@ def build_queue_and_get_candidates(
     }
 
     channels = load_channel_df(base_path)
+    if discovery_report is not None:
+        discovery_report.clear()
+        discovery_report.update({
+            "enabled": True,
+            "channel_count": len(channels),
+            "channels_succeeded": 0,
+            "channels_failed": [],
+            "unresolved": 0,
+            "complete": False,
+            "cutoff": inventory_cutoff_snapshot(base_path, config),
+        })
     if not channels:
         logger.info("channel_crawl: no channels loaded from channel_df.csv")
         q = load_crawl_queue_df(base_path)
@@ -979,19 +1039,50 @@ def build_queue_and_get_candidates(
                 "skipping channel: %s",
                 ch.get("channel_url", cid)[:80],
             )
+            if discovery_report is not None:
+                discovery_report["channels_failed"].append(cid)
             continue
 
         cursor_dt = _parse_iso_date(last_discovered_s) if last_discovered_s else None
         if not cursor_dt and last_processed_s:
             cursor_dt = _parse_iso_date(last_processed_s)
+        if not backfill and not channel_empty_backfill and (last_discovered_s or last_processed_s) and not cursor_dt:
+            logger.warning("channel_df: invalid discovery cursor; skipping channel: %s", cid)
+            if discovery_report is not None:
+                discovery_report["channels_failed"].append(cid)
+            continue
         uploads_id = ch.get("uploads_playlist_id") or None
         if uploads_id and not _is_valid_uploads_playlist_id(uploads_id):
             uploads_id = None
 
-        entries, feed_title, uploads_id_returned = fetch_channel_via_api(
-            api_key, cid, uploads_id=uploads_id,
-            cursor_dt=cursor_dt if not backfill and not channel_empty_backfill else None
-        )
+        channel_discovery = {"complete": True, "unresolved": 0}
+        try:
+            try:
+                entries, feed_title, uploads_id_returned = fetch_channel_via_api(
+                    api_key, cid, uploads_id=uploads_id,
+                    cursor_dt=cursor_dt if not backfill and not channel_empty_backfill else None,
+                    discovery_status=channel_discovery,
+                )
+            except TypeError as exc:
+                # Older integrations/tests may replace the fetcher with the
+                # original three-argument callable. A successful return from
+                # that callable still proves that the fetch completed.
+                if "discovery_status" not in str(exc):
+                    raise
+                entries, feed_title, uploads_id_returned = fetch_channel_via_api(
+                    api_key, cid, uploads_id=uploads_id,
+                    cursor_dt=cursor_dt if not backfill and not channel_empty_backfill else None,
+                )
+        except Exception as exc:
+            logger.warning("channel_crawl: discovery failed for cid=%s: %s: %s", cid, type(exc).__name__, exc)
+            entries, feed_title, uploads_id_returned = [], "", ""
+            channel_discovery["complete"] = False
+        if discovery_report is not None:
+            discovery_report["unresolved"] += int(channel_discovery.get("unresolved", 0))
+            if channel_discovery.get("complete"):
+                discovery_report["channels_succeeded"] += 1
+            else:
+                discovery_report["channels_failed"].append(cid)
         if uploads_id_returned:
             ch["uploads_playlist_id"] = uploads_id_returned
         logger.info("channel_crawl:   fetched %d videos from API for cid=%s", len(entries), cid)
@@ -1007,6 +1098,8 @@ def build_queue_and_get_candidates(
             pub_s = e.get("published_at") or ""
             pub_dt = _parse_iso_date(pub_s) if pub_s else None
             if not pub_dt:
+                if discovery_report is not None:
+                    discovery_report["unresolved"] += 1
                 continue
 
             if backfill:
@@ -1027,6 +1120,8 @@ def build_queue_and_get_candidates(
 
             vid = str(e.get("video_id") or "").strip()
             if not vid:
+                if discovery_report is not None:
+                    discovery_report["unresolved"] += 1
                 continue
             if vid in seen_discovery_ids:
                 continue
@@ -1145,6 +1240,14 @@ def build_queue_and_get_candidates(
 
     # persist channel cursor updates
     save_channel_df(base_path, channels)
+
+    if discovery_report is not None:
+        discovery_report["complete"] = bool(
+            discovery_report.get("channel_count", 0) > 0 and
+            discovery_report.get("channels_succeeded", 0) == discovery_report.get("channel_count", 0) and
+            not discovery_report.get("channels_failed") and
+            int(discovery_report.get("unresolved", 0)) == 0
+        )
 
     if discovered_rows:
         add_df = pd.DataFrame(discovered_rows)

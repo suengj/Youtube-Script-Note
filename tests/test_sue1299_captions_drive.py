@@ -13,7 +13,7 @@ from unittest.mock import patch
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from drive_api_sink import DriveApiSink, DriveUploadError, SOURCE_FOLDER_ID
+from drive_api_sink import DriveApiSink, DriveUploadError, MANIFEST_FILE_ID, SOURCE_FOLDER_ID, SUMMARY_FOLDER_ID
 
 VIDEO_ID = "abcdefghijk"
 
@@ -24,7 +24,20 @@ class _Request:
 
 
 class _FakeDrive:
-    def __init__(self, mismatch=False, mismatch_name="", bad_readback=""): self.items = {}; self.n = 0; self.mismatch = mismatch; self.mismatch_name = mismatch_name; self.bad_readback = bad_readback
+    def __init__(self, mismatch=False, mismatch_name="", bad_readback=""):
+        import hashlib
+        self.items = {}
+        self.n = 1
+        self.update_calls = []
+        self.mismatch = mismatch
+        self.mismatch_name = mismatch_name
+        self.bad_readback = bad_readback
+        initial = b"version: 1\nitems: []\n"
+        self.items[MANIFEST_FILE_ID] = {
+            "id": MANIFEST_FILE_ID, "name": "manifest.yaml", "mimeType": "text/yaml",
+            "parents": [SUMMARY_FOLDER_ID], "data": initial, "size": str(len(initial)),
+            "md5Checksum": hashlib.md5(initial).hexdigest(), "headRevisionId": "1",
+        }
     def files(self): return self
     def list(self, q="", **kwargs):
         def run():
@@ -45,11 +58,15 @@ class _FakeDrive:
         return _Request(run)
     def update(self, fileId, body=None, media_body=None, **kwargs):
         def run():
+            import hashlib
             item = self.items[fileId]; item.update(body or {})
             if media_body is not None:
                 data = getattr(media_body, "data", b""); item["data"] = data; item["size"] = str(len(data))
                 bad = self.mismatch or item.get("name") == self.mismatch_name
                 item["md5Checksum"] = "bad" if bad else __import__("hashlib").md5(data).hexdigest()
+                if fileId == MANIFEST_FILE_ID:
+                    item["headRevisionId"] = str(int(item.get("headRevisionId", "0")) + 1)
+                    self.update_calls.append(fileId)
             return {"id": fileId}
         return _Request(run)
     def get(self, fileId, **kwargs):
@@ -60,6 +77,7 @@ class _FakeDrive:
             if self.bad_readback == "size": meta["size"] = "999"
             if self.bad_readback == "md5Checksum": meta["md5Checksum"] = "bad"
             if self.bad_readback == "appProperties": meta["appProperties"]["p03_input_revision"] = "wrong"
+            if self.bad_readback == "manifest_md5" and fileId == MANIFEST_FILE_ID: meta["md5Checksum"] = "bad"
             return meta
         return _Request(run)
     def get_media(self, fileId):
@@ -324,7 +342,7 @@ class Sue1299DriveSinkTests(unittest.TestCase):
       def upload_video(self, **kwargs):
         self.uploads.append(kwargs)
         if len(self.uploads) == 1:
-          raise RuntimeError("synthetic first upload failure")
+            raise DriveUploadError("synthetic canonical manifest SHA-256 readback failure")
         return {"verified": True}
 
     class Preprocessor:

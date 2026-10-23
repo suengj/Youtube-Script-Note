@@ -14,6 +14,218 @@ from scripts.note_catalog_utils import DATE_FOLDER_PATTERN, normalize_date
 from .state import SyncStateEntry
 
 
+def utc_now_iso() -> str:
+    """Return an actual UTC timestamp suitable for lifecycle fields."""
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def parse_manifest_yaml(payload: bytes | str) -> dict:
+    """Parse and validate a canonical manifest document without discarding fields."""
+    if isinstance(payload, bytes):
+        payload = payload.decode("utf-8-sig")
+    doc = yaml.safe_load(payload)
+    if not isinstance(doc, dict):
+        raise ValueError("manifest must be a YAML mapping")
+    items = doc.get("items")
+    if not isinstance(items, list) or any(not isinstance(item, dict) for item in items):
+        raise ValueError("manifest items must be a list of mappings")
+    return doc
+
+
+def serialize_manifest_yaml(doc: dict) -> bytes:
+    if not isinstance(doc, dict):
+        raise ValueError("manifest must be a mapping")
+    return yaml.safe_dump(doc, allow_unicode=True, sort_keys=False).encode("utf-8")
+
+
+def merge_manifest_source(
+    doc: dict,
+    *,
+    file: str,
+    title: str,
+    content_hash: str,
+    video_id: str,
+    drive_file_id: str = "",
+    recovered: bool = False,
+    now: Optional[str] = None,
+) -> tuple[dict, dict, bool]:
+    """Merge one finalized summary while preserving every unrelated manifest field.
+
+    Returns ``(document, change, changed)``. A same-key, same-hash source is a
+    strict no-op, including for legacy entries without lifecycle timestamps.
+    """
+    if not isinstance(doc, dict):
+        raise ValueError("manifest must be a mapping")
+    if not isinstance(doc.get("items"), list) or any(not isinstance(x, dict) for x in doc["items"]):
+        raise ValueError("manifest items must be a list of mappings")
+    file = str(file or "").strip()
+    title = str(title or file).strip()
+    content_hash = str(content_hash or "").strip().lower()
+    video_id = str(video_id or "").strip()
+    drive_file_id = str(drive_file_id or "").strip()
+    if not file or not content_hash or not video_id:
+        raise ValueError("manifest source requires file, SHA-256 hash, and video_id")
+    if len(content_hash) != 64 or any(c not in "0123456789abcdef" for c in content_hash):
+        raise ValueError("manifest source hash must be a SHA-256 hex digest")
+
+    matches = []
+    for index, item in enumerate(doc["items"]):
+        by_drive_id = bool(drive_file_id and str(item.get("drive_file_id") or "") == drive_file_id)
+        by_file = str(item.get("file") or "") == file
+        by_video_id = str(item.get("video_id") or "") == video_id
+        if by_drive_id or by_file or by_video_id:
+            matches.append((index, item))
+    if len(matches) > 1:
+        raise ValueError(f"manifest has multiple entries for video {video_id}")
+
+    stamp = now or utc_now_iso()
+    updated = dict(doc)
+    updated["items"] = list(doc["items"])
+    source_key = drive_file_id or file
+    if matches:
+        index, old_item = matches[0]
+        old_file = str(old_item.get("file") or "")
+        old_video_id = str(old_item.get("video_id") or "")
+        if old_video_id and old_video_id != video_id:
+            raise ValueError(f"manifest video identity conflicts for {file}")
+        if old_item.get("hash") == content_hash:
+            if old_file == file:
+                return doc, {"action": "unchanged", "source_id": source_key, "hash": content_hash}, False
+            # A Drive file may retain its identity while its display name changes.
+            # Keep the content revision/timestamps intact and carry the stable ID.
+            item = dict(old_item)
+            item.update({"file": file, "title": title})
+            if drive_file_id:
+                item["drive_file_id"] = drive_file_id
+            updated["items"][index] = item
+            return updated, {"action": "renamed", "source_id": source_key, "hash": content_hash}, True
+
+        item = dict(old_item)
+        if not item.get("hash"):
+            # The previous bytes are unknown. Record the observed digest without
+            # inventing a content revision or lifecycle timestamp.
+            item["file"] = file
+            item["title"] = title
+            item["hash"] = content_hash
+            item.setdefault("revision", 1)
+            item.setdefault("video_id", video_id)
+            if drive_file_id:
+                item.setdefault("drive_file_id", drive_file_id)
+            updated["items"][index] = item
+            return updated, {"action": "recovered", "source_id": source_key, "hash": content_hash}, True
+
+        try:
+            revision = int(old_item.get("revision", 1))
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"manifest revision is invalid for {file}") from exc
+        if revision < 0:
+            raise ValueError(f"manifest revision is invalid for {file}")
+        item.update({
+            "file": file,
+            "title": title,
+            "hash": content_hash,
+            "revision": revision + 1,
+            "video_id": video_id,
+            "content_revision_at": stamp,
+        })
+        if drive_file_id:
+            item["drive_file_id"] = drive_file_id
+        updated["items"][index] = item
+        return updated, {"action": "revised", "source_id": source_key, "hash": content_hash}, True
+
+    item = {
+        "file": file,
+        "title": title,
+        "hash": content_hash,
+        "revision": 1,
+        "video_id": video_id,
+    }
+    if drive_file_id:
+        item["drive_file_id"] = drive_file_id
+    if recovered:
+        item["finalized_at"] = None
+        item["recovered_at"] = stamp
+    else:
+        item["finalized_at"] = stamp
+    updated["items"].append(item)
+    return updated, {"action": "added", "source_id": source_key, "hash": content_hash}, True
+
+
+def build_inventory_record(
+    *,
+    producer_run_id: str,
+    coverage_started_at: str,
+    cutoff,
+    succeeded: int = 0,
+    failed: int = 0,
+    unresolved: int = 0,
+    discovery_complete: bool = False,
+    all_successes_present: bool = False,
+    manifest_readback_verified: bool = False,
+    completed: bool = False,
+    inventory_revision: int = 0,
+    now: Optional[str] = None,
+) -> dict:
+    """Construct the registry-facing producer inventory evidence block."""
+    counts = {"succeeded": int(succeeded), "failed": int(failed), "unresolved": int(unresolved)}
+    if any(value < 0 for value in counts.values()):
+        raise ValueError("inventory source counts cannot be negative")
+    complete = bool(
+        completed and discovery_complete and counts["failed"] == 0 and
+        counts["unresolved"] == 0 and all_successes_present and manifest_readback_verified
+    )
+    return {
+        "inventory_revision": int(inventory_revision),
+        "producer_run_id": str(producer_run_id),
+        "coverage_started_at": str(coverage_started_at),
+        "coverage_completed_at": (now or utc_now_iso()) if completed else None,
+        "cutoff": cutoff,
+        "source_counts": counts,
+        "discovery_complete": bool(discovery_complete),
+        "manifest_readback_verified": bool(manifest_readback_verified),
+        "all_successes_present": bool(all_successes_present),
+        "batch_completed": bool(completed),
+        "inventory_complete": complete,
+    }
+
+
+def set_manifest_inventory(doc: dict, inventory: dict, *, start: bool) -> tuple[dict, dict]:
+    """Apply a batch inventory block with a monotonic per-run revision."""
+    if not isinstance(doc, dict) or not isinstance(doc.get("items"), list):
+        raise ValueError("manifest document is malformed")
+    if not isinstance(inventory, dict) or not str(inventory.get("producer_run_id") or "").strip():
+        raise ValueError("inventory requires producer_run_id")
+    current = doc.get("inventory")
+    if current is not None and not isinstance(current, dict):
+        raise ValueError("manifest inventory block is malformed")
+
+    def current_revision() -> int:
+        if not current:
+            return 0
+        try:
+            revision = int(current["inventory_revision"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError("manifest inventory revision is invalid") from exc
+        if revision < 1:
+            raise ValueError("manifest inventory revision is invalid")
+        return revision
+
+    record = dict(inventory)
+    if start:
+        if current and current.get("producer_run_id") == record.get("producer_run_id"):
+            revision = current_revision()
+        else:
+            revision = current_revision() + 1
+        record["inventory_revision"] = revision
+    else:
+        if not current or current.get("producer_run_id") != record.get("producer_run_id"):
+            raise ValueError("inventory run was superseded before completion")
+        record["inventory_revision"] = current_revision()
+    updated = dict(doc)
+    updated["inventory"] = record
+    return updated, record
+
+
 def _date_from_relative_path(rel: str) -> Optional[str]:
     parts = rel.split("/")
     if len(parts) < 2:

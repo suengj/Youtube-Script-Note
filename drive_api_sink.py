@@ -6,13 +6,27 @@ import io
 import json
 import os
 import re
+import tempfile
+import threading
 import time
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 
+from scripts.drive_yt_summary.manifest import (
+    merge_manifest_source,
+    parse_manifest_yaml,
+    serialize_manifest_yaml,
+    set_manifest_inventory,
+)
+
 SOURCE_FOLDER_ID = "1777fpf3nO2-4ISKAt_3D1ipiwgJddYY-"
 SUMMARY_FOLDER_ID = "1S-sGDHvkSC1tTKWPYWiSgxmGN2Fz7Clu"
+MANIFEST_FILE_ID = "1NUIcUNlEyYwjHVngghwNlmh4VKiIk7oW"
 TOKEN_ENV = "P03_DRIVE_TOKEN_FILE"
+MANIFEST_FILE_ID_ENV = "P03_MANIFEST_FILE_ID"
+_MANIFEST_THREAD_LOCKS = {}
+_MANIFEST_THREAD_LOCKS_GUARD = threading.Lock()
 
 
 class DriveUploadError(RuntimeError):
@@ -31,6 +45,213 @@ class DriveApiSink:
         self.source_folder_id = source_folder_id
         self.summary_folder_id = summary_folder_id
         self._transcripts_id = None
+
+    @property
+    def manifest_file_id(self):
+        return (os.getenv(MANIFEST_FILE_ID_ENV) or "").strip() or MANIFEST_FILE_ID
+
+    @contextmanager
+    def _manifest_lock(self):
+        """Serialize all local processes that write the same canonical manifest."""
+        import fcntl
+
+        import hashlib
+
+        lock_hash = hashlib.sha256(self.manifest_file_id.encode("utf-8")).hexdigest()[:20]
+        lock_path = (os.getenv("P03_MANIFEST_LOCK_PATH") or
+                     os.path.join(tempfile.gettempdir(), f"p03-manifest-{lock_hash}.lock"))
+        Path(lock_path).parent.mkdir(parents=True, exist_ok=True)
+        with _MANIFEST_THREAD_LOCKS_GUARD:
+            thread_lock = _MANIFEST_THREAD_LOCKS.setdefault(lock_path, threading.RLock())
+        with thread_lock:
+            with open(lock_path, "a+b") as handle:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+                try:
+                    yield
+                finally:
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+    def _manifest_metadata(self):
+        try:
+            meta = self._drive.files().get(
+                fileId=self.manifest_file_id,
+                fields="id,name,mimeType,parents,headRevisionId,md5Checksum",
+                supportsAllDrives=True,
+            ).execute()
+        except Exception as exc:
+            raise DriveUploadError(f"canonical manifest lookup failed: {type(exc).__name__}") from exc
+        if (meta.get("id") != self.manifest_file_id or
+                meta.get("name") != "manifest.yaml" or
+                self.summary_folder_id not in meta.get("parents", [])):
+            raise DriveUploadError("canonical manifest identity or parent verification failed")
+        if not re.fullmatch(r"[0-9a-f]{32}", str(meta.get("md5Checksum", ""))):
+            raise DriveUploadError("canonical manifest metadata has no valid MD5 checksum")
+        return meta
+
+    def _download_manifest(self, meta=None):
+        meta = meta or self._manifest_metadata()
+        try:
+            payload = self._drive.files().get_media(fileId=self.manifest_file_id).execute()
+            if isinstance(payload, str):
+                payload = payload.encode("utf-8")
+            payload = bytes(payload)
+        except Exception as exc:
+            raise DriveUploadError(f"canonical manifest download failed: {type(exc).__name__}") from exc
+        if hashlib.md5(payload).hexdigest() != meta.get("md5Checksum"):
+            raise DriveUploadError("canonical manifest download checksum does not match Drive metadata")
+        try:
+            doc = parse_manifest_yaml(payload)
+        except Exception as exc:
+            raise DriveUploadError(f"canonical manifest YAML is invalid: {type(exc).__name__}") from exc
+        return payload, doc
+
+    def read_manifest(self):
+        """Read the fixed canonical manifest and validate its Drive checksum."""
+        _, doc = self._download_manifest()
+        return doc
+
+    @staticmethod
+    def _manifest_signature(meta):
+        return (str(meta.get("headRevisionId") or ""), str(meta.get("md5Checksum") or ""))
+
+    def _modify_manifest(self, mutator, *, max_attempts=5):
+        """Locked read/merge/update with a last-moment revision/checksum check."""
+        from googleapiclient.http import MediaIoBaseUpload
+
+        with self._manifest_lock():
+            last_conflict = False
+            for attempt in range(max_attempts):
+                meta = self._manifest_metadata()
+                try:
+                    _, doc = self._download_manifest(meta)
+                except DriveUploadError as exc:
+                    if "checksum does not match Drive metadata" in str(exc):
+                        last_conflict = True
+                        continue
+                    raise
+                try:
+                    updated_doc, result, changed = mutator(doc)
+                except DriveUploadError:
+                    raise
+                except Exception as exc:
+                    raise DriveUploadError(f"canonical manifest merge failed: {type(exc).__name__}: {exc}") from exc
+                if not changed:
+                    return result
+                payload = serialize_manifest_yaml(updated_doc)
+
+                # Drive has no atomic compare-and-swap here. Recheck its current
+                # head/checksum immediately before update; conflicts restart the
+                # merge from the newly observed document.
+                latest_meta = self._manifest_metadata()
+                if self._manifest_signature(meta) != self._manifest_signature(latest_meta):
+                    last_conflict = True
+                    continue
+                try:
+                    media = MediaIoBaseUpload(io.BytesIO(payload), mimetype="application/yaml", resumable=False)
+                    self._drive.files().update(
+                        fileId=self.manifest_file_id,
+                        body={"name": "manifest.yaml"},
+                        media_body=media,
+                        fields="id,headRevisionId,md5Checksum",
+                        supportsAllDrives=True,
+                    ).execute()
+                    readback_meta = self._manifest_metadata()
+                    readback = self._drive.files().get_media(fileId=self.manifest_file_id).execute()
+                    if isinstance(readback, str):
+                        readback = readback.encode("utf-8")
+                    readback = bytes(readback)
+                    if (_sha(readback) != _sha(payload) or
+                            hashlib.md5(readback).hexdigest() != readback_meta.get("md5Checksum")):
+                        raise DriveUploadError("canonical manifest SHA-256 readback verification failed")
+                    return result
+                except DriveUploadError:
+                    raise
+                except Exception as exc:
+                    raise DriveUploadError(f"canonical manifest update/readback failed: {type(exc).__name__}") from exc
+            reason = "changed during every update attempt" if last_conflict else "update attempts exhausted"
+            raise DriveUploadError(f"canonical manifest lost-update guard failed: {reason}")
+
+    @staticmethod
+    def _summary_title(summary: bytes, summary_name: str) -> str:
+        fallback = Path(summary_name).stem
+        try:
+            from scripts.note_catalog_utils import strip_leading_frontmatter
+            from scripts.md_mobile_utils import extract_title
+
+            content = summary.decode("utf-8-sig")
+            return extract_title(strip_leading_frontmatter(content), fallback=fallback) or fallback
+        except Exception:
+            return fallback
+
+    def _merge_manifest_summary(self, *, summary_name, summary, video_id, drive_file_id, recovered=False):
+        digest = _sha(summary)
+        title = self._summary_title(summary, summary_name)
+
+        def merge(doc):
+            return merge_manifest_source(
+                doc,
+                file=summary_name,
+                title=title,
+                content_hash=digest,
+                video_id=video_id,
+                drive_file_id=drive_file_id,
+                recovered=recovered,
+            )
+
+        change = self._modify_manifest(merge)
+        return {**change, "drive_file_id": drive_file_id}
+
+    def write_inventory(self, inventory: dict, *, start=False, success_video_ids=()):
+        """Write run coverage to the same manifest and verify its exact bytes."""
+        incoming = dict(inventory)
+        success_ids = {str(value).strip() for value in success_video_ids if str(value).strip()}
+        source_counts = incoming.get("source_counts") or {}
+        expected_success_count = int(source_counts.get("succeeded", 0))
+
+        def merge(doc):
+            current_inventory = doc.get("inventory") or {}
+            if not start and current_inventory.get("producer_run_id") != incoming.get("producer_run_id"):
+                raise DriveUploadError("inventory run was superseded before completion")
+            present = {
+                str(item.get("video_id") or "")
+                for item in doc.get("items", [])
+                if item.get("file") and re.fullmatch(r"[0-9a-f]{64}", str(item.get("hash") or ""))
+            }
+            all_successes_present = (len(success_ids) == expected_success_count and success_ids.issubset(present))
+            record = dict(incoming)
+            record["all_successes_present"] = all_successes_present
+            # This flag describes verified producer readback for the inventory
+            # write below; the method returns only after SHA-256 has matched.
+            record["manifest_readback_verified"] = True
+            record["inventory_complete"] = bool(
+                record.get("batch_completed") and record.get("discovery_complete") and
+                int((record.get("source_counts") or {}).get("failed", 0)) == 0 and
+                int((record.get("source_counts") or {}).get("unresolved", 0)) == 0 and
+                all_successes_present and record["manifest_readback_verified"]
+            )
+            updated, stored_record = set_manifest_inventory(doc, record, start=start)
+            return updated, stored_record, updated.get("inventory") != doc.get("inventory")
+
+        try:
+            return self._modify_manifest(merge)
+        except DriveUploadError:
+            # If an attempted completion write could not be verified, make a
+            # best-effort corrective record that cannot assert full coverage.
+            if not start:
+                failed_record = dict(incoming)
+                failed_record.update({
+                    "manifest_readback_verified": False,
+                    "all_successes_present": False,
+                    "inventory_complete": False,
+                })
+                try:
+                    def mark_incomplete(doc):
+                        updated, stored_record = set_manifest_inventory(doc, failed_record, start=False)
+                        return updated, stored_record, updated.get("inventory") != doc.get("inventory")
+                    self._modify_manifest(mark_incomplete)
+                except Exception:
+                    pass
+            raise
 
     @staticmethod
     def _build_service():
@@ -81,9 +302,9 @@ class DriveApiSink:
                 else:
                     create_body = {**body, "parents": [parent]}
                     fid = files.create(body=create_body, media_body=media, fields="id", supportsAllDrives=True).execute()["id"]
-                meta = files.get(fileId=fid, fields="id,parents,size,md5Checksum,appProperties", supportsAllDrives=True).execute()
+                meta = files.get(fileId=fid, fields="id,name,parents,size,md5Checksum,appProperties,headRevisionId", supportsAllDrives=True).execute()
                 expected_md5 = hashlib.md5(data).hexdigest()
-                if (fid != meta.get("id") or parent not in meta.get("parents", []) or
+                if (fid != meta.get("id") or name != meta.get("name") or parent not in meta.get("parents", []) or
                         int(meta.get("size", -1)) != len(data) or meta.get("md5Checksum") != expected_md5 or
                         meta.get("appProperties", {}).get("p03_video_id") != video_id or
                         meta.get("appProperties", {}).get("p03_kind") != kind or
@@ -198,7 +419,12 @@ class DriveApiSink:
         transcript_meta = self._upload(transcripts_id, transcript_name, transcript, video_id, "transcript", "text/markdown", input_revision)
         meta_data = json.dumps(metadata, ensure_ascii=False, sort_keys=True, indent=2).encode("utf-8")
         meta_meta = self._upload(transcripts_id, stem + ".meta.json", meta_data, video_id, "metadata", "application/json", input_revision)
-        return {"summary": summary_meta, "transcript": transcript_meta, "metadata": meta_meta, "transcripts_folder_id": transcripts_id}
+        manifest_change = self._merge_manifest_summary(
+            summary_name=summary_name, summary=summary, video_id=video_id,
+            drive_file_id=summary_meta["id"], recovered=False,
+        )
+        return {"summary": summary_meta, "transcript": transcript_meta, "metadata": meta_meta,
+                "transcripts_folder_id": transcripts_id, "manifest": manifest_change}
 
     def already_uploaded(self, *, video_id: str, transcript: bytes) -> bool:
         """True only when all three Drive artifacts match this cleaned-caption revision."""
@@ -207,10 +433,10 @@ class DriveApiSink:
         input_revision = _sha(transcript)
         try:
             summaries = self._drive.files().list(q=f"'{self.source_folder_id}' in parents and trashed=false",
-                fields="files(id,appProperties)", supportsAllDrives=True, includeItemsFromAllDrives=True).execute().get("files", [])
+                fields="files(id,name,appProperties)", supportsAllDrives=True, includeItemsFromAllDrives=True).execute().get("files", [])
             transcript_folder = self._transcripts_folder()
             children = self._drive.files().list(q=f"'{transcript_folder}' in parents and trashed=false",
-                fields="files(id,appProperties)", supportsAllDrives=True, includeItemsFromAllDrives=True).execute().get("files", [])
+                fields="files(id,name,appProperties)", supportsAllDrives=True, includeItemsFromAllDrives=True).execute().get("files", [])
         except Exception as exc:
             raise DriveUploadError(f"Drive dedupe lookup failed: {type(exc).__name__}") from exc
         all_files = summaries + children
@@ -227,13 +453,14 @@ class DriveApiSink:
         expected_transcript_md5 = hashlib.md5(transcript).hexdigest()
         try:
             readbacks = {kind: self._drive.files().get(
-                fileId=item["id"], fields="id,parents,size,md5Checksum,appProperties",
+                fileId=item["id"], fields="id,name,parents,size,md5Checksum,appProperties",
                 supportsAllDrives=True).execute() for kind, item in matched.items()}
             for kind, meta in readbacks.items():
                 parent = self.source_folder_id if kind == "summary" else transcript_folder
                 props = meta.get("appProperties", {})
                 if (meta.get("id") != matched[kind].get("id") or
                         parent not in meta.get("parents", []) or
+                        meta.get("name") != matched[kind].get("name") or
                         int(meta.get("size", -1)) < 0 or
                         not re.fullmatch(r"[0-9a-f]{32}", str(meta.get("md5Checksum", ""))) or
                         props.get("p03_video_id") != video_id or
@@ -266,8 +493,23 @@ class DriveApiSink:
             summary_content = self._drive.files().get_media(fileId=matched["summary"]["id"]).execute()
             if isinstance(summary_content, str):
                 summary_content = summary_content.encode("utf-8")
-            return (_sha(summary_content) == metadata["summary_sha256"] and
-                    hashlib.md5(summary_content).hexdigest() == summary_meta["md5Checksum"] and
-                    len(summary_content) == int(summary_meta["size"]))
+            verified = (_sha(summary_content) == metadata["summary_sha256"] and
+                        hashlib.md5(summary_content).hexdigest() == summary_meta["md5Checksum"] and
+                        len(summary_content) == int(summary_meta["size"]))
         except Exception:
             return False
+        if not verified:
+            return False
+        try:
+            self._merge_manifest_summary(
+                summary_name=str(summary_meta.get("name") or ""),
+                summary=summary_content,
+                video_id=video_id,
+                drive_file_id=str(summary_meta.get("id") or ""),
+                recovered=True,
+            )
+        except Exception as exc:
+            if isinstance(exc, DriveUploadError):
+                raise
+            raise DriveUploadError(f"canonical manifest repair failed: {type(exc).__name__}") from exc
+        return True
