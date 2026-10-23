@@ -2856,13 +2856,13 @@ def process_videos(config: dict):
 
     with tqdm(total=len(url_list), desc="Processing videos", unit="video", **tqdm_kw) as pbar:
         if video_workers <= 1:
-            i = 0
-            while i < len(url_list):
-                if _stop_for_run_budget(len(url_list) - i):
+            next_pos = 0
+            while next_pos < len(url_list):
+                if _stop_for_run_budget(len(url_list) - next_pos):
                     break
-                v_url = url_list[i]
+                i, v_url = next_pos, url_list[next_pos]
+                next_pos += 1
                 picked_videos += 1
-                i += 1
                 counter += 1
                 pbar.set_description(f"Processing: {v_url[:50]}...")
                 if consecutive_failures >= max_consecutive_failures:

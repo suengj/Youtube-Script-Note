@@ -101,3 +101,50 @@ def test_budget_stop_runs_end_phase_and_finalizes_inventory(budget_run, monkeypa
     assert cleanup_calls
     assert sink.records[-1][0]["batch_completed"] is True
     assert sink.records[-1][1] is False
+
+
+def test_under_budget_sequential_run_tracks_zero_based_remaining(budget_run, monkeypatch):
+    from pipeline_models import VideoProcessResult
+
+    config, _sink, _cleanup_calls = budget_run
+    remaining_values = []
+
+    class _ProgressBar:
+        def __init__(self, **_kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            pass
+
+        def set_description(self, *_args):
+            pass
+
+        def set_postfix(self, values):
+            remaining_values.append(values["Remaining"])
+
+        def update(self, *_args):
+            pass
+
+    monkeypatch.setattr(main, "tqdm", _ProgressBar)
+    monkeypatch.setattr(main.time, "monotonic", lambda: 0.0)
+    monkeypatch.setattr(_Writer, "apply", lambda *_args, **_kwargs: None, raising=False)
+    monkeypatch.setattr(_Claims, "try_claim", lambda *_args, **_kwargs: True, raising=False)
+    monkeypatch.setattr(_Claims, "release", lambda *_args: None, raising=False)
+    monkeypatch.setattr(
+        main,
+        "process_single_video",
+        lambda **kwargs: VideoProcessResult(
+            video_id=kwargs["v_url"].rsplit("/", 1)[-1],
+            source_url=kwargs["v_url"],
+            status="download_failed",
+            retryable=True,
+            error_message="temporary download failure",
+        ),
+    )
+
+    main.process_videos(config)
+
+    assert remaining_values == [1, 0]
