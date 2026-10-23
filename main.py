@@ -16,6 +16,7 @@ import json
 import hashlib
 import glob
 import argparse
+import threading
 from datetime import datetime
 from pathlib import Path
 from dataclasses import dataclass
@@ -2555,6 +2556,7 @@ def process_videos(config: dict):
     manual_dispatch_rows = {
         vid: (url, source_url) for vid, url, source_url in manual_urls
     }
+    manual_ledger_lock = threading.Lock()
     manual_channel_overlap_ids = {
         manual_video_input.normalize_youtube_url(u)["video_id"]
         for u in url_list if manual_video_input.normalize_youtube_url(u)["kind"] == "video"
@@ -2570,11 +2572,13 @@ def process_videos(config: dict):
         if item is None:
             return
         canonical_url, source_url = item
-        manual_ledger = manual_video_input._mark_manual_queue_processing(
-            manual_ledger, video_id, canonical_url, source_url,
-            channel_overlap=video_id in manual_channel_overlap_ids,
-        )
-        manual_video_input.save_ledger(manual_ledger, manual_ledger_path)
+        with manual_ledger_lock:
+            manual_ledger = manual_video_input.read_ledger(manual_ledger_path)
+            manual_ledger = manual_video_input._mark_manual_queue_processing(
+                manual_ledger, video_id, canonical_url, source_url,
+                channel_overlap=video_id in manual_channel_overlap_ids,
+            )
+            manual_video_input.save_ledger(manual_ledger, manual_ledger_path)
     if manual_urls:
         url_list.extend(url for vid, url, _ in manual_urls if vid not in manual_channel_overlap_ids)
         direct_input_set = {url for _, url, _ in manual_urls}
@@ -2799,16 +2803,17 @@ def process_videos(config: dict):
                     drive_disabled=os.getenv("P03_DRIVE_SYNC_ENABLED", "1").strip() == "0",
                     drive_verified=bool(result.metadata_updates.get("drive_verified")))
                 ledger_status, ledger_drive_state = status, drive_state
-                manual_ledger = manual_video_input.read_ledger(manual_ledger_path)
-                manual_ledger = manual_video_input.upsert_ledger(
-                    manual_ledger, video_id=result.video_id,
-                    canonical_url=next((u for vid, u, _ in manual_urls if vid == result.video_id), v_url),
-                    source_url=next((src for vid, _, src in manual_urls if vid == result.video_id), v_url),
-                    status=status, reason=reason, md_path=md_path, drive_verified=drive_state,
-                    model=str(result.metadata_updates.get("model", "")),
-                    md_sha256=(hashlib.sha256(Path(md_path).read_text(encoding="utf-8-sig").encode("utf-8")).hexdigest()
-                               if md_path and os.path.isfile(md_path) else ""))
-                manual_video_input.save_ledger(manual_ledger, manual_ledger_path)
+                md_sha256 = (hashlib.sha256(Path(md_path).read_text(encoding="utf-8-sig").encode("utf-8")).hexdigest()
+                             if md_path and os.path.isfile(md_path) else "")
+                with manual_ledger_lock:
+                    manual_ledger = manual_video_input.read_ledger(manual_ledger_path)
+                    manual_ledger = manual_video_input.upsert_ledger(
+                        manual_ledger, video_id=result.video_id,
+                        canonical_url=next((u for vid, u, _ in manual_urls if vid == result.video_id), v_url),
+                        source_url=next((src for vid, _, src in manual_urls if vid == result.video_id), v_url),
+                        status=status, reason=reason, md_path=md_path, drive_verified=drive_state,
+                        model=str(result.metadata_updates.get("model", "")), md_sha256=md_sha256)
+                    manual_video_input.save_ledger(manual_ledger, manual_ledger_path)
             except Exception as ledger_exc:
                 # Keep the result visible even if manual-specific persistence fails.
                 logger.error("Manual input ledger write failed for %s: %s", result.video_id, ledger_exc)
@@ -3071,6 +3076,7 @@ def process_videos(config: dict):
                 retain_staging_paths={str(item.md_path) for _, item in pending_staged.iterrows()},
                 manual_expected_hashes=manual_staging_hashes,
                 blocked_staging_paths={str(item.md_path) for _, item in quarantine_staged.iterrows()},
+                classification_deadline=run_started_monotonic + run_budget_seconds,
             )
             if retried:
                 before_flush_ledger = manual_video_input.reconcile_staging_flush(

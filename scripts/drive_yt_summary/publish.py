@@ -18,6 +18,7 @@ import hashlib
 import os
 import re
 import threading
+import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -94,12 +95,16 @@ class DriveDesktopAdapter:
             return action, str(dest), revision
 
 
-def _classify_after_drive_write(result: PublishResult, sync_root: Path) -> None:
+def _classify_after_drive_write(
+    result: PublishResult, sync_root: Path, classification_deadline: Optional[float] = None,
+) -> None:
     """SUE-1327: JEV classify-if-needed for this one source after its verified Drive write.
 
     Behind P03_JEV_CLASSIFY_ENABLED (default off). Reads the Drive copy only; any failure is
     recorded on the result and never affects publish/staging/mirror.
     """
+    if classification_deadline is not None and time.time() >= classification_deadline:
+        return
     try:
         from scripts.jev_classify.classify import classify_after_publish
 
@@ -164,6 +169,7 @@ def publish_final_md(
     never_mirror: bool = False,
     retain_staging: bool = False,
     force_rewrite: bool = False,
+    classification_deadline: Optional[float] = None,
 ) -> PublishResult:
     """Drive write (canonical) then optional vault mirror; neither failure blocks the other.
 
@@ -193,7 +199,7 @@ def publish_final_md(
                 force_rewrite=force_rewrite,
             )
             result.drive_action, result.drive_path, result.revision = action, dest, revision
-            _classify_after_drive_write(result, config.sync_root)
+            _classify_after_drive_write(result, config.sync_root, classification_deadline)
     except (DriveSyncConfigError, FilesystemSyncError, OSError) as exc:
         result.drive_action = "failed"
         result.errors.append(f"drive: {exc}")
@@ -228,6 +234,7 @@ def flush_staging(
     retain_staging_paths: Optional[set[str]] = None,
     manual_expected_hashes: Optional[dict[str, str]] = None,
     blocked_staging_paths: Optional[set[str]] = None,
+    classification_deadline: Optional[float] = None,
 ) -> List[PublishResult]:
     """Retry Drive publish for files left in staging (Drive only; mirror was attempted already)."""
     out: List[PublishResult] = []
@@ -253,6 +260,7 @@ def flush_staging(
             rel_path=rel, content=content, staging_path=str(path), md_root=md_root,
             mirror=False, base_path=base_path, work_path=work_path, sync_root=sync_root,
             never_mirror=never_mirror, retain_staging=is_retained_manual,
+            classification_deadline=classification_deadline,
         )
         if (is_retained_manual and result.drive_action == "unchanged"
                 and not _destination_matches(result.drive_path, content)):
@@ -260,6 +268,7 @@ def flush_staging(
                 rel_path=rel, content=content, staging_path=str(path), md_root=md_root,
                 mirror=False, base_path=base_path, work_path=work_path, sync_root=sync_root,
                 never_mirror=never_mirror, retain_staging=True, force_rewrite=True,
+                classification_deadline=classification_deadline,
             )
         out.append(result)
     return out

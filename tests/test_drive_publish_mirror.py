@@ -240,3 +240,21 @@ def test_corrupting_write_fails_readback_and_keeps_staging(env, monkeypatch):
     res, st = env.run(mirror=False)
     assert res.drive_action == "failed" and any("verify failed" in e for e in res.errors)
     assert res.staging_retained and st.is_file()
+
+
+def test_expired_classification_deadline_still_finalizes_drive_and_staging(env, monkeypatch):
+    from scripts.jev_classify import classify
+
+    monkeypatch.setenv("P03_JEV_CLASSIFY_ENABLED", "1")
+    monkeypatch.setattr(pub.time, "time", lambda: 101.0)
+    calls = []
+    monkeypatch.setattr(classify, "classify_after_publish", lambda *args, **kwargs: calls.append(args))
+    staged = env.stage(rel="2026_10_06/expired.md")
+    flushed = flush_staging(md_root=str(env.vault), base_path=str(env.base),
+                            work_path=str(env.work), sync_root=str(env.drive),
+                            classification_deadline=100)
+
+    assert flushed and flushed[0].drive_ok
+    assert (env.drive / "source" / "expired.md").is_file()
+    assert not staged.exists()  # verified storage finalization still completes
+    assert calls == []
