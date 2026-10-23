@@ -2008,6 +2008,15 @@ def process_videos(config: dict):
     inventory_sink = None
     inventory_start_written = False
     inventory_cutoff = None
+    inventory_counts = {"unresolved": 0}
+    inventory_incomplete_reasons = set()
+
+    def _mark_inventory_incomplete(reason):
+        reason = str(reason or "").strip()
+        if reason and reason not in inventory_incomplete_reasons:
+            inventory_incomplete_reasons.add(reason)
+            inventory_counts["unresolved"] += 1
+
     if api_backend:
         try:
             inventory_cutoff = (channel_crawl.inventory_cutoff_snapshot(base_path, config)
@@ -2021,6 +2030,7 @@ def process_videos(config: dict):
             inventory_cutoff = {"mode": "unavailable"}
             logger.warning("Could not snapshot the inventory discovery cutoff: %s: %s",
                            type(exc).__name__, exc)
+            _mark_inventory_incomplete("discovery_cutoff_read_failed")
         try:
             inventory_sink = config.get("DRIVE_API_SINK")
             if inventory_sink is None:
@@ -2066,6 +2076,13 @@ def process_videos(config: dict):
             ),
         )
         final_counts = {key: reconciled[key] for key in ("succeeded", "failed", "unresolved")}
+        incomplete_reasons = set(inventory_incomplete_reasons)
+        if not discovery_complete:
+            incomplete_reasons.add("channel_discovery_incomplete")
+        if final_counts["failed"]:
+            incomplete_reasons.add("source_processing_failed")
+        if final_counts["unresolved"] and not incomplete_reasons:
+            incomplete_reasons.add("unresolved_source_coverage")
         record = build_inventory_record(
             producer_run_id=run_id,
             coverage_started_at=run_started_at,
@@ -2079,6 +2096,7 @@ def process_videos(config: dict):
             completed=completed,
             now=utc_now_iso() if completed else None,
         )
+        record["incomplete_reason"] = "; ".join(sorted(incomplete_reasons)) or None
         record["source_counts"]["scope_count"] = reconciled["scope_count"]
         record["source_counts"]["terminal_skipped"] = reconciled["terminal_skipped"]
         try:
@@ -2108,25 +2126,24 @@ def process_videos(config: dict):
         "retry_exhausted_video_ids": [],
         "queue_scope_unresolved": 0,
     }
-    inventory_counts = {"unresolved": 0}
     inventory_scope_video_ids = set()
     inventory_outcomes = {}
     if os.getenv("P03_SHEET_IMPORT_ENABLED", "0").strip() == "1":
         since = (os.getenv("P03_SHEET_IMPORT_SINCE") or "").strip()
         if not import_manual_urls_from_sheet._valid_date(since):
             logger.warning("Manual Google Sheet import skipped: P03_SHEET_IMPORT_SINCE must be a valid YYYY-MM-DD date")
-            inventory_counts["unresolved"] += 1
+            _mark_inventory_incomplete("sheet_import_cutoff_invalid")
         else:
             sa_key = (os.getenv("P03_GOOGLE_SA_JSON") or "").strip()
             if not sa_key or not os.path.isfile(sa_key):
                 logger.warning("Manual Google Sheet import skipped: P03_GOOGLE_SA_JSON key file is missing")
-                inventory_counts["unresolved"] += 1
+                _mark_inventory_incomplete("sheet_import_credentials_unavailable")
             else:
                 try:
                     import_manual_urls_from_sheet.import_from_sheet(data_root, since=since)
                 except Exception as exc:
                     logger.warning("Manual Google Sheet import failed; continuing batch: %s: %s", type(exc).__name__, exc)
-                    inventory_counts["unresolved"] += 1
+                    _mark_inventory_incomplete("sheet_import_failed")
     work_path = config.get('WORK_PATH') or base_path
     if work_path != base_path:
         logger.info("WORK_PATH set: audio, yt_subs, and prompt/logs use local path (iCloud sync avoided): %s", work_path)
@@ -2244,13 +2261,31 @@ def process_videos(config: dict):
             for i in range(preview_n):
                 logger.info("  [%d] %s", i + 1, url_list[i])
     else:
-        input_df, output_df = load_dataframes(data_root)
+        try:
+            input_df, output_df = load_dataframes(data_root)
+        except Exception:
+            _mark_inventory_incomplete("manual_input_read_failed")
+            _finish_manifest_inventory(
+                completed=False,
+                counts=inventory_counts,
+                discovery_report=inventory_discovery,
+            )
+            raise
         url_list = []
 
     # Manual input_df URLs are canonicalized and merged by video ID in both run modes.
     # Channel candidates win so their discovered metadata and policies are retained.
     manual_ledger_path = os.path.join(data_root, "manual_input_status.csv")
-    manual_ledger = manual_video_input.read_ledger(manual_ledger_path)
+    try:
+        manual_ledger = manual_video_input.read_ledger(manual_ledger_path)
+    except Exception:
+        _mark_inventory_incomplete("manual_ledger_read_failed")
+        _finish_manifest_inventory(
+            completed=False,
+            counts=inventory_counts,
+            discovery_report=inventory_discovery,
+        )
+        raise
 
     def _writeback_manual_sheet() -> None:
         current = None
@@ -2285,6 +2320,7 @@ def process_videos(config: dict):
         manual_video_input.save_ledger(manual_ledger, manual_ledger_path)
     except Exception as retry_setup_exc:
         logger.warning("Manual pending Drive retry unavailable: %s", retry_setup_exc)
+        _mark_inventory_incomplete("manual_pending_drive_state_unavailable")
     input_path = os.path.join(data_root, "input_df.csv")
     manual_rows = []
     manual_df = pd.DataFrame(columns=["url", "date"])
@@ -2293,6 +2329,7 @@ def process_videos(config: dict):
             manual_df = _read_csv_with_retry(input_path, encoding="cp949")
         except Exception as exc:
             logger.warning("Could not load manual input URLs: %s", exc)
+            _mark_inventory_incomplete("manual_input_read_failed")
     cutoff = (os.getenv("P03_MANUAL_SINCE") or "").strip()
     if not cutoff or not import_manual_urls_from_sheet._valid_date(cutoff):
         logger.warning("P03_MANUAL_SINCE is unset or invalid; manual queue admits only sheet-imported rows marked %s", manual_video_input.IMPORTER_MARKER_COLUMN)
@@ -2313,6 +2350,9 @@ def process_videos(config: dict):
         data_root, manual_df, cutoff, manual_max, output_df, manual_ledger,
         exclude_ids=terminal_manual_ids, return_processed=True)
     if processed_video_ids is None:
+        # The admission scope is unknown. Preserve the failure in inventory
+        # coverage instead of turning an unreadable source set into an empty set.
+        _mark_inventory_incomplete("manual_processed_state_read_failed")
         processed_video_ids = set()
     historical_records = [
         (str(row.get("video_id", "")), "skipped_historical", "skipped_historical", str(row.get("model", "")),
@@ -2330,6 +2370,7 @@ def process_videos(config: dict):
                 registry_exc,
             )
             manual_rows = []
+            _mark_inventory_incomplete("manual_historical_state_persist_failed")
     max_manual_retries = int(config.get("CRAWL_QUEUE_MAX_RETRIES", 3) or 3)
     manual_duration_map = {}
     manual_video_channel_ids = {}
@@ -2356,6 +2397,7 @@ def process_videos(config: dict):
                     manual_video_channel_ids[vid] = str(snippet["channelId"])
     except Exception as policy_exc:
         logger.warning("Manual video policy metadata unavailable; applying available metadata only: %s", policy_exc)
+        _mark_inventory_incomplete("manual_policy_metadata_read_failed")
     shorts_threshold = int(float(config.get("FILTERING_SHORTS_MINUTES", 3) or 0) * 60)
     manual_urls, manual_ledger = manual_video_input.prepare_manual_queue(
         manual_rows, url_list, output_df, manual_ledger, max_manual_retries,

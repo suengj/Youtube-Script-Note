@@ -740,10 +740,11 @@ def fetch_channel_via_api(
         for pl_item in items:
             sn = pl_item.get("snippet") or {}
             rid = sn.get("resourceId") or {}
-            video_id = rid.get("videoId")
-            if not video_id:
+            video_id = str(rid.get("videoId") or "").strip()
+            if not re.fullmatch(r"[A-Za-z0-9_-]{11}", video_id):
                 if discovery_status is not None:
                     discovery_status["unresolved"] += 1
+                    discovery_status["complete"] = False
                 continue
             published = sn.get("publishedAt") or ""
             pub_dt = _parse_iso_date(published) if published else None
@@ -1114,7 +1115,10 @@ def build_queue_and_get_candidates(
         filtered_entries: List[Dict[str, Any]] = []
         seen_discovery_ids: set[str] = set()
         discovered_dt_max: Optional[datetime] = cursor_dt
-        channel_cursor_safe = bool(channel_discovery.get("complete"))
+        channel_cursor_safe = (
+            bool(channel_discovery.get("complete")) and
+            int(channel_discovery.get("unresolved", 0) or 0) == 0
+        )
 
         for e in entries:
             pub_s = e.get("published_at") or ""
@@ -1142,7 +1146,7 @@ def build_queue_and_get_candidates(
                 discovered_dt_max = pub_dt
 
             vid = str(e.get("video_id") or "").strip()
-            if not vid:
+            if not re.fullmatch(r"[A-Za-z0-9_-]{11}", vid):
                 channel_cursor_safe = False
                 if discovery_report is not None:
                     discovery_report["unresolved"] += 1

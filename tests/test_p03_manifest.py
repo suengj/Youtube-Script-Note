@@ -395,6 +395,98 @@ def test_inventory_file_readback_failure_cannot_be_trusted():
         sink.read_inventory_evidence()
 
 
+@pytest.mark.parametrize(
+    ("failure", "expected_reason"),
+    [
+        ("manual_input", "manual_input_read_failed"),
+        ("processed_state", "manual_processed_state_read_failed"),
+    ],
+)
+def test_process_videos_keeps_unreadable_manual_scope_out_of_complete_inventory(
+        tmp_path, monkeypatch, failure, expected_reason):
+    import pandas as pd
+    import main
+    import processed_video_registry as pvr
+
+    data = tmp_path / "data"
+    data.mkdir()
+    pvr.write_registry(pd.DataFrame(columns=pvr.REGISTRY_COLUMNS), pvr.registry_path(data))
+    (data / "input_df.csv").write_text(
+        "date,url,category\n2026-10-22,https://youtu.be/manual00001,manual\n",
+        encoding="cp949",
+    )
+    base, md = tmp_path / "base", tmp_path / "md"
+    base.mkdir()
+    md.mkdir()
+
+    _install_fake_media(monkeypatch)
+    sink = DriveApiSink(_FakeDrive())
+
+    def empty_channel_queue(_root, _config, _output, *, discovery_report=None, **_kwargs):
+        discovery_report.update({
+            "enabled": True,
+            "channel_count": 1,
+            "channels_succeeded": 1,
+            "channels_failed": [],
+            "cursor_blocked_channels": [],
+            "unresolved": 0,
+            "complete": True,
+            "cutoff": {"mode": "channel_cursor"},
+            "queue_scope_video_ids": [],
+            "retry_exhausted_video_ids": [],
+            "queue_scope_unresolved": 0,
+        })
+        return pd.DataFrame(), pd.DataFrame(columns=["url"]), []
+
+    monkeypatch.setattr(main, "initialize_clients", lambda _config: (None, None, None))
+    monkeypatch.setattr(main.channel_crawl, "inventory_cutoff_snapshot",
+                        lambda *_args: {"mode": "channel_cursor"})
+    monkeypatch.setattr(main.channel_crawl, "build_queue_and_get_candidates", empty_channel_queue)
+    monkeypatch.setattr(main.channel_crawl, "load_channel_df", lambda _root: [])
+    monkeypatch.setattr(main, "load_output_df_only",
+                        lambda _root: pd.DataFrame(columns=["v_id", "url", "status"]))
+    monkeypatch.setattr(pvr, "read_sheet_marked_ids", lambda: set())
+    monkeypatch.setattr(main, "_run_batch_cleanup", lambda *_args, **_kwargs: None)
+
+    if failure == "manual_input":
+        original_read_csv = main._read_csv_with_retry
+
+        def fail_manual_csv(path, *args, **kwargs):
+            if str(path).endswith("input_df.csv"):
+                raise OSError("injected manual CSV read failure")
+            return original_read_csv(path, *args, **kwargs)
+
+        monkeypatch.setattr(main, "_read_csv_with_retry", fail_manual_csv)
+    else:
+        monkeypatch.setattr(pvr, "processed_id_union",
+                            lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                                OSError("injected processed-state read failure")))
+
+    monkeypatch.setenv("P03_DRIVE_BACKEND", "api")
+    monkeypatch.setenv("P03_DRIVE_SYNC_ENABLED", "0")
+    monkeypatch.setenv("P03_MANUAL_SINCE", "2026-10-01")
+    monkeypatch.delenv("P03_SHEET_IMPORT_ENABLED", raising=False)
+    config = {
+        "BASE_PATH": str(base),
+        "DATA_ROOT": str(data),
+        "WORK_PATH": str(base),
+        "HF_HOME": str(tmp_path / "hf"),
+        "OUTPUT_MD_PATH": str(md),
+        "CHANNEL_CRAWL": True,
+        "YOUTUBE_API_KEY": "fixture",
+        "DRIVE_API_SINK": sink,
+    }
+
+    main.process_videos(config)
+
+    inventory = sink.read_manifest()["inventory"]
+    assert inventory["inventory_complete"] is False
+    assert inventory["source_counts"]["unresolved"] >= 1
+    assert inventory["source_counts"]["scope_count"] >= 1
+    assert expected_reason in inventory["incomplete_reason"]
+    assert sink.read_inventory_evidence() is None
+
+
 def test_inventory_scope_counts_claimed_deferred_and_retry_exhausted_sources():
     reconciled = reconcile_inventory_scope(
         {"success0001", "claim000001", "limit000001", "retry000001", "failed00001", "skip000001"},
