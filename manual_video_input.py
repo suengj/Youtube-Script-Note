@@ -330,11 +330,15 @@ def snapshot_dispatch_state(ledger, video_id):
 
 def restore_dispatch_state(ledger, video_id, snapshot):
     """Restore a pre-dispatch row after run-budget deferral."""
-    if snapshot is None or not len(ledger):
+    if not len(ledger):
         return ledger
     matches = ledger.index[ledger.video_id.astype(str) == str(video_id)].tolist()
     if not matches:
         return ledger
+    if snapshot is None:
+        # A dispatch can insert the first row for a manual URL. Returning that
+        # synthetic processing row would consume an attempt and block reselect.
+        return ledger.drop(index=matches)
     idx = matches[-1]
     for column in _DISPATCH_STATE_COLUMNS:
         if column in ledger.columns:

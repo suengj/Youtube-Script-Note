@@ -47,10 +47,13 @@ class _BudgetExpiredResponse(httpx.Response):
 class _BudgetAwareClient(DefaultHttpxClient):
     """Check each dispatch while preserving the OpenAI SDK's HTTP defaults."""
 
-    def send(self, request, *args, **kwargs):
+    def _send_single_request(self, request):
+        # Client.send follows redirects internally, so its public send override
+        # only gates the initial request. This lower-level method runs once per
+        # redirect hop and still returns the sentinel outside the SDK retry loop.
         if expired():
             return _BudgetExpiredResponse(status_code=499, request=request)
-        return super().send(request, *args, **kwargs)
+        return super()._send_single_request(request)
 
 
 def make_http_client(**kwargs) -> httpx.Client:

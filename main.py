@@ -92,6 +92,11 @@ class VideoNotQueuedError(ValueError):
     """Explicit --video-id is absent from the selected queue."""
 
 
+def _is_run_budget_deferral(exc: BaseException) -> bool:
+    return (isinstance(exc, run_budget.RunBudgetExpired) or
+            getattr(exc, "category", "") == "run_budget_expired")
+
+
 def _run_budget_seconds(value=None) -> float:
     """Return the configured positive run budget, falling back to 100 minutes."""
     if value is None:
@@ -227,7 +232,7 @@ class MainLlmConfig:
         model_used_callback=None,
     ) -> str:
         if run_budget.expired():
-            raise RuntimeError("P03 run budget expired before paid LLM summary")
+            raise run_budget.RunBudgetExpired("P03 run budget expired before paid LLM summary")
         return stt.summarize_with_chunking(
             transcription=transcription,
             filename=filename,
@@ -1398,6 +1403,8 @@ def process_single_video(
                 if metadata_key:
                     reused_metadata = fetch_video_metadata_batch(metadata_key, [video_id]).get(video_id, {})
             except Exception as metadata_exc:
+                if _is_run_budget_deferral(metadata_exc):
+                    return _vr("deferred_run_budget", video_id or "unknown", str(metadata_exc), stage="run_budget")
                 logger.info("YouTube metadata unavailable for reused transcript (%s)", type(metadata_exc).__name__)
             audio_nm = (reused_metadata.get("title") or os.path.basename(durable_full_path or "")).rsplit(".", 1)[0]
             audio_path_file = None
@@ -1474,6 +1481,8 @@ def process_single_video(
                 logger.info(f"  Audio file: {audio_nm}")
             
             except Exception as e:
+                if _is_run_budget_deferral(e):
+                    return _vr("deferred_run_budget", video_id or "unknown", str(e), stage="run_budget")
                 error_category = "DOWNLOAD_EXCEPTION"
                 error_type = type(e).__name__
                 error_msg = f"{error_type}: {str(e)}"
@@ -1555,6 +1564,8 @@ def process_single_video(
                 logger.info(f"  Subtitle file: {subs_path}")
                 logger.info(f"  Transcription length: {transcription_length} characters")
             except Exception as e:
+                if _is_run_budget_deferral(e):
+                    return _vr("deferred_run_budget", video_id or "unknown", str(e), stage="run_budget")
                 error_category = "SUBTITLE_READ_ERROR"
                 error_msg = f"{type(e).__name__}: {str(e)}"
                 logger.error(f"[ERROR] {error_category} - Video ID: {video_id}")
@@ -1647,6 +1658,8 @@ def process_single_video(
                 logger.info(f"  Reduction rate: {reduction_rate:.1f}%")
 
             except Exception as e:
+                if _is_run_budget_deferral(e):
+                    return _vr("deferred_run_budget", video_id or "unknown", str(e), stage="preprocess")
                 error_category = "TOKEN_MINIMIZATION_ERROR"
                 error_type = type(e).__name__
                 error_msg = f"{error_type}: {str(e)}"
@@ -1679,6 +1692,8 @@ def process_single_video(
                 logger.info(f"  File size: {file_size} bytes")
 
             except PermissionError as e:
+                if _is_run_budget_deferral(e):
+                    return _vr("deferred_run_budget", video_id or "unknown", str(e), stage="run_budget")
                 error_category = "FILE_PERMISSION_ERROR"
                 error_msg = f"PermissionError: {str(e)}"
                 logger.error(f"[ERROR] {error_category} - Video ID: {video_id}")
@@ -1687,6 +1702,8 @@ def process_single_video(
                 logger.error(f"  Solution: Check directory permissions")
                 return _vr("file_error", video_id, error_msg, stage="save")
             except OSError as e:
+                if _is_run_budget_deferral(e):
+                    return _vr("deferred_run_budget", video_id or "unknown", str(e), stage="run_budget")
                 error_category = "FILE_SYSTEM_ERROR"
                 error_msg = f"OSError: {str(e)}"
                 logger.error(f"[ERROR] {error_category} - Video ID: {video_id}")
@@ -1694,6 +1711,8 @@ def process_single_video(
                 logger.error(f"  Cause: File system error (disk full, path too long, etc.)")
                 return _vr("file_error", video_id, error_msg, stage="save")
             except Exception as e:
+                if _is_run_budget_deferral(e):
+                    return _vr("deferred_run_budget", video_id or "unknown", str(e), stage="run_budget")
                 error_category = "FILE_SAVE_ERROR"
                 error_type = type(e).__name__
                 error_msg = f"{error_type}: {str(e)}"
@@ -1741,6 +1760,8 @@ def process_single_video(
                         filename=audio_nm, video_id=video_id, config=config, prompt=INPUT_PROMPT,
                     )
                 except ResponsesCallError as exc:
+                    if _is_run_budget_deferral(exc):
+                        return _vr("deferred_run_budget", video_id, str(exc), stage="summarize")
                     if exc.usage is None:
                         return _vr("manual_review", video_id, f"{exc.category}: {exc}", stage="summarize")
                     _append_llm_usage(config.get("DATA_ROOT", base_path), exc.usage.to_dict(), video_id)
@@ -1762,8 +1783,7 @@ def process_single_video(
             logger.info(f"  Response length: {response_length} characters")
             
         except Exception as e:
-            if (isinstance(e, run_budget.RunBudgetExpired) or
-                    getattr(e, "category", "") == "run_budget_expired"):
+            if _is_run_budget_deferral(e):
                 return _vr("deferred_run_budget", video_id, str(e), stage="summarize")
             error_category = "SUMMARY_GENERATION_ERROR"
             error_type = type(e).__name__
@@ -1982,6 +2002,8 @@ def process_single_video(
                 }
 
         except Exception as e:
+            if _is_run_budget_deferral(e):
+                return _vr("deferred_run_budget", video_id or "unknown", str(e), stage="save")
             error_category = "MARKDOWN_SAVE_ERROR"
             error_type = type(e).__name__
             error_msg = f"{error_type}: {str(e)}"
@@ -2021,8 +2043,7 @@ def process_single_video(
         raise  # Re-raise to be handled by main()
         
     except Exception as e:
-        if (isinstance(e, run_budget.RunBudgetExpired) or
-                getattr(e, "category", "") == "run_budget_expired"):
+        if _is_run_budget_deferral(e):
             return _vr("deferred_run_budget", video_id or "unknown", str(e), stage="run_budget")
         error_category = error_category or "UNKNOWN_ERROR"
         error_type = type(e).__name__
@@ -2847,6 +2868,8 @@ def process_videos(config: dict):
                             model=str(result.metadata_updates.get("model", "")), md_sha256=md_sha256)
                         manual_video_input.save_ledger(manual_ledger, manual_ledger_path)
             except Exception as ledger_exc:
+                if _is_run_budget_deferral(ledger_exc):
+                    raise
                 # Keep the result visible even if manual-specific persistence fails.
                 logger.error("Manual input ledger write failed for %s: %s", result.video_id, ledger_exc)
             if ledger_status == "success" and ledger_drive_state == "verified":

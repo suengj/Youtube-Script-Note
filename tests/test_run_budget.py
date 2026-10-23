@@ -535,7 +535,89 @@ def test_run_budget_deferral_restores_manual_and_channel_rows_for_next_run(tmp_p
         "channel0001"]
 
 
-def test_run_budget_http_client_keeps_sdk_redirect_defaults():
+@pytest.mark.parametrize("prior_exists", [False, True], ids=["manual-new-row", "manual-existing-row"])
+def test_manual_dispatch_deferral_restores_pre_dispatch_state_and_reselects(tmp_path, prior_exists):
+    import manual_video_input as mvi
+
+    video_id = "manual00002"
+    url = f"https://youtu.be/{video_id}"
+    before = mvi.read_ledger(tmp_path / "missing.csv")
+    if prior_exists:
+        before = mvi.upsert_ledger(
+            before, video_id=video_id, canonical_url=url, source_url=url,
+            status="retryable_failed", reason="prior API failure")
+        before.loc[before.video_id == video_id, "attempts"] = 2
+        before.loc[before.video_id == video_id, "last_attempt_at"] = "before-dispatch"
+    expected = before.copy(deep=True)
+
+    snapshot = mvi.snapshot_dispatch_state(before, video_id)
+    claimed = mvi._mark_manual_queue_processing(before.copy(), video_id, url, url)
+    assert int(claimed.iloc[0].attempts) == (3 if prior_exists else 1)
+    restored = mvi.restore_dispatch_state(claimed, video_id, snapshot)
+    if prior_exists:
+        actual_state = restored.iloc[0][list(mvi.LEDGER_COLUMNS)].astype(str).to_dict()
+        expected_state = expected.iloc[0][list(mvi.LEDGER_COLUMNS)].astype(str).to_dict()
+        assert actual_state == expected_state
+    else:
+        assert restored.empty
+
+    selected, _ = mvi.prepare_manual_queue(
+        [url], [], pd.DataFrame(), restored, 3, processed_video_ids=set(), mark_processing=False)
+    assert [item[0] for item in selected] == [video_id]
+
+
+def test_legacy_preprocess_expiry_returns_deferral_and_remains_reselectable(tmp_path, monkeypatch):
+    import main
+    import manual_video_input as mvi
+    import run_budget
+
+    video_id = "legacy00001"
+    url = f"https://youtu.be/{video_id}"
+    full = tmp_path / f"{video_id}_full.txt"
+    full.write_text("existing transcript", encoding="utf-8")
+    monkeypatch.setenv("P03_DRIVE_BACKEND", "desktop")
+    monkeypatch.setattr(main, "_build_transcript_cache", lambda _config: None)
+    monkeypatch.setattr(main, "_find_exact_durable_full_transcript", lambda *_args: str(full))
+    monkeypatch.setattr(main, "_read_durable_full_transcript", lambda *_args: (str(full), "existing transcript"))
+    monkeypatch.setattr(main, "_is_requeue_unpublished_video", lambda *_args: False)
+
+    class ExpiringPreprocessor:
+        def minimize(self, *_args, **_kwargs):
+            raise run_budget.RunBudgetExpired("run budget expired during preprocessing")
+
+    main_llm = main.MainLlmConfig(object(), "model", "provider")
+    args = (url, {"WORK_PATH": str(tmp_path), "DATA_ROOT": str(tmp_path), "USE_JOB_WORKSPACE": False},
+            None, main_llm, pd.DataFrame(), str(tmp_path), str(tmp_path / "audio"), str(tmp_path / "full"),
+            str(tmp_path / "smm"), str(tmp_path / "md"), str(tmp_path / "logs"), str(tmp_path / "hf"))
+    result = main.process_single_video(*args, preprocessor=ExpiringPreprocessor())
+    assert result.status == "deferred_run_budget"
+    assert result.retryable is False
+
+    before = mvi.read_ledger(tmp_path / "missing.csv")
+    snapshot = mvi.snapshot_dispatch_state(before, video_id)
+    claimed = mvi._mark_manual_queue_processing(before, video_id, url, url)
+    restored = mvi.restore_dispatch_state(claimed, video_id, snapshot)
+    assert restored.empty
+    selected, _ = mvi.prepare_manual_queue(
+        [url], [], pd.DataFrame(), restored, 3, processed_video_ids=set(), mark_processing=False)
+    assert [item[0] for item in selected] == [video_id]
+
+
+def test_legacy_summary_guard_raises_dedicated_deferral():
+    import main
+    import run_budget
+
+    main_llm = main.MainLlmConfig(object(), "model", "provider")
+    monkeypatch = pytest.MonkeyPatch()
+    try:
+        monkeypatch.setattr(run_budget, "expired", lambda: True)
+        with pytest.raises(run_budget.RunBudgetExpired):
+            main_llm.summarize("text", "file", "prompt")
+    finally:
+        monkeypatch.undo()
+
+
+def test_run_budget_http_client_keeps_sdk_redirect_defaults(monkeypatch):
     import run_budget
     from openai import OpenAI
     httpx = run_budget.httpx
@@ -560,5 +642,30 @@ def test_run_budget_http_client_keeps_sdk_redirect_defaults():
         result = client.responses.create(model="gpt-4.1", input="hello")
         assert result.output_text == "redirect worked"
         assert seen == ["/v1/responses", "/v1/responses-final"]
+    finally:
+        client.close()
+
+
+def test_run_budget_expiry_between_redirect_hops_blocks_redirect(monkeypatch):
+    import run_budget
+    from openai import OpenAI
+    httpx = run_budget.httpx
+
+    now = [100.0]
+    monkeypatch.setattr(run_budget.time, "time", lambda: now[0])
+    monkeypatch.setattr(run_budget, "_deadline", 101.0)
+    seen = []
+
+    def handler(request):
+        seen.append(request.url.path)
+        now[0] = 102.0
+        return httpx.Response(307, headers={"location": "/v1/responses-final"})
+
+    client = OpenAI(api_key="test", http_client=run_budget.make_http_client(
+        transport=httpx.MockTransport(handler)))
+    try:
+        with pytest.raises(run_budget.RunBudgetExpired, match="run budget expired"):
+            client.responses.create(model="gpt-4.1", input="hello")
+        assert seen == ["/v1/responses"]
     finally:
         client.close()
