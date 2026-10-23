@@ -78,6 +78,15 @@ def _file_hash(path: Path) -> str:
     return hashlib.sha256(path.read_text(encoding="utf-8-sig").encode("utf-8")).hexdigest()
 
 
+def _verify_source_write(path: Path, expected_hash: str) -> None:
+    try:
+        actual_hash = _file_hash(path)
+    except (OSError, UnicodeError, ValueError) as exc:
+        raise FilesystemSyncError(f"source readback verification failed for {path}: {exc}") from exc
+    if actual_hash != expected_hash:
+        raise FilesystemSyncError(f"source readback verification failed for {path}: content hash mismatch")
+
+
 def _manifest_item_identity(item: dict) -> tuple[str, str]:
     for key in ("drive_file_id", "video_id", "file"):
         value = str(item.get(key) or "").strip()
@@ -376,6 +385,10 @@ def run_sync(
         result.legacy_message = legacy_result.message
 
     new_files: Dict[str, SyncStateEntry] = dict(state.files)
+    # Cached state is useful for persistence and skip decisions, but only a
+    # source file written successfully in this run is authority to change its
+    # canonical manifest item.
+    written_files: Dict[str, SyncStateEntry] = {}
     for rel, item in sorted(local_map.items()):
         dest = config.source_dir / item.drive_name
         prev = state.files.get(rel)
@@ -385,6 +398,7 @@ def run_sync(
                 result.actions.append(f"skipped: {rel} (truncated copy of an existing canonical note)")
             elif prev is None:
                 copy_or_update_file(Path(item.absolute_path), dest, item.content)
+                _verify_source_write(dest, item.content_hash)
                 new_files[rel] = SyncStateEntry(
                     relative_path=rel,
                     content_hash=item.content_hash,
@@ -392,6 +406,7 @@ def run_sync(
                     drive_name=item.drive_name,
                     updated_at=_now_iso(),
                 )
+                written_files[rel] = new_files[rel]
                 result.created += 1
                 result.actions.append(f"created: {rel} → {dest}")
                 _classify(dest, config.sync_root)
@@ -399,6 +414,7 @@ def run_sync(
                 result.skipped += 1
             else:
                 copy_or_update_file(Path(item.absolute_path), Path(prev.dest_path), item.content)
+                _verify_source_write(Path(prev.dest_path), item.content_hash)
                 new_files[rel] = SyncStateEntry(
                     relative_path=rel,
                     content_hash=item.content_hash,
@@ -409,6 +425,7 @@ def run_sync(
                     title=prev.title or item.title,
                     revision=prev.revision + 1,
                 )
+                written_files[rel] = new_files[rel]
                 result.updated += 1
                 result.actions.append(f"updated: {rel} → {prev.dest_path}")
                 _classify(Path(prev.dest_path), config.sync_root)
@@ -421,7 +438,7 @@ def run_sync(
             result.skipped += 1
 
     try:
-        _write_merged_manifest(manifest_path, new_files, titles_by_rel)
+        _write_merged_manifest(manifest_path, written_files, titles_by_rel)
         result.manifest_path = str(manifest_path)
     except FilesystemSyncError as exc:
         result.errors += 1

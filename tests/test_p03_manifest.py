@@ -306,6 +306,32 @@ def test_post_update_clobber_is_detected_and_missing_pre_read_items_are_restored
     assert {item.get("drive_file_id") for item in items} == {"old-drive-id", "local-id"}
 
 
+def test_post_update_clobber_restores_missing_fields_on_matching_item():
+    drive = _FakeDrive()
+    old_item = {
+        "file": "old_abcdefghijk.md", "title": "Old", "hash": hashlib.sha256(b"old").hexdigest(),
+        "revision": 1, "video_id": "abcdefghijk", "drive_file_id": "old-drive-id",
+        "custom_field": {"retain": True, "nested": {"also_retain": "yes"}},
+    }
+    drive._set_manifest({"version": 1, "items": [old_item]}, revision="1")
+    sink = DriveApiSink(drive)
+
+    def racing_writer_drops_pre_read_field():
+        current = parse_manifest_yaml(drive.items[MANIFEST_FILE_ID]["data"])
+        current["items"][0]["custom_field"]["nested"].pop("also_retain")
+        drive._set_manifest(current, revision=str(int(drive.items[MANIFEST_FILE_ID]["headRevisionId"]) + 1))
+
+    drive.on_after_manifest_update = racing_writer_drops_pre_read_field
+    result = _merge(sink, file="local_lmnopqrst.md", video_id="lmnopqrst", summary=b"local",
+                    drive_file_id="local-id")
+
+    items = sink.read_manifest()["items"]
+    restored = next(item for item in items if item.get("drive_file_id") == "old-drive-id")
+    assert result["action"] == "unchanged"
+    assert restored["custom_field"] == {"retain": True, "nested": {"also_retain": "yes"}}
+    assert drive.manifest_update_count >= 2
+
+
 @pytest.mark.parametrize(
     "kwargs",
     [

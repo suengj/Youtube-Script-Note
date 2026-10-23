@@ -13,6 +13,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
 
 from scripts.drive_yt_summary.config import discover_yt_summary_root  # noqa: E402
+from scripts.drive_yt_summary.config import load_config  # noqa: E402
 from scripts.drive_yt_summary.scanner import is_syncable_relative_path, scan_summary_map  # noqa: E402
 from scripts.drive_yt_summary import sync as sync_module  # noqa: E402
 from scripts.drive_yt_summary.manifest import parse_manifest_yaml, serialize_manifest_yaml  # noqa: E402
@@ -286,3 +287,27 @@ def test_manifest_merge_retry_restores_item_removed_by_racing_writer(tmp_path, m
     assert any(item.get("video_id") == "lmnopqrst" for item in final["items"])
     assert final["inventory"] == {"keep": True}
     assert calls == 2
+
+
+def test_skipped_cached_state_cannot_rewrite_canonical_manifest_item(md_root, drive_root, work_env):
+    rel, source = next(iter(scan_summary_map(str(md_root)).items()))
+    dest = drive_root / "source" / source.drive_name
+    cached = SyncStateEntry(
+        relative_path=rel, content_hash=source.content_hash, dest_path=str(dest),
+        drive_name=source.drive_name, updated_at="2026-10-20T00:00:00Z", revision=1,
+    )
+    config = load_config(work_env[0], work_env[1], str(md_root), str(drive_root))
+    save_state(config.state_path, SyncState(files={rel: cached}))
+    canonical = {
+        "file": source.drive_name, "title": "canonical title", "hash": "b" * 64,
+        "revision": 2, "content_revision_at": "2026-10-20T00:00:00Z",
+        "custom_field": {"keep": True},
+    }
+    manifest_path = drive_root / "manifest.yaml"
+    manifest_path.write_bytes(serialize_manifest_yaml({"version": 1, "items": [canonical]}))
+
+    result = _run(md_root, drive_root, work_env, limit=1)
+
+    merged = parse_manifest_yaml(manifest_path.read_bytes())
+    assert result.errors == 0 and result.skipped == 1
+    assert merged["items"] == [canonical]

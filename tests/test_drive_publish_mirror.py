@@ -109,7 +109,7 @@ def test_rerun_no_duplicate_and_change_is_revision(env):
     assert e["video_id"] == "abc" and e["revision"] == 2 and len(e["content_hash"]) == 64
 
 
-def test_batch_sync_after_publish_is_noop_and_manifest_has_ids(env):
+def test_batch_sync_after_publish_does_not_promote_cached_state_to_manifest(env):
     from scripts.drive_yt_summary.sync import run_sync
 
     env.run(mirror=True)
@@ -117,7 +117,8 @@ def test_batch_sync_after_publish_is_noop_and_manifest_has_ids(env):
                  sync_root=str(env.drive), base_path=str(env.base), work_path=str(env.work))
     assert r.created == 0 and r.updated == 0 and r.errors == 0
     manifest = (env.drive / "manifest.yaml").read_text(encoding="utf-8")
-    assert "video_id: abc" in manifest and "hash:" in manifest
+    assert "items: []" in manifest
+    assert "video_id: abc" not in manifest and "hash:" not in manifest
 
 
 def test_disabled_falls_back_to_vault(env, monkeypatch):
