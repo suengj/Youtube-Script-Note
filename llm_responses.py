@@ -100,8 +100,6 @@ def call_responses(client, model: str, instructions: str, input_text: str, effor
                    max_output_tokens: int = 32000, retries: int = 2, backoff_s: float = 0.25,
                    sample_video_id: Optional[str] = None, source_text: Optional[str] = None):
     """Return (visible output, UsageRecord); retry only errors accepted by the legacy classifier."""
-    if run_budget.expired():
-        raise ResponsesCallError("run_budget_expired", "P03 run budget expired before paid LLM summary", None)
     if effort not in {"low", "medium", "high"}:
         raise ValueError("effort must be low, medium, or high")
     source_sha = hashlib.sha256((source_text if source_text is not None else input_text).encode("utf-8")).hexdigest()
@@ -110,27 +108,21 @@ def call_responses(client, model: str, instructions: str, input_text: str, effor
     started = time.monotonic()
     max_attempts = max(1, int(retries) + 1)
     for attempt in range(1, max_attempts + 1):
-        if run_budget.expired():
-            raise ResponsesCallError(
-                "run_budget_expired", "P03 run budget expired before paid LLM summary", rec
-            )
+        rec.attempts = attempt
         try:
-            response = run_budget.call_with_retries(
-                client.responses.create,
+            response = client.responses.create(
                 model=model, instructions=instructions, input=input_text,
                 reasoning={"effort": effort}, max_output_tokens=max_output_tokens,
-                on_attempt=lambda: setattr(rec, "attempts", rec.attempts + 1),
-                on_error=lambda exc: rec.attempt_errors.append({
-                    "attempt": rec.attempts, "category": _error_category(exc)
-                }),
             )
-        except run_budget.RunBudgetExpired as exc:
-            rec.status = "error"
-            rec.latency_s = round(time.monotonic() - started, 3)
-            raise ResponsesCallError(
-                "run_budget_expired", "P03 run budget expired before paid LLM summary", rec
-            ) from exc
         except Exception as exc:
+            if isinstance(exc, run_budget.RunBudgetExpired):
+                rec.attempt_errors.append({"attempt": attempt, "category": "run_budget_expired"})
+                rec.status = "error"
+                rec.latency_s = round(time.monotonic() - started, 3)
+                raise ResponsesCallError(
+                    "run_budget_expired", str(exc), rec
+                ) from exc
+            rec.attempt_errors.append({"attempt": attempt, "category": _error_category(exc)})
             if attempt >= max_attempts or not stt._is_retryable_llm_error(exc):
                 rec.status = "error"
                 rec.latency_s = round(time.monotonic() - started, 3)

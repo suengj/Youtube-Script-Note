@@ -369,126 +369,112 @@ def test_expired_run_budget_blocks_paid_work_from_all_recovery_paths(tmp_path, m
     assert result.errors == 0 and result.created == 1
     assert paid_calls == []
 
-    class PaidClient:
-        def __init__(self):
-            self.calls = 0
-            self.responses = SimpleNamespace(create=self.create)
-            self.chat = SimpleNamespace(completions=SimpleNamespace(create=self.create))
-        def create(self, **_kwargs):
-            self.calls += 1
-            raise AssertionError("expired paid call")
-
-    client = PaidClient()
-    with pytest.raises(ResponsesCallError, match="run budget expired"):
-        call_responses(client, "model", "instructions", "input")
-    with pytest.raises(RuntimeError, match="run budget expired"):
-        stt.token_minimizer("role", "query", "transcript", client)
-    with pytest.raises(RuntimeError, match="run budget expired"):
-        stt.response_text_5mini("summary query", client)
-    assert client.calls == 0
-
-
-@pytest.mark.parametrize("entrypoint,args", [
-    ("token_minimizer", ("role", "query", "transcript")),
-    ("response_text_4o", ("role", "query")),
-    ("response_text_o1", ("query",)),
-    ("response_text_o3", ("query",)),
-    ("response_text_o4", ("query",)),
-    ("response_text_5mini", ("query",)),
-    ("response_text_grok", ("role", "query")),
-])
-def test_production_chat_call_sites_keep_origin_main_request_count(monkeypatch, entrypoint, args):
-    from types import SimpleNamespace
-
-    import run_budget
-    import stt_function_v3 as stt
-
-    monkeypatch.setattr(run_budget, "_deadline", None)
-    delays = []
-    monkeypatch.setattr(run_budget.random, "random", lambda: 0)
-    monkeypatch.setattr(run_budget.time, "sleep", delays.append)
-
-    class HttpError(Exception):
-        status_code = 500
+def _openai_retry_client(monkeypatch, run_budget, *, error_kind, status_code=500):
+    httpx = run_budget.httpx
+    from openai import OpenAI
+    import openai._base_client as sdk_base
 
     calls = []
+    delays = []
+    monkeypatch.setattr(sdk_base, "random", lambda: 0)
+    monkeypatch.setattr(sdk_base.time, "sleep", delays.append)
 
-    def create(**_kwargs):
-        calls.append(1)
-        raise HttpError("persistent server error")
+    def handler(request):
+        calls.append(request)
+        if error_kind == "connection":
+            raise httpx.ConnectError("connection dropped", request=request)
+        headers = {"retry-after": "120"} if error_kind == "retry_after" else {}
+        return httpx.Response(status_code, headers=headers,
+                               json={"error": {"message": "temporary failure", "type": "server_error"}})
 
-    client = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=create)))
-    with pytest.raises(HttpError):
-        getattr(stt, entrypoint)(*args, client)
-    assert len(calls) == 3
-
-
-def test_production_retry_sites_use_zero_sdk_retries(monkeypatch):
-    """Application retry wrappers must not be multiplied by OpenAI SDK retries."""
-    import inspect
-
-    import main
-    import stt_function_v3 as stt
-
-    assert "max_retries=0" in inspect.getsource(main.initialize_clients)
-    assert "max_retries=0" in inspect.getsource(main._create_llm_provider_client)
-    assert "max_retries=0" in inspect.getsource(main.initialize_clients)
-    # Benchmarks are standalone tools and stay on origin/main call behavior.
-    for path in (ROOT / "benchmarks/llm/runner.py", ROOT / "benchmarks/llm/v5_single_pass.py"):
-        assert "run_budget" not in path.read_text(encoding="utf-8")
-    assert "run_budget.call_with_retries" in inspect.getsource(stt)
+    transport = httpx.MockTransport(handler)
+    client = OpenAI(api_key="test", http_client=run_budget.make_http_client(transport=transport))
+    return client, calls, delays
 
 
-def test_call_responses_preserves_origin_total_sdk_and_application_attempts(monkeypatch):
-    from types import SimpleNamespace
-
+@pytest.mark.parametrize("error_kind,status_code", [
+    ("status", 500), ("retry_after", 429), ("connection", 500),
+])
+@pytest.mark.parametrize("endpoint", ["chat", "responses"])
+def test_sdk_and_origin_app_retry_counts_match_below_deadline(
+    monkeypatch, error_kind, status_code, endpoint,
+):
+    import openai._base_client as sdk_base
+    import openai
     import run_budget
+    import stt_function_v3 as stt
     from llm_responses import ResponsesCallError, call_responses
 
     monkeypatch.setattr(run_budget, "_deadline", None)
-    delays = []
-    monkeypatch.setattr(run_budget.random, "random", lambda: 0)
-    monkeypatch.setattr(run_budget.time, "sleep", delays.append)
+    client, calls, delays = _openai_retry_client(
+        monkeypatch, run_budget, error_kind=error_kind, status_code=status_code)
+    sdk_delays = ([120.0, 120.0] if error_kind == "retry_after" and
+                  openai.__version__.startswith("3.") else [0.5, 1.0])
+    try:
+        if endpoint == "chat":
+            with pytest.raises(Exception):
+                stt.response_text_o1("question", client)
+            expected_calls = 3
+            expected_delays = sdk_delays
+        else:
+            with pytest.raises(ResponsesCallError):
+                call_responses(client, "gpt-4.1", "instructions", "input")
+            expected_calls = 9
+            expected_delays = sdk_delays + [0.25] + sdk_delays + [0.5] + sdk_delays
+        assert len(calls) == expected_calls
+        assert delays == expected_delays
+    finally:
+        client.close()
 
-    class HttpError(Exception):
-        status_code = 500
 
-    calls = []
+def test_production_clients_restore_sdk_default_retries_and_use_transport_gate():
+    import inspect
+    import main
+    import stt_function_v3 as stt
 
-    def create(**_kwargs):
-        calls.append(1)
-        raise HttpError("persistent server error")
-
-    client = SimpleNamespace(responses=SimpleNamespace(create=create))
-    with pytest.raises(ResponsesCallError) as exc:
-        call_responses(client, "model", "instructions", "input")
-    assert len(calls) == 9
-    assert exc.value.usage.attempts == 9
-    assert delays == [0.5, 1.0, 0.25, 0.5, 1.0, 0.5, 0.5, 1.0]
+    assert "max_retries=0" not in inspect.getsource(main.initialize_clients)
+    assert "max_retries=0" not in inspect.getsource(main._create_llm_provider_client)
+    assert "run_budget.call_with_retries" not in inspect.getsource(stt)
+    assert "http_client=run_budget.make_http_client()" in inspect.getsource(main.initialize_clients)
+    assert "run_budget" not in inspect.getsource(stt)
 
 
-def test_deadline_crossed_after_first_500_blocks_next_http_attempt(monkeypatch):
-    from types import SimpleNamespace
-
+@pytest.mark.parametrize("endpoint", ["chat", "responses"])
+def test_deadline_crossed_during_sdk_retry_blocks_next_request_and_defers(monkeypatch, endpoint):
     import run_budget
+    httpx = run_budget.httpx
+    from openai import OpenAI
+    import openai._base_client as sdk_base
+    import stt_function_v3 as stt
     from llm_responses import ResponsesCallError, call_responses
 
     now = [100.0]
     monkeypatch.setattr(run_budget.time, "time", lambda: now[0])
     monkeypatch.setattr(run_budget, "_deadline", 101.0)
-    monkeypatch.setattr(run_budget.time, "sleep", lambda _seconds: None)
-
-    class HttpError(Exception):
-        status_code = 500
-
+    monkeypatch.setattr(sdk_base, "random", lambda: 0)
+    monkeypatch.setattr(sdk_base.time, "sleep", lambda seconds: now.__setitem__(0, now[0] + seconds + 1))
     calls = []
 
-    def create(**_kwargs):
-        calls.append(1)
-        now[0] = 102.0
-        raise HttpError("temporary server error")
+    def handler(request):
+        calls.append(request)
+        return httpx.Response(500, json={"error": {"message": "temporary", "type": "server_error"}})
 
-    client = SimpleNamespace(responses=SimpleNamespace(create=create))
-    with pytest.raises(ResponsesCallError, match="run budget expired"):
-        call_responses(client, "model", "instructions", "input", backoff_s=0)
-    assert len(calls) == 1
+    client = OpenAI(api_key="test", http_client=run_budget.make_http_client(
+        transport=httpx.MockTransport(handler)))
+    try:
+        if endpoint == "chat":
+            with pytest.raises(run_budget.RunBudgetExpired, match="run budget expired"):
+                stt.response_text_o1("question", client)
+        else:
+            with pytest.raises(ResponsesCallError, match="run budget expired") as exc:
+                call_responses(client, "gpt-4.1", "instructions", "input")
+            assert exc.value.category == "run_budget_expired"
+        assert len(calls) == 1
+        from pipeline_models import VideoProcessResult
+        import manual_video_input
+        deferred = VideoProcessResult.from_legacy_tuple(
+            "api_error", "abcdefghijk", "run_budget_expired", source_url="https://youtu.be/abcdefghijk")
+        assert deferred.retryable is True
+        assert manual_video_input.ledger_outcome("api_error", "run_budget_expired")[0] == "retryable_failed"
+    finally:
+        client.close()

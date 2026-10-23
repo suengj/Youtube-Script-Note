@@ -739,7 +739,7 @@ def _create_llm_provider_client(provider: str, config: dict, openai_client: Open
         return OpenAI(
             api_key=config['OPENROUTER_API_KEY'],
             base_url="https://openrouter.ai/api/v1",
-            max_retries=0,
+            http_client=run_budget.make_http_client(),
         )
     if provider == 'openai':
         return openai_client
@@ -752,7 +752,8 @@ def initialize_clients(config: dict) -> Tuple[OpenAI, Optional[OpenAI], MainLlmC
     
     try:
         logger.info("  Initializing OpenAI client...")
-        openai_client = OpenAI(api_key=config['OPENAI_API_KEY'], max_retries=0)
+        openai_client = OpenAI(
+            api_key=config['OPENAI_API_KEY'], http_client=run_budget.make_http_client())
         logger.info("  ✓ OpenAI client initialized")
         
         # Test API connection with a simple request (optional)
@@ -775,7 +776,9 @@ def initialize_clients(config: dict) -> Tuple[OpenAI, Optional[OpenAI], MainLlmC
     if config.get('XAI_API_KEY'):
         try:
             logger.info("  Initializing XAI (Grok) client...")
-            xai_client = OpenAI(api_key=config['XAI_API_KEY'], base_url="https://api.x.ai/v1", max_retries=0)
+            xai_client = OpenAI(
+                api_key=config['XAI_API_KEY'], base_url="https://api.x.ai/v1",
+                http_client=run_budget.make_http_client())
             logger.info("  ✓ XAI client initialized")
         except Exception as e:
             error_type = type(e).__name__
@@ -2739,7 +2742,8 @@ def process_videos(config: dict):
     ]
     if video_workers > 1:
         worker_openai_clients = [
-            OpenAI(api_key=config['OPENAI_API_KEY'], max_retries=0) for _ in range(video_workers)
+            OpenAI(api_key=config['OPENAI_API_KEY'], http_client=run_budget.make_http_client())
+            for _ in range(video_workers)
         ]
         worker_preprocessors = [
             create_transcript_preprocessor(config.get("PREPROCESS_BACKEND", "cloud_api"), worker_openai_clients[i])
