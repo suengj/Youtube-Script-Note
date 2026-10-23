@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import copy
 from datetime import datetime, timezone
 from typing import Dict, List, Optional
 
@@ -36,6 +37,58 @@ def serialize_manifest_yaml(doc: dict) -> bytes:
     if not isinstance(doc, dict):
         raise ValueError("manifest must be a mapping")
     return yaml.safe_dump(doc, allow_unicode=True, sort_keys=False).encode("utf-8")
+
+
+def restore_missing_manifest_fields(doc: dict, prior_docs) -> tuple[dict, bool]:
+    """Restore previously observed manifest fields lost to a concurrent write.
+
+    Existing values win. A prior item is matched by any stable manifest
+    identity; ambiguous matches fail closed rather than attaching fields to the
+    wrong item.
+    """
+    restored = copy.deepcopy(doc)
+    restored_items = restored.get("items", [])
+    changed = False
+
+    def merge_missing(current, prior):
+        merged_any = False
+        for key, value in prior.items():
+            if key not in current:
+                current[key] = copy.deepcopy(value)
+                merged_any = True
+            elif isinstance(current[key], dict) and isinstance(value, dict):
+                merged_any = merge_missing(current[key], value) or merged_any
+        return merged_any
+
+    def tokens(item):
+        return {
+            (key, str(item.get(key) or "").strip())
+            for key in ("drive_file_id", "video_id", "file")
+            if str(item.get(key) or "").strip()
+        }
+
+    for prior in prior_docs:
+        for key, value in prior.items():
+            if key == "items":
+                continue
+            if key not in restored:
+                restored[key] = copy.deepcopy(value)
+                changed = True
+            elif isinstance(restored[key], dict) and isinstance(value, dict):
+                changed = merge_missing(restored[key], value) or changed
+
+        for item in prior.get("items", []):
+            item_tokens = tokens(item)
+            matches = [current for current in restored_items
+                       if item_tokens and item_tokens & tokens(current)]
+            if not matches and item_tokens:
+                restored_items.append(copy.deepcopy(item))
+                changed = True
+            elif len(matches) == 1:
+                changed = merge_missing(matches[0], item) or changed
+            elif len(matches) > 1:
+                raise ValueError("cannot safely restore fields for an ambiguous manifest item")
+    return restored, changed
 
 
 def merge_manifest_source(

@@ -255,10 +255,11 @@ def test_desktop_sync_merges_without_dropping_api_inventory_or_lifecycle_fields(
     assert len(merged["items"]) == 2
 
 
-def test_manifest_merge_retry_restores_item_removed_by_racing_writer(tmp_path, monkeypatch):
+def test_manifest_merge_retry_restores_missing_nested_fields_removed_by_racing_writer(tmp_path, monkeypatch):
     manifest_path = tmp_path / "manifest.yaml"
     retained = {"file": "api_only.md", "title": "API", "hash": "a" * 64, "revision": 2,
-                "video_id": "abcdefghijk", "drive_file_id": "drive-api-item", "unknown": "keep"}
+                "video_id": "abcdefghijk", "drive_file_id": "drive-api-item",
+                "unknown": {"nested": {"keep": True, "newer": "preserve"}}}
     manifest_path.write_bytes(serialize_manifest_yaml({
         "version": 1, "inventory": {"keep": True}, "items": [retained],
     }))
@@ -276,14 +277,16 @@ def test_manifest_merge_retry_restores_item_removed_by_racing_writer(tmp_path, m
         real_write(path, content)
         if calls == 1:
             doc = parse_manifest_yaml(Path(path).read_bytes())
-            doc["items"] = [item for item in doc["items"] if item.get("drive_file_id") != "drive-api-item"]
+            item = next(item for item in doc["items"] if item.get("drive_file_id") == "drive-api-item")
+            del item["unknown"]["nested"]["keep"]
             real_write(path, serialize_manifest_yaml(doc).decode("utf-8"))
 
     monkeypatch.setattr(sync_module, "atomic_write_text", clobber_once)
     sync_module._write_merged_manifest(manifest_path, {"new/new.md": entry}, {"new/new.md": "New"})
 
     final = parse_manifest_yaml(manifest_path.read_bytes())
-    assert retained in final["items"]
+    recovered = next(item for item in final["items"] if item.get("drive_file_id") == "drive-api-item")
+    assert recovered["unknown"] == {"nested": {"keep": True, "newer": "preserve"}}
     assert any(item.get("video_id") == "lmnopqrst" for item in final["items"])
     assert final["inventory"] == {"keep": True}
     assert calls == 2

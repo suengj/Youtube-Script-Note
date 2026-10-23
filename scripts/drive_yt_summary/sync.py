@@ -18,7 +18,13 @@ from filename_utils import MAX_FILENAME_BYTES, parse_note_name
 from .config import DriveSyncConfigError, load_config, verify_sync_root
 from .fs_transport import FilesystemSyncError, atomic_write_text, copy_or_update_file, ensure_dir
 from .legacy import migrate_contents_gen_to_legacy
-from .manifest import build_manifest_yaml, parse_manifest_yaml, serialize_manifest_yaml, utc_now_iso
+from .manifest import (
+    build_manifest_yaml,
+    parse_manifest_yaml,
+    restore_missing_manifest_fields,
+    serialize_manifest_yaml,
+    utc_now_iso,
+)
 from .scanner import scan_summary_map
 from .state import SyncState, SyncStateEntry, load_state, save_state
 
@@ -99,26 +105,12 @@ def _manifest_item_identities(doc: dict) -> set[tuple[str, str]]:
     return {_manifest_item_identity(item) for item in doc.get("items", []) if _manifest_item_identity(item)[1]}
 
 
-def _merge_manifest_doc(existing: dict, generated: dict, *, preserved_docs=()) -> dict:
+def _merge_manifest_doc(existing: dict, generated: dict) -> dict:
     """Merge desktop sync entries without dropping canonical or unknown fields."""
     result = dict(existing)
     items = [dict(item) for item in existing.get("items", [])]
-    identities = {_manifest_item_identity(item) for item in items}
-
-    # If a concurrent desktop writer removed a previously observed item/top-level
-    # key, restore only the missing data; newer values already present win.
-    for prior in preserved_docs:
-        for key, value in prior.items():
-            if key != "items" and key not in result:
-                result[key] = value
-        for prior_item in prior.get("items", []):
-            identity = _manifest_item_identity(prior_item)
-            if identity[1] and identity not in identities:
-                items.append(dict(prior_item))
-                identities.add(identity)
 
     for source in generated.get("items", []):
-        identity = _manifest_item_identity(source)
         matches = [i for i, item in enumerate(items) if (
             (source.get("drive_file_id") and item.get("drive_file_id") == source.get("drive_file_id")) or
             (source.get("video_id") and item.get("video_id") == source.get("video_id")) or
@@ -128,8 +120,6 @@ def _merge_manifest_doc(existing: dict, generated: dict, *, preserved_docs=()) -
             raise ValueError(f"manifest has multiple entries for desktop source {source.get('file')}")
         if not matches:
             items.append(dict(source))
-            if identity[1]:
-                identities.add(identity)
             continue
 
         index = matches[0]
@@ -155,7 +145,6 @@ def _merge_manifest_doc(existing: dict, generated: dict, *, preserved_docs=()) -
         elif "revision" in source:
             merged["revision"] = source["revision"]
         items[index] = merged
-        identities.add(_manifest_item_identity(merged))
 
     result["items"] = items
     result.setdefault("version", generated.get("version", 1))
@@ -182,7 +171,11 @@ def _write_merged_manifest(path: Path, new_files, titles_by_rel, *, max_attempts
     for _attempt in range(max_attempts):
         before_bytes, before_doc = _read_manifest(path)
         signature = (hashlib.sha256(before_bytes).hexdigest(), hashlib.md5(before_bytes).hexdigest())
-        merged = _merge_manifest_doc(before_doc, generated, preserved_docs=preserved_docs)
+        try:
+            restored_doc, _restored = restore_missing_manifest_fields(before_doc, preserved_docs)
+        except ValueError as exc:
+            raise FilesystemSyncError(f"cannot safely restore manifest fields: {exc}") from exc
+        merged = _merge_manifest_doc(restored_doc, generated)
         expected = serialize_manifest_yaml(merged)
         latest_bytes, latest_doc = _read_manifest(path)
         latest_signature = (hashlib.sha256(latest_bytes).hexdigest(), hashlib.md5(latest_bytes).hexdigest())

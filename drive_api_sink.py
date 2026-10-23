@@ -1,7 +1,6 @@
 """Verified Google Drive API sink for P03 per-video artifacts."""
 from __future__ import annotations
 
-import copy
 import hashlib
 import io
 import json
@@ -18,6 +17,7 @@ from scripts.drive_yt_summary.manifest import (
     inventory_completion_decision,
     merge_manifest_source,
     parse_manifest_yaml,
+    restore_missing_manifest_fields,
     serialize_manifest_yaml,
     set_manifest_inventory,
     verify_inventory_evidence,
@@ -56,46 +56,6 @@ def _manifest_retains_items(before_doc, after_doc):
         any(_manifest_item_tokens(item) & tokens for tokens in after_tokens)
         for item in before_doc.get("items", [])
     )
-
-
-def _restore_missing_manifest_items(doc, prior_docs):
-    """Restore every previously observed key lost to a concurrent revision."""
-    restored = dict(doc)
-    restored_items = copy.deepcopy(doc.get("items", []))
-    restored["items"] = restored_items
-    changed = False
-
-    def merge_missing(current, prior):
-        """Deep-merge prior keys that disappeared; values already present win."""
-        merged_any = False
-        for key, value in prior.items():
-            if key not in current:
-                current[key] = copy.deepcopy(value)
-                merged_any = True
-            elif isinstance(current[key], dict) and isinstance(value, dict):
-                merged_any = merge_missing(current[key], value) or merged_any
-        return merged_any
-
-    for prior in prior_docs:
-        for key, value in prior.items():
-            if key != "items":
-                if key not in restored:
-                    restored[key] = copy.deepcopy(value)
-                    changed = True
-                elif isinstance(restored[key], dict) and isinstance(value, dict):
-                    changed = merge_missing(restored[key], value) or changed
-        for item in prior.get("items", []):
-            item_tokens = _manifest_item_tokens(item)
-            matches = [current for current in restored_items
-                       if item_tokens and item_tokens & _manifest_item_tokens(current)]
-            if not matches and item_tokens:
-                restored_items.append(copy.deepcopy(item))
-                changed = True
-            elif len(matches) == 1:
-                changed = merge_missing(matches[0], item) or changed
-            elif len(matches) > 1:
-                raise DriveUploadError("cannot safely restore fields for an ambiguous manifest item")
-    return restored, changed
 
 
 class DriveApiSink:
@@ -191,7 +151,10 @@ class DriveApiSink:
                         last_conflict = True
                         continue
                     raise
-                doc, restored_missing = _restore_missing_manifest_items(doc, preserved_docs)
+                try:
+                    doc, restored_missing = restore_missing_manifest_fields(doc, preserved_docs)
+                except ValueError as exc:
+                    raise DriveUploadError(str(exc)) from exc
                 try:
                     updated_doc, result, changed = mutator(doc)
                 except DriveUploadError:
