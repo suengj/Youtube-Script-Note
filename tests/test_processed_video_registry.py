@@ -175,7 +175,45 @@ def test_unreadable_sheet_import_is_fail_closed_with_registry_only_state(tmp_pat
     assert result["new"] == 0
     assert pvr.processed_ids(pvr.registry_path(tmp_path)) == {"existing0001"}
     assert not (tmp_path / "input_df.csv").exists()
-    assert "registry-only processed checks" in caplog.text
+    assert "Google Sheet read failed" in caplog.text
+
+
+def test_batch_manual_admission_fails_closed_when_sheet_read_fails(tmp_path, monkeypatch, caplog):
+    import main
+    import manual_video_input as mvi
+
+    _empty_registry(tmp_path)
+    monkeypatch.setattr(pvr, "read_sheet_marked_ids",
+                        lambda: (_ for _ in ()).throw(OSError("offline")))
+    manual_df = pd.DataFrame([{"date": "2026-10-22", "url": "https://youtu.be/sheetonly01"}])
+
+    admitted = main.select_batch_manual_rows(
+        tmp_path, manual_df, "2026-10-01", 5, pd.DataFrame(), mvi.read_ledger(tmp_path / "ledger.csv"))
+
+    assert admitted == []
+    assert "manual admission is disabled" in caplog.text
+
+
+def test_importer_excludes_existing_and_stale_registry_evidence_before_cap(tmp_path):
+    _empty_registry(tmp_path)
+    pd.DataFrame([{"video_id": "ledgerdne01", "status": "skipped_historical"}]).to_csv(
+        tmp_path / "manual_input_status.csv", index=False)
+    pd.DataFrame([{"v_id": "unknown", "url": "https://youtu.be/outputdone1",
+                   "status": "download_failed"}]).to_csv(tmp_path / "output_df_new.csv", index=False)
+    pd.DataFrame([{"url": "https://youtu.be/inputdone01", "date": "2026-10-23"}]).to_csv(
+        tmp_path / "input_df.csv", index=False, encoding="cp949")
+    rows = [["URL", "Source", "Download 여부", "Updated/Published Time/"],
+            ["https://youtu.be/inputdone01", "", "", "2026-10-23"],
+            ["https://youtu.be/outputdone1", "", "", "2026-10-22"],
+            ["https://youtu.be/ledgerdne01", "", "", "2026-10-21"],
+            ["https://youtu.be/fresholder1", "", "", "2026-10-20"]]
+
+    result = import_rows(rows, tmp_path / "input_df.csv", tmp_path, max_new=1, dry_run=True)
+
+    assert result["new"] == 1
+    assert result["deferred"] == 0
+    frame = pd.read_csv(tmp_path / "input_df.csv", dtype=str, encoding="cp949")
+    assert frame.url.tolist() == ["https://youtu.be/inputdone01"]
 
 
 def test_manual_success_ledger_row_is_processed(tmp_path):

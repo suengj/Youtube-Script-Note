@@ -173,6 +173,47 @@ def output_processed_ids(output_df, normalize) -> set[str]:
     return ids
 
 
+def input_video_ids(input_df, normalize) -> set[str]:
+    """Return video IDs already queued in an input_df-like frame."""
+    ids = set()
+    if input_df is None or "url" not in getattr(input_df, "columns", ()):
+        return ids
+    for value in input_df["url"]:
+        vid = _video_id(value, normalize)
+        if vid:
+            ids.add(vid)
+    return ids
+
+
+def processed_id_union(data_root: str | Path, normalize, output_df=None, *,
+                       sheet_rows=None, ledger_df=None, input_df=None) -> set[str]:
+    """Build the admission guard from registry, output, Sheet, ledger, and input.
+
+    Sheet evidence is required: if it cannot be read or validated this function
+    raises so manual admission callers can fail closed for the run.
+    """
+    from manual_video_input import read_ledger
+
+    path = registry_path(data_root)
+    registry = processed_ids(path)
+    if registry is None:
+        raise FileNotFoundError(f"processed registry is missing: {path}")
+    if sheet_rows is None:
+        sheet_ids = read_sheet_marked_ids()
+    else:
+        sheet_ids = sheet_marked_ids(sheet_rows, normalize)
+    ids = reconcile_sheet_marked(path, sheet_ids)
+    ids |= output_processed_ids(output_df, normalize)
+    if ledger_df is None:
+        ledger_df = read_ledger(Path(data_root) / "manual_input_status.csv")
+    if ledger_df is not None and len(ledger_df) and {"video_id", "status"}.issubset(ledger_df.columns):
+        terminal = ledger_df.status.astype(str).isin({"success", "skipped_historical"})
+        ids |= {vid for value in ledger_df.loc[terminal, "video_id"]
+                if (vid := _video_id(value, normalize))}
+    ids |= input_video_ids(input_df, normalize)
+    return ids
+
+
 def record_success(data_root: str | Path, video_id: str, *, source: str, status: str = "success", model: str = "") -> None:
     merge_records(registry_path(data_root), [(video_id, source, status, model)])
 

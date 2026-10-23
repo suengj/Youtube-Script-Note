@@ -475,6 +475,7 @@ def test_process_videos_runs_unregistered_manual_video_through_existing_path(
             raise RuntimeError("sheet unavailable")
 
     monkeypatch.setattr(main, "initialize_clients", lambda config: (None, None, None))
+    monkeypatch.setattr(main.processed_video_registry, "read_sheet_marked_ids", lambda: set())
     monkeypatch.setattr(main.channel_crawl, "load_channel_df",
                         lambda root: registry_roots.append(root) or [])
     monkeypatch.setattr(main, "create_transcript_preprocessor", lambda *args: object())
