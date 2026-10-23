@@ -1,6 +1,7 @@
 # Core pipeline (Python 3.9+)
 python-dotenv>=1.0.0
-pandas>=2.0.0
+# OVH runs pandas 3.0.6; run tests under that version as well as local pandas.
+pandas>=2.0.0,<4
 tqdm>=4.66.0
 openai>=1.0.0
 yt-dlp[default]>=2024.1.0
