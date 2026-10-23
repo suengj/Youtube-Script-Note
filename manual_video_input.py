@@ -212,7 +212,7 @@ def _ensure_ledger_flag_columns(df):
     return df
 
 
-def read_ledger(path: str | Path):
+def read_ledger(path: str | Path, *, require_schema: bool = False):
     import pandas as pd
     p = Path(path)
     if not p.exists():
@@ -221,9 +221,11 @@ def read_ledger(path: str | Path):
         df = pd.read_csv(p, dtype=str, keep_default_na=False, encoding="utf-8-sig")
     except UnicodeDecodeError:
         df = pd.read_csv(p, dtype=str, keep_default_na=False, encoding="cp949")
-    for col in LEDGER_COLUMNS:
-        if col not in df.columns:
-            df[col] = ""
+    missing = sorted(set(LEDGER_COLUMNS) - set(df.columns))
+    if require_schema and missing:
+        raise ValueError(f"manual ledger missing required columns: {', '.join(missing)}")
+    for col in missing:
+        df[col] = ""
     _ensure_ledger_flag_columns(df)
     # Counters remain numeric in memory; all other ledger CSV values stay text.
     for col in ("attempts", "regen_attempts"):

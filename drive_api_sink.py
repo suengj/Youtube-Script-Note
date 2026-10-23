@@ -14,6 +14,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from scripts.drive_yt_summary.manifest import (
+    inventory_completion_decision,
     merge_manifest_source,
     parse_manifest_yaml,
     serialize_manifest_yaml,
@@ -275,7 +276,7 @@ class DriveApiSink:
         incoming = dict(inventory)
         success_ids = {str(value).strip() for value in success_video_ids if str(value).strip()}
         source_counts = incoming.get("source_counts") or {}
-        expected_success_count = int(source_counts.get("succeeded", 0))
+        expected_success_count = int(source_counts.get("manifest_succeeded", source_counts.get("succeeded", 0)))
 
         def merge(doc):
             current_inventory = doc.get("inventory") or {}
@@ -298,26 +299,45 @@ class DriveApiSink:
             return updated, stored_record, updated.get("inventory") != doc.get("inventory")
 
         def publish_verified_evidence(manifest_payload, _doc, stored_record):
-            counts = stored_record.get("source_counts") or {}
-            complete = bool(
-                stored_record.get("batch_completed") and
-                stored_record.get("discovery_complete") and
-                int(counts.get("failed", 0)) == 0 and
-                int(counts.get("unresolved", 0)) == 0 and
+            all_successes_present = bool(
                 stored_record.get("all_successes_present") and
                 len(success_ids) == expected_success_count
             )
-            if not complete:
+            ready = inventory_completion_decision(
+                stored_record,
+                manifest_readback_verified=True,
+                inventory_file_readback_verified=False,
+                all_successes_present=all_successes_present,
+            )
+            if not ready["ready_for_inventory_file_verification"]:
                 return stored_record
-            completed_record = dict(stored_record)
-            completed_record["manifest_readback_verified"] = True
-            completed_record["inventory_complete"] = True
-            evidence = {
+            staged_record = dict(stored_record)
+            staged_record.update({
+                "manifest_readback_verified": True,
+                "inventory_file_readback_verified": False,
+                "inventory_complete": False,
+            })
+            staged_evidence = {
                 "schema_version": 1,
                 "manifest_file_id": self.manifest_file_id,
                 "manifest_sha256": _sha(manifest_payload),
-                "inventory": completed_record,
+                "inventory": staged_record,
             }
+            # First persist and read back a provisional artifact. Only that
+            # positive Drive readback lets the central gate authorize true.
+            self._upsert_inventory_evidence(staged_evidence)
+            decision = inventory_completion_decision(
+                staged_record,
+                manifest_readback_verified=True,
+                inventory_file_readback_verified=True,
+                all_successes_present=all_successes_present,
+            )
+            if not decision["inventory_complete"]:
+                return stored_record
+            completed_record = dict(staged_record)
+            completed_record["inventory_file_readback_verified"] = True
+            completed_record["inventory_complete"] = decision["inventory_complete"]
+            evidence = {**staged_evidence, "inventory": completed_record}
             self._upsert_inventory_evidence(evidence)
             # This value is a return receipt, not a self-assertion stored in the
             # artifact. Consumers independently verify the downloaded MD5/SHA and

@@ -16,6 +16,8 @@ sys.path.insert(0, str(ROOT))
 from drive_api_sink import DriveApiSink, DriveUploadError, INVENTORY_FILE_NAME, MANIFEST_FILE_ID, SUMMARY_FOLDER_ID
 from scripts.drive_yt_summary.manifest import (
     build_inventory_record,
+    classify_inventory_status,
+    inventory_completion_decision,
     merge_manifest_source,
     parse_manifest_yaml,
     reconcile_inventory_scope,
@@ -338,7 +340,7 @@ def test_inventory_write_is_readback_verified_and_revision_monotonic():
     completed = build_inventory_record(
         producer_run_id="run-1", coverage_started_at=started["coverage_started_at"], cutoff=started["cutoff"],
         succeeded=1, discovery_complete=True, all_successes_present=True,
-        manifest_readback_verified=True, completed=True, now="2026-10-23T00:01:00Z",
+        coverage_state_valid=True, manifest_readback_verified=True, completed=True, now="2026-10-23T00:01:00Z",
     )
     final = sink.write_inventory(completed, success_video_ids=["abcdefghijk"])
     assert final["inventory_revision"] == 1
@@ -368,7 +370,8 @@ def test_manifest_readback_failure_never_publishes_completion_evidence():
     drive.corrupt_manifest_after_update_count = drive.manifest_update_count
     final = build_inventory_record(
         producer_run_id="run-1", coverage_started_at=started["coverage_started_at"], cutoff=started["cutoff"],
-        succeeded=0, discovery_complete=True, completed=True, now="2026-10-23T00:01:00Z",
+        succeeded=0, discovery_complete=True, coverage_state_valid=True,
+        completed=True, now="2026-10-23T00:01:00Z",
     )
     with pytest.raises(DriveUploadError, match="readback"):
         sink.write_inventory(final)
@@ -386,6 +389,7 @@ def test_inventory_file_readback_failure_cannot_be_trusted():
     complete = build_inventory_record(
         producer_run_id="run-1", coverage_started_at=started["coverage_started_at"], cutoff=started["cutoff"],
         succeeded=1, discovery_complete=True, all_successes_present=True, completed=True,
+        coverage_state_valid=True,
         now="2026-10-23T00:01:00Z",
     )
     with pytest.raises(DriveUploadError, match="inventory evidence"):
@@ -506,9 +510,11 @@ def test_inventory_scope_counts_claimed_deferred_and_retry_exhausted_sources():
             "skip000001": "passed_shorts",
         },
     )
-    assert reconciled["succeeded"] == 1
+    assert reconciled["succeeded"] == 2
     assert reconciled["failed"] == 2
     assert reconciled["unresolved"] == 2  # active claim and max-video deferral
+    assert reconciled["succeeded"] + reconciled["failed"] + reconciled["unresolved"] == reconciled["scope_count"]
+    assert reconciled["manifest_succeeded"] == 1
     assert reconciled["terminal_skipped"] == 1
     assert reconciled["success_video_ids"] == {"success0001"}
 
@@ -530,6 +536,164 @@ def test_retry_exhausted_queue_rows_are_declared_even_when_not_candidates():
     )
     assert reconciled["failed"] == 1
     assert reconciled["unresolved"] == 1
+
+
+def test_unknown_queue_status_is_preserved_as_unresolved_coverage():
+    import pandas as pd
+    import channel_crawl
+
+    queue = pd.DataFrame([
+        {"video_id": "blank000001", "status": "", "retry_count": 0},
+        {"video_id": "future000001", "status": "future_status", "retry_count": 0},
+        {"video_id": "claim000001", "status": "claimed", "retry_count": 0},
+        {"video_id": "done0000001", "status": "done", "retry_count": 0},
+    ])
+    report = {}
+    channel_crawl._record_inventory_queue_scope(report, queue, max_retries=3)
+    assert report["queue_scope_video_ids"] == [
+        "blank000001", "claim000001", "done0000001", "future000001",
+    ]
+    reconciled = reconcile_inventory_scope(report["queue_scope_video_ids"], {})
+    assert reconciled["unresolved"] == 4
+    assert reconciled["succeeded"] + reconciled["failed"] + reconciled["unresolved"] == reconciled["scope_count"]
+
+    resolved = {}
+    channel_crawl._record_inventory_queue_scope(
+        resolved, queue, max_retries=3,
+        output_df=pd.DataFrame([{"v_id": "done0000001", "status": "success"}]),
+    )
+    terminal_counts = reconcile_inventory_scope(
+        resolved["queue_scope_video_ids"], resolved["queue_scope_outcomes"],
+    )
+    assert terminal_counts["manifest_succeeded"] == 1
+    assert terminal_counts["unresolved"] == 3
+
+
+def test_coverage_state_readers_reject_missing_required_columns(tmp_path):
+    import main
+    import manual_video_input
+    import processed_video_registry
+    import channel_crawl
+
+    data = tmp_path / "data"
+    data.mkdir()
+    (data / "output_df_new.csv").write_text("date,url,v_id\n", encoding="utf-8-sig")
+    with pytest.raises(channel_crawl.CoverageStateReadError, match="output_df missing required columns"):
+        main.load_output_df_only(str(data))
+
+    (data / "input_df.csv").write_text("url\nhttps://youtu.be/manual00001\n", encoding="cp949")
+    with pytest.raises(channel_crawl.CoverageStateReadError, match="input_df missing required columns"):
+        main.get_input_urls_for_channel_crawl(str(data), None)
+
+    (data / channel_crawl.CRAWL_QUEUE_FILENAME).write_text("video_id,status\nvideo000001,queued\n", encoding="utf-8-sig")
+    with pytest.raises(channel_crawl.CoverageStateReadError, match="crawl queue missing required columns"):
+        channel_crawl.load_crawl_queue_df(str(data))
+
+    (data / "channel_df.csv").write_text("channel_url\nhttps://youtube.test/channel\n", encoding="utf-8-sig")
+    with pytest.raises(channel_crawl.CoverageStateReadError, match="channel_df missing required columns"):
+        channel_crawl.load_channel_df(str(data))
+
+    (data / "manual_input_status.csv").write_text("video_id,status\nmanual00001,new\n", encoding="utf-8-sig")
+    with pytest.raises(ValueError, match="manual ledger missing required columns"):
+        manual_video_input.read_ledger(data / "manual_input_status.csv", require_schema=True)
+
+    (data / processed_video_registry.REGISTRY_NAME).write_text("video_id,last_status\nvideo000001,success\n", encoding="utf-8-sig")
+    with pytest.raises(ValueError, match="processed registry missing required columns"):
+        processed_video_registry.read_registry(processed_video_registry.registry_path(data))
+
+
+def test_inventory_completion_gate_exhaustively_rejects_fault_injections():
+    """Fault each persisted source, Drive checkpoint, and interruption boundary."""
+    from itertools import product
+
+    state_files = ("queue", "output_df", "input_df", "ledger", "channel_df", "processed_registry")
+    faults = []
+    for state_file in state_files:
+        for condition in ("missing", "unreadable", "missing_columns"):
+            faults.append((f"{state_file}:{condition}", "state"))
+        faults.append((f"{state_file}:unknown_status", "status"))
+    for step in (
+        "inventory_start_write", "manifest_write", "manifest_readback", "inventory_create",
+        "inventory_update", "inventory_metadata_read", "inventory_file_readback",
+        "inventory_identity_readback",
+    ):
+        faults.append((f"drive:{step}", "drive"))
+    for point in ("before_batch_complete", "during_manifest_publish", "during_inventory_publish"):
+        faults.append((f"interrupt:{point}", "interrupt"))
+
+    def complete_record():
+        return {
+            "batch_completed": True,
+            "discovery_complete": True,
+            "coverage_state_valid": True,
+            "count_partition_verified": True,
+            "source_counts": {"succeeded": 1, "failed": 0, "unresolved": 0, "scope_count": 1},
+        }
+
+    for label, kind in faults:
+        record = complete_record()
+        manifest_verified = True
+        inventory_file_verified = True
+        all_successes_present = True
+        if kind == "state":
+            record["coverage_state_valid"] = False
+        elif kind == "status":
+            assert classify_inventory_status("future_status") == "unresolved"
+            record["source_counts"].update({"succeeded": 0, "unresolved": 1, "scope_count": 1})
+        elif kind == "drive":
+            if label.endswith(("manifest_write", "manifest_readback")):
+                manifest_verified = False
+            elif label.endswith("inventory_start_write"):
+                record["coverage_state_valid"] = False
+            else:
+                inventory_file_verified = False
+        else:
+            if label.endswith("before_batch_complete"):
+                record["batch_completed"] = False
+            elif label.endswith("during_manifest_publish"):
+                manifest_verified = False
+            else:
+                inventory_file_verified = False
+        decision = inventory_completion_decision(
+            record,
+            manifest_readback_verified=manifest_verified,
+            inventory_file_readback_verified=inventory_file_verified,
+            all_successes_present=all_successes_present,
+        )
+        assert decision["inventory_complete"] is False, label
+
+    # Exhaust every combination of independent positive evidence flags too.
+    for batch, discovery, state, partition, manifest, inventory_file, successes in product((False, True), repeat=7):
+        record = complete_record()
+        record.update({
+            "batch_completed": batch,
+            "discovery_complete": discovery,
+            "coverage_state_valid": state,
+            "count_partition_verified": partition,
+        })
+        decision = inventory_completion_decision(
+            record,
+            manifest_readback_verified=manifest,
+            inventory_file_readback_verified=inventory_file,
+            all_successes_present=successes,
+        )
+        assert decision["inventory_complete"] is all((batch, discovery, state, partition, manifest, inventory_file, successes))
+
+    for counts in (
+        {"succeeded": 1, "failed": 0, "unresolved": 0, "scope_count": 2, "manifest_succeeded": 1},
+        {"succeeded": 0, "failed": 1, "unresolved": 0, "scope_count": 1, "manifest_succeeded": 0},
+        {"succeeded": 0, "failed": 0, "unresolved": 1, "scope_count": 1, "manifest_succeeded": 0},
+        {"succeeded": 0, "failed": 0, "unresolved": 0, "scope_count": 0, "manifest_succeeded": 1},
+    ):
+        record = complete_record()
+        record["source_counts"] = counts
+        decision = inventory_completion_decision(
+            record,
+            manifest_readback_verified=True,
+            inventory_file_readback_verified=True,
+            all_successes_present=True,
+        )
+        assert decision["inventory_complete"] is False
 
 
 @pytest.mark.parametrize(
@@ -554,8 +718,8 @@ def test_unreadable_coverage_state_keeps_inventory_incomplete_and_queue_intact(
     md.mkdir()
     cursor = "2026-10-22T00:00:00Z"
     (data / "channel_df.csv").write_text(
-        "channel_url,channel_name,channel_id,uploads_playlist_id,last_processed_published_at,last_discovered_published_at\n"
-        f"https://www.youtube.com/channel/UC{'a' * 22},Fixture,UC{'a' * 22},UU{'a' * 22},{cursor},{cursor}\n",
+        "channel_url,channel_name,usage_channel,channel_id,uploads_playlist_id,last_processed_published_at,last_discovered_published_at,auto_sub_only\n"
+        f"https://www.youtube.com/channel/UC{'a' * 22},Fixture,fixture,UC{'a' * 22},UU{'a' * 22},{cursor},{cursor},\n",
         encoding="utf-8-sig",
     )
     (data / "output_df_new.csv").write_text("date,url,v_id,status\n", encoding="utf-8-sig")

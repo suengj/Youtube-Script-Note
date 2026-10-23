@@ -29,9 +29,9 @@ def read_registry(path: str | Path):
         frame = pd.read_csv(p, dtype=str, keep_default_na=False, encoding="utf-8-sig")
     except UnicodeDecodeError:
         frame = pd.read_csv(p, dtype=str, keep_default_na=False, encoding="cp949")
-    for column in REGISTRY_COLUMNS:
-        if column not in frame.columns:
-            frame[column] = ""
+    missing = sorted(set(REGISTRY_COLUMNS) - set(frame.columns))
+    if missing:
+        raise ValueError(f"processed registry missing required columns: {', '.join(missing)}")
     return frame[REGISTRY_COLUMNS]
 
 
@@ -195,9 +195,25 @@ def processed_id_union(data_root: str | Path, normalize, output_df=None, *,
     from manual_video_input import read_ledger
 
     path = registry_path(data_root)
-    registry = processed_ids(path)
-    if registry is None:
+    registry_frame = read_registry(path)
+    if registry_frame is None:
         raise FileNotFoundError(f"processed registry is missing: {path}")
+    registry = {
+        str(value).strip() for value in registry_frame.video_id
+        if str(value).strip() and str(value).strip().lower() != "unknown"
+    }
+    from manual_video_input import LEDGER_STATUSES
+    known_statuses = {value.casefold() for value in LEDGER_STATUSES} | {
+        "success", "already_existed", "oversized_file", "passed_shorts", "short",
+        "video_unavailable", "skipped_auto_subs_only", "sheet_marked", "done", "queued",
+        "failed", "retry_exhausted", "error", "download_failed", "mlx_error",
+        "captions_error", "source_unavailable", "api_error", "file_error",
+        "no_auto_caption", "manual_review", "durable_transcript_unreadable", "live_scheduled",
+    }
+    unknown_statuses = sorted({str(value).strip().casefold() for value in registry_frame.last_status
+                               if str(value).strip().casefold() not in known_statuses})
+    if unknown_statuses:
+        raise ValueError(f"processed registry has unknown status values: {', '.join(unknown_statuses)}")
     if sheet_rows is None:
         sheet_ids = read_sheet_marked_ids()
     else:

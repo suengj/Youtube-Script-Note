@@ -165,6 +165,10 @@ def build_inventory_record(
     succeeded: int = 0,
     failed: int = 0,
     unresolved: int = 0,
+    scope_count: Optional[int] = None,
+    manifest_succeeded: Optional[int] = None,
+    coverage_state_valid: bool = False,
+    count_partition_verified: Optional[bool] = None,
     discovery_complete: bool = False,
     all_successes_present: bool = False,
     manifest_readback_verified: bool = False,
@@ -176,6 +180,15 @@ def build_inventory_record(
     counts = {"succeeded": int(succeeded), "failed": int(failed), "unresolved": int(unresolved)}
     if any(value < 0 for value in counts.values()):
         raise ValueError("inventory source counts cannot be negative")
+    counts["scope_count"] = int(scope_count if scope_count is not None else sum(counts.values()))
+    counts["manifest_succeeded"] = int(manifest_succeeded if manifest_succeeded is not None else succeeded)
+    counts["terminal_skipped"] = max(0, counts["succeeded"] - counts["manifest_succeeded"])
+    partition_verified = (
+        counts["succeeded"] + counts["failed"] + counts["unresolved"] == counts["scope_count"] and
+        0 <= counts["manifest_succeeded"] <= counts["succeeded"]
+    )
+    if count_partition_verified is not None:
+        partition_verified = partition_verified and bool(count_partition_verified)
     return {
         "inventory_revision": int(inventory_revision),
         "producer_run_id": str(producer_run_id),
@@ -183,6 +196,8 @@ def build_inventory_record(
         "coverage_completed_at": (now or utc_now_iso()) if completed else None,
         "cutoff": cutoff,
         "source_counts": counts,
+        "coverage_state_valid": bool(coverage_state_valid),
+        "count_partition_verified": partition_verified,
         "discovery_complete": bool(discovery_complete),
         # These flags are only set in the detached completion evidence after the
         # manifest bytes and that evidence file have both passed readback.
@@ -190,6 +205,65 @@ def build_inventory_record(
         "all_successes_present": bool(all_successes_present),
         "batch_completed": bool(completed),
         "inventory_complete": False,
+    }
+
+
+INVENTORY_SUMMARY_SUCCESS_STATUSES = {"success", "already_existed"}
+INVENTORY_TERMINAL_SUCCESS_STATUSES = INVENTORY_SUMMARY_SUCCESS_STATUSES | {
+    "passed_shorts", "short", "video_unavailable", "skipped_auto_subs_only", "oversized_file",
+}
+INVENTORY_TERMINAL_FAILURE_STATUSES = {
+    "error", "download_failed", "mlx_error", "captions_error", "source_unavailable",
+    "api_error", "file_error", "no_auto_caption", "manual_review", "durable_transcript_unreadable",
+    "retry_exhausted",
+}
+
+
+def classify_inventory_status(status) -> str:
+    """Map every status to succeeded, failed, or unresolved without a default PASS."""
+    normalized = str(status or "").strip().casefold()
+    if normalized in INVENTORY_TERMINAL_SUCCESS_STATUSES:
+        return "succeeded"
+    if normalized in INVENTORY_TERMINAL_FAILURE_STATUSES:
+        return "failed"
+    return "unresolved"
+
+
+def inventory_completion_decision(
+    inventory: dict,
+    *,
+    manifest_readback_verified: bool,
+    inventory_file_readback_verified: bool,
+    all_successes_present: bool,
+) -> dict:
+    """Central fail-closed decision for publishing ``inventory_complete``."""
+    inventory = inventory if isinstance(inventory, dict) else {}
+    counts = inventory.get("source_counts") if isinstance(inventory, dict) else None
+    counts = counts if isinstance(counts, dict) else {}
+    try:
+        succeeded = int(counts.get("succeeded", -1))
+        failed = int(counts.get("failed", -1))
+        unresolved = int(counts.get("unresolved", -1))
+        scope_count = int(counts.get("scope_count", -1))
+        manifest_succeeded = int(counts.get("manifest_succeeded", succeeded))
+    except (TypeError, ValueError):
+        succeeded = failed = unresolved = scope_count = manifest_succeeded = -1
+    partition_verified = (
+        succeeded >= 0 and failed >= 0 and unresolved >= 0 and scope_count >= 0 and
+        succeeded + failed + unresolved == scope_count and
+        0 <= manifest_succeeded <= succeeded and
+        inventory.get("count_partition_verified") is True
+    )
+    ready = bool(
+        inventory.get("batch_completed") is True and
+        inventory.get("discovery_complete") is True and
+        inventory.get("coverage_state_valid") is True and
+        partition_verified and failed == 0 and unresolved == 0 and
+        all_successes_present is True and manifest_readback_verified is True
+    )
+    return {
+        "ready_for_inventory_file_verification": ready,
+        "inventory_complete": bool(ready and inventory_file_readback_verified is True),
     }
 
 
@@ -233,12 +307,7 @@ def set_manifest_inventory(doc: dict, inventory: dict, *, start: bool) -> tuple[
 
 
 def reconcile_inventory_scope(scope_video_ids, outcomes, *, extra_unresolved: int = 0):
-    """Count every declared source, including deferred and skipped queue rows.
-
-    Outcomes are keyed by source ID. Only a completed producer result is terminal;
-    active claims, max-video deferrals, and other missing outcomes remain unresolved.
-    Explicit retry-exhaustion remains a failure and therefore blocks completeness.
-    """
+    """Classify every declared source exactly once into success/failure/unresolved."""
     scope = {str(value).strip() for value in scope_video_ids if str(value).strip()}
     normalized = {
         str(video_id).strip(): str(status or "").strip().lower()
@@ -246,27 +315,29 @@ def reconcile_inventory_scope(scope_video_ids, outcomes, *, extra_unresolved: in
         if str(video_id).strip()
     }
     scope.update(normalized)
-    successes = {"success", "already_existed"}
-    failures = {
-        "error", "download_failed", "mlx_error", "captions_error", "source_unavailable",
-        "api_error", "file_error", "no_auto_caption", "manual_review",
-        "durable_transcript_unreadable", "retry_exhausted",
-    }
-    verified_skips = {
-        "passed_shorts", "short", "video_unavailable", "skipped_auto_subs_only", "oversized_file",
-    }
-    success_ids = {video_id for video_id in scope if normalized.get(video_id) in successes}
-    failed_ids = {video_id for video_id in scope if normalized.get(video_id) in failures}
-    terminal_ids = success_ids | failed_ids | {
-        video_id for video_id in scope if normalized.get(video_id) in verified_skips
-    }
-    unresolved = len(scope - terminal_ids) + max(0, int(extra_unresolved or 0))
+    classifications = {video_id: classify_inventory_status(normalized.get(video_id, "")) for video_id in scope}
+    success_ids = {video_id for video_id in scope
+                   if normalized.get(video_id) in INVENTORY_SUMMARY_SUCCESS_STATUSES}
+    succeeded_ids = {video_id for video_id, classification in classifications.items()
+                     if classification == "succeeded"}
+    failed_ids = {video_id for video_id, classification in classifications.items()
+                  if classification == "failed"}
+    unresolved = sum(classification == "unresolved" for classification in classifications.values())
+    extra_unresolved = max(0, int(extra_unresolved or 0))
+    unresolved += extra_unresolved
+    succeeded = len(succeeded_ids)
+    failed = len(failed_ids)
+    scope_count = len(scope) + extra_unresolved
+    partition_verified = succeeded + failed + unresolved == scope_count
+    assert partition_verified, "inventory scope counts must classify every source exactly once"
     return {
-        "succeeded": len(success_ids),
-        "failed": len(failed_ids),
+        "succeeded": succeeded,
+        "failed": failed,
         "unresolved": unresolved,
-        "scope_count": len(scope) + max(0, int(extra_unresolved or 0)),
-        "terminal_skipped": len(terminal_ids - success_ids - failed_ids),
+        "scope_count": scope_count,
+        "manifest_succeeded": len(success_ids),
+        "terminal_skipped": len(succeeded_ids - success_ids),
+        "count_partition_verified": partition_verified,
         "success_video_ids": success_ids,
     }
 
@@ -293,13 +364,15 @@ def verify_inventory_evidence(
         raise ValueError("inventory evidence download does not match Drive metadata")
     evidence = json.loads(evidence_bytes.decode("utf-8"))
     inventory = evidence.get("inventory") if isinstance(evidence, dict) else None
-    counts = (inventory or {}).get("source_counts") if isinstance(inventory, dict) else None
-    if not isinstance(inventory, dict) or not inventory.get("inventory_complete"):
+    if not isinstance(inventory, dict) or inventory.get("inventory_complete") is not True:
         raise ValueError("inventory evidence is incomplete")
-    if (not inventory.get("manifest_readback_verified") or not inventory.get("batch_completed") or
-            not inventory.get("discovery_complete") or not inventory.get("all_successes_present") or
-            not isinstance(counts, dict) or int(counts.get("failed", -1)) != 0 or
-            int(counts.get("unresolved", -1)) != 0):
+    decision = inventory_completion_decision(
+        inventory,
+        manifest_readback_verified=inventory.get("manifest_readback_verified") is True,
+        inventory_file_readback_verified=inventory.get("inventory_file_readback_verified") is True,
+        all_successes_present=inventory.get("all_successes_present") is True,
+    )
+    if not decision["inventory_complete"]:
         raise ValueError("inventory evidence does not prove complete verified coverage")
     if not inventory.get("coverage_completed_at") or int(inventory.get("inventory_revision", 0)) < 1:
         raise ValueError("inventory evidence has no verified coverage end or revision")

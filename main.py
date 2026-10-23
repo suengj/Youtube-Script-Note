@@ -819,9 +819,9 @@ def load_dataframes(data_root: str) -> Tuple[pd.DataFrame, pd.DataFrame]:
         
         logger.info(f"Loading input dataframe: {input_df_path}")
         input_df = _read_csv_with_retry(input_df_path, encoding='cp949')
-        
-        if 'url' not in input_df.columns:
-            error_msg = "Input dataframe must have 'url' column"
+        missing = sorted({"url", "date"} - set(input_df.columns))
+        if missing:
+            error_msg = f"Input dataframe missing required columns: {', '.join(missing)}"
             logger.error(f"[ERROR] ValueError - {error_msg}")
             logger.error(f"  Columns found: {list(input_df.columns)}")
             raise ValueError(error_msg)
@@ -845,6 +845,9 @@ def load_dataframes(data_root: str) -> Tuple[pd.DataFrame, pd.DataFrame]:
         if os.path.exists(output_df_path):
             logger.info(f"Loading output dataframe: {output_df_path}")
             output_df = _read_csv_with_retry(output_df_path)
+            _validate_inventory_state_columns(
+                output_df, {"date", "url", "v_id", "status"}, "output_df", output_df_path
+            )
             logger.info(f"  Loaded {len(output_df)} existing records")
         else:
             logger.info(f"Output file not found, creating new: {output_df_path}")
@@ -923,6 +926,9 @@ def load_output_df_only(data_root: str) -> pd.DataFrame:
     output_df_path = os.path.join(data_root, 'output_df_new.csv')
     if os.path.exists(output_df_path):
         output_df = _read_csv_with_retry(output_df_path)
+        _validate_inventory_state_columns(
+            output_df, {"date", "url", "v_id", "status"}, "output_df", output_df_path
+        )
         logger.info(f"Loaded output dataframe: {output_df_path} ({len(output_df)} records)")
     else:
         output_df = pd.DataFrame(columns=['date', 'url', 'v_id', 'status'])
@@ -945,21 +951,30 @@ def get_url_list(input_df: pd.DataFrame, output_df: pd.DataFrame) -> List[str]:
 def get_input_urls_for_channel_crawl(data_root: str, output_df: pd.DataFrame) -> List[str]:
     """
     When CHANNEL_CRAWL=true: load input_df.csv if present and return URLs not yet in output_df.
-    Returns [] if input_df.csv is missing or contains no rows. Read/schema failures propagate
+    Returns [] if input_df.csv contains no rows. Missing/read/schema failures propagate
     because they leave the manual portion of discovery scope unknown.
     """
     input_df_path = os.path.join(data_root, 'input_df.csv')
     if not os.path.exists(input_df_path):
-        return []
+        raise channel_crawl.CoverageStateReadError(
+            "input_df", input_df_path, FileNotFoundError("state file is missing")
+        )
     try:
         input_df = _read_csv_with_retry(input_df_path, encoding='cp949')
-        if 'url' not in input_df.columns:
-            raise ValueError("input_df.csv must contain a 'url' column")
+        _validate_inventory_state_columns(input_df, {"url", "date"}, "input_df", input_df_path)
         if input_df.empty:
             return []
         return get_url_list(input_df, output_df)
     except Exception as e:
         raise channel_crawl.CoverageStateReadError("input_df", input_df_path, e) from e
+
+
+def _validate_inventory_state_columns(frame, required_columns, state_name: str, path: str) -> None:
+    """Reject padded or partial CSV headers before they can shrink inventory scope."""
+    missing = sorted(set(required_columns) - set(getattr(frame, "columns", ())))
+    if missing:
+        cause = ValueError(f"{state_name} missing required columns: {', '.join(missing)}")
+        raise channel_crawl.CoverageStateReadError(state_name, path, cause) from cause
 
 # Prompt templates
 def build_token_query(retention_min: int, retention_max: int, *, auto_subs: bool = False) -> str:
@@ -2022,14 +2037,27 @@ def process_videos(config: dict):
     def _mark_discovery_state_failure(reason):
         _mark_inventory_incomplete(reason)
         inventory_discovery["complete"] = False
-        inventory_discovery["unresolved"] = int(inventory_discovery.get("unresolved", 0)) + 1
-        inventory_discovery["queue_scope_unresolved"] = int(
-            inventory_discovery.get("queue_scope_unresolved", 0)
-        ) + 1
+
+    # Missing files are not empty-state evidence. Continue where possible so
+    # the run can recover, but preserve the missing source as an incomplete
+    # coverage reason. Existing files are validated by their typed readers.
+    state_paths = {
+        "input_df": os.path.join(data_root, "input_df.csv"),
+        "output_df": os.path.join(data_root, "output_df_new.csv"),
+        "manual_ledger": os.path.join(data_root, "manual_input_status.csv"),
+    }
+    if config.get("CHANNEL_CRAWL"):
+        state_paths.update({
+            "channel_df": os.path.join(data_root, channel_crawl.CHANNEL_DF_FILENAME),
+            "crawl_queue": os.path.join(data_root, channel_crawl.CRAWL_QUEUE_FILENAME),
+        })
+    for state_name, state_path in state_paths.items():
+        if not os.path.isfile(state_path):
+            _mark_inventory_incomplete(f"{state_name}_missing")
 
     if api_backend:
         try:
-            inventory_cutoff = (channel_crawl.inventory_cutoff_snapshot(base_path, config)
+            inventory_cutoff = (channel_crawl.inventory_cutoff_snapshot(data_root, config)
                                 if config.get("CHANNEL_CRAWL") else {
                                     "mode": "manual_selection",
                                     "manual_since": (os.getenv("P03_MANUAL_SINCE") or "").strip() or None,
@@ -2064,6 +2092,7 @@ def process_videos(config: dict):
         except Exception as exc:
             logger.error("Could not start canonical manifest inventory coverage: %s: %s",
                          type(exc).__name__, exc)
+            _mark_inventory_incomplete("inventory_start_write_failed")
 
     def _finish_manifest_inventory(*, completed, counts, discovery_report):
         if not api_backend or inventory_sink is None or not callable(getattr(inventory_sink, "write_inventory", None)):
@@ -2071,7 +2100,8 @@ def process_videos(config: dict):
         discovery_complete = bool(discovery_report and discovery_report.get("complete"))
         cutoff = (discovery_report.get("cutoff") if discovery_report else None)
         scope_ids = set(inventory_scope_video_ids)
-        outcomes = dict(inventory_outcomes)
+        outcomes = dict((discovery_report or {}).get("queue_scope_outcomes") or {})
+        outcomes.update(inventory_outcomes)
         if discovery_report:
             scope_ids.update(discovery_report.get("queue_scope_video_ids") or ())
             for video_id in discovery_report.get("retry_exhausted_video_ids") or ():
@@ -2087,6 +2117,8 @@ def process_videos(config: dict):
         )
         final_counts = {key: reconciled[key] for key in ("succeeded", "failed", "unresolved")}
         incomplete_reasons = set(inventory_incomplete_reasons)
+        if not reconciled.get("count_partition_verified"):
+            incomplete_reasons.add("inventory_count_partition_failed")
         if not discovery_complete:
             incomplete_reasons.add("channel_discovery_incomplete")
         if final_counts["failed"]:
@@ -2100,6 +2132,10 @@ def process_videos(config: dict):
             succeeded=final_counts["succeeded"],
             failed=final_counts["failed"],
             unresolved=final_counts["unresolved"],
+            scope_count=reconciled["scope_count"],
+            manifest_succeeded=reconciled["manifest_succeeded"],
+            coverage_state_valid=not inventory_incomplete_reasons,
+            count_partition_verified=reconciled.get("count_partition_verified", False),
             discovery_complete=discovery_complete,
             all_successes_present=False,
             manifest_readback_verified=False,
@@ -2107,7 +2143,6 @@ def process_videos(config: dict):
             now=utc_now_iso() if completed else None,
         )
         record["incomplete_reason"] = "; ".join(sorted(incomplete_reasons)) or None
-        record["source_counts"]["scope_count"] = reconciled["scope_count"]
         record["source_counts"]["terminal_skipped"] = reconciled["terminal_skipped"]
         try:
             stored = inventory_sink.write_inventory(
@@ -2133,6 +2168,7 @@ def process_videos(config: dict):
         "unresolved": 0,
         "cutoff": inventory_cutoff,
         "queue_scope_video_ids": [],
+        "queue_scope_outcomes": {},
         "retry_exhausted_video_ids": [],
         "queue_scope_unresolved": 0,
     }
@@ -2307,7 +2343,7 @@ def process_videos(config: dict):
     # Channel candidates win so their discovered metadata and policies are retained.
     manual_ledger_path = os.path.join(data_root, "manual_input_status.csv")
     try:
-        manual_ledger = manual_video_input.read_ledger(manual_ledger_path)
+        manual_ledger = manual_video_input.read_ledger(manual_ledger_path, require_schema=True)
     except Exception:
         _mark_inventory_incomplete("manual_ledger_read_failed")
         _finish_manifest_inventory(
@@ -2316,6 +2352,15 @@ def process_videos(config: dict):
             discovery_report=inventory_discovery,
         )
         raise
+    unknown_ledger_statuses = {
+        str(status or "").strip().casefold()
+        for status in manual_ledger.status
+        if str(status or "").strip().casefold() not in
+        {value.casefold() for value in manual_video_input.LEDGER_STATUSES}
+    }
+    if unknown_ledger_statuses:
+        logger.warning("Manual ledger contains unknown statuses: %s", sorted(unknown_ledger_statuses))
+        _mark_inventory_incomplete("manual_ledger_unknown_status")
 
     def _writeback_manual_sheet() -> None:
         current = None
@@ -2357,6 +2402,7 @@ def process_videos(config: dict):
     if os.path.exists(input_path):
         try:
             manual_df = _read_csv_with_retry(input_path, encoding="cp949")
+            _validate_inventory_state_columns(manual_df, {"url", "date"}, "input_df", input_path)
         except Exception as exc:
             logger.warning("Could not load manual input URLs: %s", exc)
             _mark_inventory_incomplete("manual_input_read_failed")

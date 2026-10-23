@@ -72,6 +72,11 @@ CRAWL_QUEUE_COLUMNS = [
     "auto_sub_only",
     "obsidian",
 ]
+# obsidian was added after the queue schema was established and remains an
+# optional migration column. Every other queue column participates in reading,
+# writing, selection, or inventory coverage and must be present on disk.
+CRAWL_QUEUE_REQUIRED_COLUMNS = set(CRAWL_QUEUE_COLUMNS) - {OBSIDIAN_COLUMN}
+CHANNEL_DF_REQUIRED_COLUMNS = set(CHANNEL_DF_COLUMNS) - {OBSIDIAN_COLUMN}
 DONE_STATUSES = {"success", "already_existed", "oversized_file"}
 SKIPPED_AUTO_SUBS_ONLY_STATUS = "skipped_auto_subs_only"
 FAILED_STATUSES = {"error", "download_failed", "mlx_error", "captions_error", "SOURCE_UNAVAILABLE", "source_unavailable", "api_error", "file_error"}
@@ -287,6 +292,9 @@ def load_channel_df(base_path: str) -> List[Dict[str, Any]]:
     rows = []
     try:
         _header, all_rows = read_channel_df_raw(path)
+        missing = sorted(CHANNEL_DF_REQUIRED_COLUMNS - set(_header))
+        if missing:
+            raise ValueError(f"channel_df missing required columns: {', '.join(missing)}")
     except ChannelDfSchemaError:
         raise
     except Exception as exc:
@@ -437,6 +445,9 @@ def load_crawl_queue_df(base_path: str):
                     time.sleep(2 * (attempt + 1))
                     continue
                 raise
+        missing = sorted(CRAWL_QUEUE_REQUIRED_COLUMNS - set(df.columns))
+        if missing:
+            raise ValueError(f"crawl queue missing required columns: {', '.join(missing)}")
         for col in CRAWL_QUEUE_COLUMNS:
             if col not in df.columns:
                 df[col] = ""
@@ -994,7 +1005,9 @@ def build_queue_and_get_candidates(
         )
         q = expire_live_replay_rows(q, config.get("LIVE_REPLAY_WAIT_HOURS", 72))
         if discovery_report is not None:
-            _record_inventory_queue_scope(discovery_report, q, int(config.get("CRAWL_QUEUE_MAX_RETRIES", 3) or 3))
+            _record_inventory_queue_scope(
+                discovery_report, q, int(config.get("CRAWL_QUEUE_MAX_RETRIES", 3) or 3), output_df
+            )
         save_crawl_queue_df(base_path, q)
         return q, select_process_candidates(
             q, int(config.get("CRAWL_QUEUE_MAX_RETRIES", 3)),
@@ -1041,7 +1054,7 @@ def build_queue_and_get_candidates(
         queue_video_ids = set(queue_df["video_id"].astype(str).str.strip())
 
     if discovery_report is not None:
-        _record_inventory_queue_scope(discovery_report, queue_df, max_retries)
+        _record_inventory_queue_scope(discovery_report, queue_df, max_retries, output_df)
 
     discovered_rows: List[Dict[str, Any]] = []
     shorts_rows_for_output_df: List[Dict[str, str]] = []
@@ -1415,7 +1428,7 @@ def build_queue_and_get_candidates(
         queue_df, max_retries, config.get("LIVE_RETRY_MIN_INTERVAL_MIN", 60)
     )
     if discovery_report is not None:
-        _record_inventory_queue_scope(discovery_report, queue_df, max_retries)
+        _record_inventory_queue_scope(discovery_report, queue_df, max_retries, output_df)
     logger.info(
         "channel_crawl: queue persisted. total=%d, candidates=%d",
         len(queue_df),
@@ -1437,24 +1450,49 @@ def build_queue_and_get_candidates(
     return queue_df, candidates_df, shorts_rows_for_output_df
 
 
-def _record_inventory_queue_scope(report: Dict[str, Any], queue_df, max_retries: int) -> None:
-    """Declare pending and retry-exhausted queue items in batch coverage scope."""
+def _record_inventory_queue_scope(
+    report: Dict[str, Any], queue_df, max_retries: int, output_df=None,
+) -> None:
+    """Declare every queue row; resolve terminal rows from durable output status."""
     import pandas as pd
 
     if queue_df is None or len(queue_df) == 0:
         report["queue_scope_video_ids"] = []
         report["retry_exhausted_video_ids"] = []
+        report["queue_scope_outcomes"] = {}
         report["queue_scope_unresolved"] = 0
         return
-    pending = queue_df[queue_df["status"].astype(str).str.strip().isin({"queued", "failed"})]
-    ids = pending["video_id"].astype(str).str.strip()
-    valid = ids.ne("") & ids.ne("nan") & ids.ne("None")
+    statuses = queue_df["status"].map(lambda value: str(value or "").strip().lower())
+    ids = queue_df["video_id"].astype(str).str.strip()
+    valid = ids.ne("") & ids.str.casefold().ne("nan") & ids.str.casefold().ne("none")
     report["queue_scope_video_ids"] = sorted(set(ids[valid].tolist()))
-    retry_counts = pd.to_numeric(pending["retry_count"], errors="coerce").fillna(0)
-    exhausted = pending[(pending["status"].astype(str).str.strip() == "failed") & (retry_counts >= max_retries)]
+    duplicate_count = int(ids[valid].duplicated(keep="first").sum())
+    retry_counts = pd.to_numeric(queue_df["retry_count"], errors="coerce").fillna(0)
+    exhausted = queue_df[(statuses == "failed") & (retry_counts >= max_retries)]
     exhausted_ids = exhausted["video_id"].astype(str).str.strip()
-    report["retry_exhausted_video_ids"] = sorted({value for value in exhausted_ids if value and value not in {"nan", "None"}})
-    report["queue_scope_unresolved"] = int((~valid).sum())
+    report["retry_exhausted_video_ids"] = sorted({
+        value for value in exhausted_ids
+        if value.casefold() not in {"", "nan", "none"}
+    })
+    output_status_by_vid = {}
+    if output_df is not None and {"v_id", "status"}.issubset(getattr(output_df, "columns", ())):
+        output_ids = output_df["v_id"].astype(str).str.strip()
+        output_status_by_vid = dict(zip(output_ids, output_df["status"]))
+    retry_exhausted_ids = set(report["retry_exhausted_video_ids"])
+    queue_outcomes = {}
+    for idx, video_id in ids[valid].items():
+        state = statuses.loc[idx]
+        if state == "done":
+            # Queue ``done`` is only a compact marker. Its source result must
+            # still be present in output_df; a missing/unknown status is unresolved.
+            queue_outcomes[video_id] = output_status_by_vid.get(video_id, "")
+        elif video_id in retry_exhausted_ids:
+            queue_outcomes[video_id] = "retry_exhausted"
+        elif state in {"success", "already_existed", "oversized_file", "passed_shorts",
+                       "short", "video_unavailable", "skipped_auto_subs_only"}:
+            queue_outcomes[video_id] = state
+    report["queue_scope_outcomes"] = queue_outcomes
+    report["queue_scope_unresolved"] = int((~valid).sum()) + duplicate_count
 
 
 def update_channel_last_processed(
