@@ -61,6 +61,7 @@ from input_df_csv import read_input_df
 from scripts import import_manual_urls_from_sheet
 from filename_utils import fit_filename, parse_note_name, validate_llm_suffix
 import run_lock
+import run_budget
 from job_workspace import VideoJobWorkspace, cleanup_stale_jobs
 from transcript_cache import (
     TranscriptCache,
@@ -225,6 +226,8 @@ class MainLlmConfig:
         style: str = "Markdown",
         model_used_callback=None,
     ) -> str:
+        if run_budget.expired():
+            raise RuntimeError("P03 run budget expired before paid LLM summary")
         return stt.summarize_with_chunking(
             transcription=transcription,
             filename=filename,
@@ -3177,6 +3180,7 @@ def main(argv=None):
     if args.video_id and not re.fullmatch(r"[A-Za-z0-9_-]{11}", args.video_id):
         parser.error("--video-id must be an 11-character YouTube ID")
     start_time = time.time()
+    run_budget.set_deadline(start_time + _run_budget_seconds(os.getenv("P03_RUN_BUDGET_MIN")))
     lock_handle = None
     
     try:
@@ -3307,6 +3311,7 @@ def main(argv=None):
                 logger.info("Run lock released.")
             except Exception:
                 pass
+        run_budget.set_deadline(None)
 
 if __name__ == "__main__":
     main()

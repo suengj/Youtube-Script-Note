@@ -9,6 +9,7 @@ import subprocess
 import tiktoken
 from urllib.parse import urlparse, parse_qs
 import logging
+import run_budget
 from dotenv import load_dotenv
 
 try:
@@ -1235,6 +1236,9 @@ def token_minimizer(INPUT_ROLE, INPUT_QUERY,
 
     INPUT_MESSAGE = prompt_engineering(INPUT_ROLE, FULL_PROMPT)
 
+    if run_budget.expired():
+        raise RuntimeError("P03 run budget expired before paid transcript minimization")
+
     completion = client.chat.completions.create(
         model = model,
         messages = INPUT_MESSAGE
@@ -1573,6 +1577,9 @@ def _response_text_5mini_once(INPUT_QUERY, client, model="gpt-5-mini-2025-08-07"
         {'role': 'user',
          'content': INPUT_QUERY}
     ]
+
+    if run_budget.expired():
+        raise RuntimeError("P03 run budget expired before paid LLM summary")
 
     start_time = time.time(); print("response starts")
 

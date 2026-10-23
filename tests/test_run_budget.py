@@ -266,3 +266,123 @@ def test_successful_manual_ledger_row_survives_next_dispatch(tmp_path, monkeypat
     assert seen == ids
     assert row.status == "success"
     assert row.md_sha256 == hashlib.sha256(md_text.encode("utf-8")).hexdigest()
+
+
+def test_expired_run_budget_blocks_paid_work_from_all_recovery_paths(tmp_path, monkeypatch):
+    import hashlib
+    import time
+    from types import SimpleNamespace
+
+    import manual_video_input as mvi
+    import run_budget
+    import stt_function_v3 as stt
+    from llm_responses import call_responses, ResponsesCallError
+    from scripts.drive_yt_summary import publish, sync
+    from scripts.drive_yt_summary.publish import PublishResult
+    from scripts.jev_classify import classify as jev_classify
+
+    paid_calls = []
+    monkeypatch.setattr(jev_classify, "classify_after_publish", lambda *_: paid_calls.append("publish"))
+
+    # Prepare an error entry before the run deadline expires so retry_errors has work queued.
+    source_dir = tmp_path / "YT_summary" / "source"
+    source_dir.mkdir(parents=True)
+    source = source_dir / "failed.md"
+    video_id = "p8rphwT9g-A"
+    source.write_text(f"---\nvid: {video_id}\nsource_url: https://youtu.be/{video_id}\n---\nbody\n",
+                      encoding="utf-8")
+    index_path = source_dir.parent / "classification-index.json"
+    class Provider:
+        name, model, prompt_version = "jev", "jev-test", "test"
+        calls = 0
+        def classify_detail(self, _text):
+            self.calls += 1
+            raise RuntimeError("prepare retry entry")
+    provider = Provider()
+    monkeypatch.setattr(run_budget, "_deadline", None)
+    jev_classify.classify_if_needed(source, index_path, provider=provider)
+    provider.calls = 0
+    monkeypatch.setattr(run_budget, "_deadline", time.time() - 1)
+    monkeypatch.setenv("P03_JEV_CLASSIFY_ENABLED", "1")
+
+    # Pending Drive recovery: the ordinary publish and forced rewrite both reach the
+    # post-write classification sink, while their storage/readback path still runs.
+    staged_root = tmp_path / "work" / "output_md_staging" / "2026"
+    staged_root.mkdir(parents=True)
+    staged = staged_root / "manual.md"
+    content = "already generated summary"
+    staged.write_text(content, encoding="utf-8")
+    destination = tmp_path / "drive" / "manual.md"
+    destination.parent.mkdir()
+    destination.write_text("stale", encoding="utf-8")
+    ledger = mvi.upsert_ledger(mvi.read_ledger(tmp_path / "missing.csv"), video_id="abcdefghijk",
+        status="retryable_failed", reason="pending_drive: prior run", md_path=str(staged),
+        md_sha256=hashlib.sha256(content.encode()).hexdigest())
+    publish_calls = []
+
+    def recovery_publisher(**kwargs):
+        publish_calls.append(kwargs)
+        if kwargs.get("force_rewrite"):
+            destination.write_text(kwargs["content"], encoding="utf-8")
+        result = PublishResult(drive_action="unchanged", drive_path=str(destination))
+        publish._classify_after_drive_write(result, destination.parent)
+        return result
+
+    mvi.retry_pending_drive(ledger, base_path=str(tmp_path), work_path=str(tmp_path / "work"),
+                            md_root=str(tmp_path / "md"), publisher=recovery_publisher)
+    assert len(publish_calls) == 2 and publish_calls[1].get("force_rewrite") is True
+
+    # Staging flush uses the same sink after its publish callback.
+    staged_flush = staged_root / "flush.md"
+    staged_flush.write_text("flushed summary", encoding="utf-8")
+
+    def flush_publisher(**kwargs):
+        result = PublishResult(drive_action="created", drive_path=str(tmp_path / "drive" / "flush.md"))
+        publish._classify_after_drive_write(result, destination.parent)
+        return result
+
+    monkeypatch.setattr(publish, "publish_final_md", flush_publisher)
+    assert len(publish.flush_staging(md_root=str(tmp_path / "md"), base_path=str(tmp_path),
+        work_path=str(tmp_path / "work"))) == 1
+
+    # A previously failed classifier entry is retried, but the provider is never called.
+    jev_classify.classify_if_needed(source, index_path, provider=provider)
+    summary = jev_classify.retry_errors(index_path, source_dir, provider=provider)
+    assert summary.provider_calls == 0 and provider.calls == 0
+
+    # run_sync_safe performs its normal inventory/write work and skips only classification.
+    md_root = tmp_path / "obsidian" / "2026_10_23"
+    md_root.mkdir(parents=True)
+    (md_root / "channel_title_abcdefghijk_ko_5-mini.md").write_text(
+        "---\nformat_version: 4.1\ntitle: title\n---\n\n# title\n", encoding="utf-8")
+    sync_root = tmp_path / "YT_summary_sync"
+    (sync_root / "source").mkdir(parents=True)
+    (sync_root / "legacy").mkdir()
+    monkeypatch.setenv("P03_DRIVE_BACKEND", "desktop")
+    monkeypatch.setenv("P03_MANIFEST_WRITER", "desktop")
+    monkeypatch.setenv("P03_DRIVE_SYNC_ENABLED", "1")
+    monkeypatch.setenv("BASE_PATH", str(tmp_path))
+    monkeypatch.setenv("WORK_PATH", str(tmp_path / "work"))
+    monkeypatch.setenv("OUTPUT_MD_PATH", str(tmp_path / "obsidian"))
+    monkeypatch.setenv("P03_DRIVE_SYNC_ROOT", str(sync_root))
+    result = sync.run_sync_safe(migrate_legacy=False)
+    assert result.errors == 0 and result.created == 1
+    assert paid_calls == []
+
+    class PaidClient:
+        def __init__(self):
+            self.calls = 0
+            self.responses = SimpleNamespace(create=self.create)
+            self.chat = SimpleNamespace(completions=SimpleNamespace(create=self.create))
+        def create(self, **_kwargs):
+            self.calls += 1
+            raise AssertionError("expired paid call")
+
+    client = PaidClient()
+    with pytest.raises(ResponsesCallError, match="run budget expired"):
+        call_responses(client, "model", "instructions", "input")
+    with pytest.raises(RuntimeError, match="run budget expired"):
+        stt.token_minimizer("role", "query", "transcript", client)
+    with pytest.raises(RuntimeError, match="run budget expired"):
+        stt.response_text_5mini("summary query", client)
+    assert client.calls == 0

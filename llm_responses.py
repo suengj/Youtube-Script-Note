@@ -4,6 +4,7 @@ from __future__ import annotations
 import hashlib
 import json
 import time
+import run_budget
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Optional
@@ -99,6 +100,8 @@ def call_responses(client, model: str, instructions: str, input_text: str, effor
                    max_output_tokens: int = 32000, retries: int = 2, backoff_s: float = 0.25,
                    sample_video_id: Optional[str] = None, source_text: Optional[str] = None):
     """Return (visible output, UsageRecord); retry only errors accepted by the legacy classifier."""
+    if run_budget.expired():
+        raise ResponsesCallError("run_budget_expired", "P03 run budget expired before paid LLM summary", None)
     if effort not in {"low", "medium", "high"}:
         raise ValueError("effort must be low, medium, or high")
     source_sha = hashlib.sha256((source_text if source_text is not None else input_text).encode("utf-8")).hexdigest()
@@ -107,6 +110,10 @@ def call_responses(client, model: str, instructions: str, input_text: str, effor
     started = time.monotonic()
     max_attempts = max(1, int(retries) + 1)
     for attempt in range(1, max_attempts + 1):
+        if run_budget.expired():
+            raise ResponsesCallError(
+                "run_budget_expired", "P03 run budget expired before paid LLM summary", rec
+            )
         rec.attempts = attempt
         try:
             response = client.responses.create(

@@ -13,6 +13,7 @@ import unicodedata
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, List, Optional
+import run_budget
 
 from filename_utils import MAX_FILENAME_BYTES, parse_note_name
 
@@ -282,7 +283,7 @@ def find_canonical_for_truncated(
 
 def _classify(dest: Path, sync_root: Path, deadline: Optional[float] = None) -> None:
     """SUE-1327: classify-if-needed after a written Drive copy (flag-gated, never raises)."""
-    if deadline is not None and time.time() >= deadline:
+    if run_budget.expired() or (deadline is not None and time.time() >= deadline):
         return
     try:
         from scripts.jev_classify.classify import classify_after_publish

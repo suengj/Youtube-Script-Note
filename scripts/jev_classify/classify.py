@@ -21,6 +21,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlsplit
+import run_budget
 
 from .index import INDEX_FILENAME, VIDEO_ID_RE, cache_key, load_index, update_index
 from .taxonomy import TAXONOMY_VERSION, TOPIC_IDS
@@ -183,6 +184,9 @@ def classify_if_needed(
 
     scores = details = reason = None
     if provider is not None:
+        if run_budget.expired():
+            out.action = "skipped"
+            return out
         out.provider_calls = 1
         try:
             if hasattr(provider, "classify_detail"):
@@ -276,7 +280,7 @@ def retry_errors(index_path: Path, source_dir: Path, *, limit: int = DEFAULT_RET
     index, _ = load_index(index_path)
     pending = [e for e in index["entries"].values() if isinstance(e, dict) and e.get("error")]
     for entry in sorted(pending, key=lambda e: e.get("video_id", ""))[:limit]:
-        if deadline is not None and time.time() >= deadline:
+        if run_budget.expired() or (deadline is not None and time.time() >= deadline):
             break
         name = (entry.get("lineage") or {}).get("drive_name")
         path = source_dir / name if name else None

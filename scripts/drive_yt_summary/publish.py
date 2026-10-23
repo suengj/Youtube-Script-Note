@@ -23,6 +23,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import List, Optional
+import run_budget
 
 from .config import DriveSyncConfigError, load_config, selective_mirror_enabled, verify_sync_root
 from .fs_transport import FilesystemSyncError, atomic_write_text, ensure_dir, short_tmp_path
@@ -103,7 +104,7 @@ def _classify_after_drive_write(
     Behind P03_JEV_CLASSIFY_ENABLED (default off). Reads the Drive copy only; any failure is
     recorded on the result and never affects publish/staging/mirror.
     """
-    if classification_deadline is not None and time.time() >= classification_deadline:
+    if run_budget.expired() or (classification_deadline is not None and time.time() >= classification_deadline):
         return
     try:
         from scripts.jev_classify.classify import classify_after_publish
