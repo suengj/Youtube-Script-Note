@@ -386,3 +386,34 @@ def test_expired_run_budget_blocks_paid_work_from_all_recovery_paths(tmp_path, m
     with pytest.raises(RuntimeError, match="run budget expired"):
         stt.response_text_5mini("summary query", client)
     assert client.calls == 0
+
+
+def test_openai_sdk_retry_cannot_cross_run_deadline(monkeypatch):
+    httpx = pytest.importorskip("httpx")
+    openai = pytest.importorskip("openai")
+    OpenAI = openai.OpenAI
+
+    import run_budget
+    from llm_responses import ResponsesCallError, call_responses
+
+    now = [100.0]
+    monkeypatch.setattr(run_budget.time, "time", lambda: now[0])
+    monkeypatch.setattr(run_budget, "_deadline", 101.0)
+    requests = []
+
+    def transport(request):
+        requests.append(request)
+        now[0] = 102.0
+        return httpx.Response(500, json={"error": {"message": "temporary", "type": "server_error"}},
+                              request=request)
+
+    client = OpenAI(api_key="test", max_retries=0,
+                    http_client=httpx.Client(transport=httpx.MockTransport(transport)))
+    try:
+        with pytest.raises(ResponsesCallError, match="run budget expired"):
+            call_responses(client, "model", "instructions", "input", retries=1, backoff_s=0)
+    finally:
+        client.close()
+
+    assert len(requests) == 1
+    assert requests[0].url.path == "/v1/responses"
