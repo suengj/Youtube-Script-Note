@@ -400,6 +400,7 @@ def test_inventory_file_readback_failure_cannot_be_trusted():
     [
         ("manual_input", "manual_input_read_failed"),
         ("processed_state", "manual_processed_state_read_failed"),
+        ("manual_ledger", "manual_ledger_read_failed"),
     ],
 )
 def test_process_videos_keeps_unreadable_manual_scope_out_of_complete_inventory(
@@ -457,10 +458,14 @@ def test_process_videos_keeps_unreadable_manual_scope_out_of_complete_inventory(
             return original_read_csv(path, *args, **kwargs)
 
         monkeypatch.setattr(main, "_read_csv_with_retry", fail_manual_csv)
-    else:
+    elif failure == "processed_state":
         monkeypatch.setattr(pvr, "processed_id_union",
                             lambda *_args, **_kwargs: (_ for _ in ()).throw(
                                 OSError("injected processed-state read failure")))
+    else:
+        monkeypatch.setattr(main.manual_video_input, "read_ledger",
+                            lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                                OSError("injected manual ledger read failure")))
 
     monkeypatch.setenv("P03_DRIVE_BACKEND", "api")
     monkeypatch.setenv("P03_DRIVE_SYNC_ENABLED", "0")
@@ -477,7 +482,11 @@ def test_process_videos_keeps_unreadable_manual_scope_out_of_complete_inventory(
         "DRIVE_API_SINK": sink,
     }
 
-    main.process_videos(config)
+    if failure == "manual_ledger":
+        with pytest.raises(OSError, match="injected manual ledger read failure"):
+            main.process_videos(config)
+    else:
+        main.process_videos(config)
 
     inventory = sink.read_manifest()["inventory"]
     assert inventory["inventory_complete"] is False
@@ -521,6 +530,89 @@ def test_retry_exhausted_queue_rows_are_declared_even_when_not_candidates():
     )
     assert reconciled["failed"] == 1
     assert reconciled["unresolved"] == 1
+
+
+@pytest.mark.parametrize(
+    ("failed_state", "expected_reason"),
+    [
+        ("queue", "crawl_queue_read_failed"),
+        ("output", "output_df_read_failed"),
+        ("channel", "channel_df_read_failed"),
+    ],
+)
+def test_unreadable_coverage_state_keeps_inventory_incomplete_and_queue_intact(
+        tmp_path, monkeypatch, failed_state, expected_reason):
+    """Exercise coverage reads with a pending queue row behind the discovery cursor."""
+    import pandas as pd
+    import main
+    import channel_crawl
+
+    data = tmp_path / "data"
+    data.mkdir()
+    base, md = tmp_path / "base", tmp_path / "md"
+    base.mkdir()
+    md.mkdir()
+    cursor = "2026-10-22T00:00:00Z"
+    (data / "channel_df.csv").write_text(
+        "channel_url,channel_name,channel_id,uploads_playlist_id,last_processed_published_at,last_discovered_published_at\n"
+        f"https://www.youtube.com/channel/UC{'a' * 22},Fixture,UC{'a' * 22},UU{'a' * 22},{cursor},{cursor}\n",
+        encoding="utf-8-sig",
+    )
+    (data / "output_df_new.csv").write_text("date,url,v_id,status\n", encoding="utf-8-sig")
+    queue_path = data / channel_crawl.CRAWL_QUEUE_FILENAME
+    pd.DataFrame([{
+        **{column: "" for column in channel_crawl.CRAWL_QUEUE_COLUMNS},
+        "video_id": "pending00001",
+        "url": "https://youtu.be/pending00001",
+        "channel_id": "UC" + "a" * 22,
+        "published_at": "2026-10-20T00:00:00Z",
+        "status": "queued",
+        "retry_count": 0,
+    }]).to_csv(queue_path, index=False)
+    original_queue_bytes = queue_path.read_bytes()
+    original_read_csv = pd.read_csv
+
+    _install_fake_media(monkeypatch)
+    sink = DriveApiSink(_FakeDrive())
+    monkeypatch.setattr(main, "initialize_clients", lambda _config: (None, None, None))
+    monkeypatch.setattr(main, "_run_batch_cleanup", lambda *_args, **_kwargs: None)
+    if failed_state == "queue":
+        def fail_queue_read(path, *args, **kwargs):
+            if str(path) == str(queue_path):
+                raise OSError("injected queue read failure")
+            return original_read_csv(path, *args, **kwargs)
+
+        monkeypatch.setattr(pd, "read_csv", fail_queue_read)
+    elif failed_state == "output":
+        monkeypatch.setattr(main, "load_output_df_only", lambda *_args: (_ for _ in ()).throw(
+            OSError("injected output_df read failure")))
+    else:
+        monkeypatch.setattr(channel_crawl, "read_channel_df_raw", lambda *_args: (_ for _ in ()).throw(
+            OSError("injected channel_df read failure")))
+    monkeypatch.setenv("P03_DRIVE_BACKEND", "api")
+    monkeypatch.setenv("P03_DRIVE_SYNC_ENABLED", "0")
+    monkeypatch.delenv("P03_SHEET_IMPORT_ENABLED", raising=False)
+    config = {
+        "BASE_PATH": str(base), "DATA_ROOT": str(data), "WORK_PATH": str(base),
+        "HF_HOME": str(tmp_path / "hf"), "OUTPUT_MD_PATH": str(md),
+        "CHANNEL_CRAWL": True, "YOUTUBE_API_KEY": "fixture",
+        "FILTERING_SHORTS_MINUTES": 0, "CRAWL_QUEUE_MAX_RETRIES": 3,
+        "DRIVE_API_SINK": sink,
+    }
+
+    if failed_state == "output":
+        with pytest.raises(OSError, match="injected output_df read failure"):
+            main.process_videos(config)
+    else:
+        main.process_videos(config)
+
+    inventory = sink.read_manifest()["inventory"]
+    assert inventory["inventory_complete"] is False
+    assert inventory["discovery_complete"] is False
+    assert inventory["source_counts"]["unresolved"] >= 1
+    assert expected_reason in inventory["incomplete_reason"]
+    assert queue_path.read_bytes() == original_queue_bytes
+    assert sink.read_inventory_evidence() is None
 
 
 @pytest.mark.parametrize(("failed_channel", "expected_complete"), [(None, True), ("UC" + "b" * 22, False)])

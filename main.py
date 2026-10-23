@@ -945,19 +945,21 @@ def get_url_list(input_df: pd.DataFrame, output_df: pd.DataFrame) -> List[str]:
 def get_input_urls_for_channel_crawl(data_root: str, output_df: pd.DataFrame) -> List[str]:
     """
     When CHANNEL_CRAWL=true: load input_df.csv if present and return URLs not yet in output_df.
-    Returns [] if input_df.csv missing or invalid (so channel-only mode is unchanged).
+    Returns [] if input_df.csv is missing or contains no rows. Read/schema failures propagate
+    because they leave the manual portion of discovery scope unknown.
     """
     input_df_path = os.path.join(data_root, 'input_df.csv')
     if not os.path.exists(input_df_path):
         return []
     try:
         input_df = _read_csv_with_retry(input_df_path, encoding='cp949')
-        if input_df.empty or 'url' not in input_df.columns:
+        if 'url' not in input_df.columns:
+            raise ValueError("input_df.csv must contain a 'url' column")
+        if input_df.empty:
             return []
         return get_url_list(input_df, output_df)
     except Exception as e:
-        logger.warning("Channel crawl: could not load input_df for merge (%s). Using channel URLs only.", e)
-        return []
+        raise channel_crawl.CoverageStateReadError("input_df", input_df_path, e) from e
 
 # Prompt templates
 def build_token_query(retention_min: int, retention_max: int, *, auto_subs: bool = False) -> str:
@@ -2017,6 +2019,14 @@ def process_videos(config: dict):
             inventory_incomplete_reasons.add(reason)
             inventory_counts["unresolved"] += 1
 
+    def _mark_discovery_state_failure(reason):
+        _mark_inventory_incomplete(reason)
+        inventory_discovery["complete"] = False
+        inventory_discovery["unresolved"] = int(inventory_discovery.get("unresolved", 0)) + 1
+        inventory_discovery["queue_scope_unresolved"] = int(
+            inventory_discovery.get("queue_scope_unresolved", 0)
+        ) + 1
+
     if api_backend:
         try:
             inventory_cutoff = (channel_crawl.inventory_cutoff_snapshot(base_path, config)
@@ -2195,7 +2205,14 @@ def process_videos(config: dict):
     crawl_queue_df = None
     shorts_recorded_count = 0
     if config.get('CHANNEL_CRAWL'):
-        output_df = load_output_df_only(data_root)
+        try:
+            output_df = load_output_df_only(data_root)
+        except Exception as exc:
+            logger.warning("Could not read output_df state for channel coverage: %s", exc)
+            _mark_discovery_state_failure("output_df_read_failed")
+            _finish_manifest_inventory(completed=False, counts=inventory_counts,
+                                       discovery_report=inventory_discovery)
+            raise
         logger.info("Channel crawl: building persistent queue from channel_df.csv...")
         try:
             crawl_queue_df, candidate_df, shorts_rows = channel_crawl.build_queue_and_get_candidates(
@@ -2248,6 +2265,19 @@ def process_videos(config: dict):
             # ValueError/UnicodeError 계열 메시지 출력
             error_msg = str(e) if e else "Configuration error"
             logger.error("[ERROR] Channel crawl config: %s", error_msg)
+            _finish_manifest_inventory(
+                completed=False,
+                counts=inventory_counts,
+                discovery_report=inventory_discovery,
+            )
+            return
+        except Exception as e:
+            state_name = getattr(e, "state_name", "channel_discovery")
+            reason = f"{state_name}_read_failed" if state_name.endswith("df") or state_name in {
+                "crawl_queue", "input_df"
+            } else "channel_discovery_failed"
+            logger.error("Channel crawl state/discovery failed: %s: %s", type(e).__name__, e)
+            _mark_discovery_state_failure(reason)
             _finish_manifest_inventory(
                 completed=False,
                 counts=inventory_counts,

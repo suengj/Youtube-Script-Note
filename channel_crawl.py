@@ -198,6 +198,15 @@ class ChannelDfSchemaError(ValueError):
     """channel_df.csv header/value conflict that must be fixed by the owner."""
 
 
+class CoverageStateReadError(OSError):
+    """A persisted crawl state file could not be read safely for coverage."""
+
+    def __init__(self, state_name: str, path: str, cause: Exception):
+        self.state_name = state_name
+        self.path = path
+        super().__init__(f"{state_name} read failed at {path}: {type(cause).__name__}: {cause}")
+
+
 def _norm_marker(value: Any) -> str:
     """strip+lower for marker comparison; NaN/None -> ''."""
     if value is None or (isinstance(value, float) and value != value):
@@ -275,7 +284,12 @@ def load_channel_df(base_path: str) -> List[Dict[str, Any]]:
         logger.warning(f"channel_df.csv not found: {path}")
         return []
     rows = []
-    _header, all_rows = read_channel_df_raw(path)
+    try:
+        _header, all_rows = read_channel_df_raw(path)
+    except ChannelDfSchemaError:
+        raise
+    except Exception as exc:
+        raise CoverageStateReadError("channel_df", path, exc) from exc
     total_rows = len(all_rows)
     logger.info("channel_crawl: loading %d rows from channel_df.csv", total_rows)
     for idx, row in enumerate(all_rows, start=1):
@@ -438,8 +452,7 @@ def load_crawl_queue_df(base_path: str):
                 df[col] = df[col].astype(object)
         return df
     except Exception as e:
-        logger.warning("crawl_queue: failed to read queue csv (%s). starting empty queue.", e)
-        return pd.DataFrame(columns=CRAWL_QUEUE_COLUMNS)
+        raise CoverageStateReadError("crawl_queue", path, e) from e
 
 
 def save_crawl_queue_df(base_path: str, queue_df) -> None:
@@ -777,7 +790,12 @@ def get_url_list_from_channel_crawl(
     Returns (url_list, meta_list) where meta_list[i] = {url, published_at, channel_id} for url_list[i].
     """
     import pandas as pd
-    channels = load_channel_df(base_path)
+    try:
+        channels = load_channel_df(base_path)
+    except CoverageStateReadError:
+        raise
+    except Exception as exc:
+        raise CoverageStateReadError("channel_df", os.path.join(base_path, CHANNEL_DF_FILENAME), exc) from exc
     if not channels:
         logger.info("channel_crawl: no channels loaded from channel_df.csv")
         return [], []
