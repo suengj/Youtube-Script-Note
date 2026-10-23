@@ -275,7 +275,8 @@ def load_channel_df(base_path: str) -> List[Dict[str, Any]]:
     """
     Load channel_df.csv. Returns list of dicts with channel_url, channel_name, channel_id, uploads_playlist_id, etc.
     Uses cached channel_id/uploads_playlist_id from CSV when valid; otherwise resolves from URL/API.
-    Rows whose channel_url does not yield a channel_id are skipped.
+    Rows whose channel_url does not yield a channel_id are retained with an empty
+    channel_id so discovery coverage can report them and a later run can retry.
     Unknown columns (and ``obsidian``, if present) are carried through on each row so save_channel_df
     can write them back unchanged.
     """
@@ -294,8 +295,6 @@ def load_channel_df(base_path: str) -> List[Dict[str, Any]]:
     logger.info("channel_crawl: loading %d rows from channel_df.csv", total_rows)
     for idx, row in enumerate(all_rows, start=1):
         url_s = (row.get("channel_url") or "").strip()
-        if not url_s:
-            continue
         logger.info("channel_crawl: parsing channel row [%d/%d] url=%s", idx, total_rows, url_s[:80])
         cid_cached = (row.get("channel_id") or "").strip()
         if _is_valid_channel_id(cid_cached):
@@ -305,10 +304,9 @@ def load_channel_df(base_path: str) -> List[Dict[str, Any]]:
         if not cid:
             try:
                 safe_url = url_s[:60].encode('utf-8', errors='replace').decode('utf-8', errors='replace')
-                logger.warning("channel_df: skipping row (could not extract channel_id from URL): %s...", safe_url)
+                logger.warning("channel_df: unresolved channel_id for configured row: %s...", safe_url)
             except Exception:
-                logger.warning("channel_df: skipping row (could not extract channel_id from URL): [URL encoding error]")
-            continue
+                logger.warning("channel_df: unresolved channel_id for configured row: [URL encoding error]")
         uploads_cached = (row.get("uploads_playlist_id") or "").strip()
         uploads_id = uploads_cached if _is_valid_uploads_playlist_id(uploads_cached) else ""
         out = dict(row)  # keeps unknown columns + obsidian untouched
@@ -316,7 +314,7 @@ def load_channel_df(base_path: str) -> List[Dict[str, Any]]:
             "channel_url": url_s,
             "channel_name": (row.get("channel_name") or "").strip(),
             "usage_channel": (row.get("usage_channel") or "").strip(),
-            "channel_id": cid,
+            "channel_id": cid or "",
             "uploads_playlist_id": uploads_id,
             "last_processed_published_at": (row.get("last_processed_published_at") or "").strip(),
             "last_discovered_published_at": (row.get("last_discovered_published_at") or "").strip(),
@@ -983,6 +981,7 @@ def build_queue_and_get_candidates(
             "channels_failed": [],
             "cursor_blocked_channels": [],
             "unresolved": 0,
+            "unresolved_channels": [],
             "complete": False,
             "cutoff": inventory_cutoff_snapshot(base_path, config),
         })
@@ -1050,7 +1049,7 @@ def build_queue_and_get_candidates(
     now_iso = _now_iso()
 
     for idx, ch in enumerate(channels, start=1):
-        cid = ch["channel_id"]
+        cid = str(ch.get("channel_id") or "").strip()
         ch_name = (ch.get("channel_name") or "").strip() or "(no_name)"
         ch_usage = (ch.get("usage_channel") or "").strip()
         ch_url = (ch.get("channel_url") or "").strip()
@@ -1068,6 +1067,17 @@ def build_queue_and_get_candidates(
         )
         if ch_url:
             logger.info("channel_crawl:   source channel_url=%s", ch_url)
+
+        if not _is_valid_channel_id(cid):
+            logger.warning("channel_df: unresolved configured channel URL: %s", ch_url[:80] or "(blank URL)")
+            if discovery_report is not None:
+                discovery_report["unresolved"] += 1
+                discovery_report["channels_failed"].append(ch_url or f"row:{idx}")
+                discovery_report["unresolved_channels"].append({
+                    "channel_url": ch_url,
+                    "reason": "channel_id_unresolved",
+                })
+            continue
 
         channel_empty_backfill = (
             cid in empty_cursor_backfill and not last_discovered_s and not last_processed_s
@@ -1124,6 +1134,16 @@ def build_queue_and_get_candidates(
                 discovery_report["channels_succeeded"] += 1
             else:
                 discovery_report["channels_failed"].append(cid)
+                # A malformed/unresolved item already represents the failed
+                # discovery call in coverage counts; otherwise count the
+                # failed channel discovery itself as one unresolved source.
+                if int(channel_discovery.get("unresolved", 0) or 0) == 0:
+                    discovery_report["unresolved"] += 1
+                discovery_report["unresolved_channels"].append({
+                    "channel_url": ch_url,
+                    "channel_id": cid,
+                    "reason": "channel_discovery_failed",
+                })
         if uploads_id_returned:
             ch["uploads_playlist_id"] = uploads_id_returned
         logger.info("channel_crawl:   fetched %d videos from API for cid=%s", len(entries), cid)

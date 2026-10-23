@@ -647,3 +647,51 @@ def test_channel_discovery_report_requires_every_channel_call(failed_channel, ex
     )
     assert report["channels_succeeded"] == (2 if failed_channel is None else 1)
     assert report["complete"] is expected_complete
+
+
+def test_unresolved_configured_channel_survives_and_recovers_on_next_run(tmp_path, monkeypatch):
+    import csv
+    import pandas as pd
+    import channel_crawl
+
+    channel_url = "https://www.youtube.com/@recover_later"
+    channel_id = "UC" + "r" * 22
+    video_id = "recover1234"
+    channel_file = tmp_path / channel_crawl.CHANNEL_DF_FILENAME
+    with channel_file.open("w", encoding="utf-8-sig", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(channel_crawl.CHANNEL_DF_COLUMNS[:-1])
+        writer.writerow([channel_url, "Recovery", "", "", "", "2026-10-22T00:00:00Z", "", ""])
+
+    resolved = {"value": None}
+    monkeypatch.setattr(channel_crawl, "extract_channel_id_from_url", lambda _url: resolved["value"])
+    monkeypatch.setattr(channel_crawl, "fetch_channel_via_api", lambda _key, cid, **_kwargs: (
+        [{"video_id": video_id, "url": f"https://www.youtube.com/watch?v={video_id}",
+          "published_at": "2026-10-23T00:00:00Z", "channel_id": cid}],
+        "Recovery", "UU" + "r" * 22,
+    ))
+    config = {"YOUTUBE_API_KEY": "synthetic", "FILTERING_SHORTS_MINUTES": 0}
+    output = pd.DataFrame(columns=["v_id"])
+
+    first_report = {}
+    channel_crawl.build_queue_and_get_candidates(
+        str(tmp_path), config, output, discovery_report=first_report,
+    )
+    assert first_report["channel_count"] == 1
+    assert first_report["complete"] is False
+    assert first_report["unresolved"] == 1
+    assert first_report["unresolved_channels"] == [
+        {"channel_url": channel_url, "reason": "channel_id_unresolved"}
+    ]
+    assert len(channel_crawl.load_channel_df(str(tmp_path))) == 1
+    assert channel_crawl.load_channel_df(str(tmp_path))[0]["channel_id"] == ""
+
+    resolved["value"] = channel_id
+    second_report = {}
+    channel_crawl.build_queue_and_get_candidates(
+        str(tmp_path), config, output, discovery_report=second_report,
+    )
+    assert second_report["channel_count"] == 1
+    assert second_report["complete"] is True
+    queue = channel_crawl.load_crawl_queue_df(str(tmp_path))
+    assert video_id in set(queue["video_id"].astype(str))
