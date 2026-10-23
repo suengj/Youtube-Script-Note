@@ -90,6 +90,19 @@ class VideoNotQueuedError(ValueError):
     """Explicit --video-id is absent from the selected queue."""
 
 
+def _run_budget_seconds(value=None) -> float:
+    """Return the configured positive run budget, falling back to 100 minutes."""
+    if value is None:
+        value = os.getenv("P03_RUN_BUDGET_MIN")
+    try:
+        minutes = float(value)
+    except (TypeError, ValueError):
+        return 100 * 60
+    if not (minutes > 0 and minutes < float("inf")):
+        return 100 * 60
+    return minutes * 60
+
+
 def select_batch_manual_rows(data_root, manual_df, cutoff, max_rows, output_df, ledger,
                              exclude_ids=None, return_processed=False):
     """Select manual rows only when every processed-ID source is readable."""
@@ -2025,6 +2038,8 @@ def process_videos(config: dict):
     base_path = config['BASE_PATH']
     data_root = config['DATA_ROOT']
     run_id = datetime.now().strftime("%Y%m%d%H%M%S") + "-" + uuid.uuid4().hex[:8]
+    run_started_monotonic = config.get("_RUN_START_TIME", time.time())
+    run_budget_seconds = _run_budget_seconds(config.get("_RUN_BUDGET_MIN"))
     inventory_coverage_ledger = channel_crawl.BatchCoverageLedger()
     run_started_at = utc_now_iso()
     api_backend = os.getenv(
@@ -2041,6 +2056,21 @@ def process_videos(config: dict):
         if reason and reason not in inventory_incomplete_reasons:
             inventory_incomplete_reasons.add(reason)
             inventory_counts["unresolved"] += 1
+
+    def _run_budget_reached(remaining):
+        elapsed = max(0.0, time.time() - run_started_monotonic)
+        if elapsed < run_budget_seconds:
+            return False
+        logger.info("P03_RUN_BUDGET_REACHED elapsed=%.1f remaining=%d", elapsed, remaining)
+        inventory_incomplete_reasons.add("run_budget_reached")
+        return True
+
+    def _record_budget_deferred(urls):
+        for url in urls:
+            video_id = _claim_vid_for_url(url)
+            if video_id:
+                inventory_scope_video_ids.add(video_id)
+                inventory_outcomes[video_id] = "deferred_run_budget"
 
     def _mark_discovery_state_failure(reason):
         _mark_inventory_incomplete(reason)
@@ -2845,6 +2875,9 @@ def process_videos(config: dict):
     with tqdm(total=len(url_list), desc="Processing videos", unit="video", **tqdm_kw) as pbar:
         if video_workers <= 1:
             for i, v_url in enumerate(url_list):
+                if _run_budget_reached(len(url_list) - i):
+                    _record_budget_deferred(url_list[i:])
+                    break
                 counter += 1
                 pbar.set_description(f"Processing: {v_url[:50]}...")
                 if consecutive_failures >= max_consecutive_failures:
@@ -2869,17 +2902,24 @@ def process_videos(config: dict):
             with ThreadPoolExecutor(max_workers=video_workers) as executor:
                 url_iter2 = iter(enumerate(url_list))
                 in_flight = {}
-                submitted = 0
+                next_index = 0
                 completed = 0
+                budget_stopped = False
                 while completed < len(url_list):
                     if consecutive_failures >= max_consecutive_failures:
                         download_limiter.set_extended_block(extended_duration * failure_multiplier)
                         consecutive_failures = 0
-                    while submitted < len(url_list) and len(in_flight) < video_workers and not api_storage_failure:
+                    while (next_index < len(url_list) and len(in_flight) < video_workers
+                           and not api_storage_failure and not budget_stopped):
+                        if _run_budget_reached(len(url_list) - next_index):
+                            _record_budget_deferred(url_list[next_index:])
+                            budget_stopped = True
+                            break
                         try:
                             i, v_url = next(url_iter2)
                         except StopIteration:
                             break
+                        next_index = i + 1
                         counter += 1
                         video_config = _video_config_for_url(v_url)
                         claim_vid = _claim_vid_for_url(v_url)
@@ -2895,7 +2935,6 @@ def process_videos(config: dict):
                             continue
                         fut = executor.submit(_worker_run, widx, v_url, video_config, claim_vid)
                         in_flight[fut] = (i, v_url, claim_vid)
-                        submitted += 1
                     if not in_flight:
                         break
                     done, _ = wait(in_flight.keys(), return_when=FIRST_COMPLETED)
@@ -3117,6 +3156,8 @@ def main(argv=None):
         config = load_config()
         config["MAX_VIDEOS"] = args.max_videos
         config["VIDEO_ID_FILTER"] = args.video_id
+        config["_RUN_START_TIME"] = start_time
+        config["_RUN_BUDGET_MIN"] = os.getenv("P03_RUN_BUDGET_MIN")
         logger.info("Configuration loaded successfully")
 
         run_source = "scheduled" if (os.environ.get("LAUNCHD_SCHEDULED") or os.environ.get("CRON_SCHEDULED") or os.environ.get("SYSTEMD_SCHEDULED")) else "manual"

@@ -91,6 +91,8 @@ Offline/unit tests do not require API keys or personal paths.
 
 The Linux runner defaults to `P03_DRIVE_BACKEND=api`. It writes the summary into the existing `YT_summary/source` folder, creates/uses `YT_summary/transcripts/` for the transcript and metadata JSON, and only marks a video successful after Drive metadata readback matches the uploaded bytes. VTT files stay in each job workspace and are removed when verified processing completes. The systemd user units are in `deploy/systemd/`; install is an operator action.
 
+`P03_RUN_BUDGET_MIN` limits how long one process takes new videos, measured from application start. It defaults to 100 minutes; unset, invalid, zero, or negative values use that default. When the budget is reached, already-running videos finish, queued videos remain untouched for a later run, and the normal inventory and state backup phases still run.
+
 Set `P03_DRIVE_TOKEN_FILE` to the user OAuth token file. The token is refreshed in memory and is not written back.
 
 ## Optional Drive Desktop sync
