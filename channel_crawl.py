@@ -800,6 +800,9 @@ def select_process_candidates(
 def apply_result_to_queue(queue_df, video_id: str, status: str, error_msg: Optional[str]):
     if queue_df is None or len(queue_df) == 0 or not video_id:
         return queue_df
+    if status == "deferred_run_budget":
+        # No attempt was sent, so retain the exact queue row for the next run.
+        return queue_df.copy()
     q = queue_df.copy()
     q["video_id"] = q["video_id"].astype(str).str.strip()
     idx_list = q.index[q["video_id"] == str(video_id).strip()].tolist()

@@ -57,24 +57,25 @@ class SharedStateWriter:
 
     def _apply_unlocked(self, result: VideoProcessResult) -> None:
         v_date = datetime.today().strftime("%Y-%m-%d")
-        new_row = {
-            "date": v_date,
-            "url": result.source_url,
-            "v_id": result.video_id if result.video_id else "unknown",
-            "status": result.status,
-        }
-        self.output_df = pd.concat(
-            [self.output_df, pd.DataFrame([new_row])],
-            ignore_index=True,
-        )
-        self.save_output_df(self.output_df, self.output_df_path)
-        logger.info(
-            "[TRACK] output_df append: status=%s, v_id=%s, url=%s worker=%s",
-            result.status,
-            new_row["v_id"],
-            result.source_url,
-            result.worker_id,
-        )
+        if result.status != "deferred_run_budget":
+            new_row = {
+                "date": v_date,
+                "url": result.source_url,
+                "v_id": result.video_id if result.video_id else "unknown",
+                "status": result.status,
+            }
+            self.output_df = pd.concat(
+                [self.output_df, pd.DataFrame([new_row])],
+                ignore_index=True,
+            )
+            self.save_output_df(self.output_df, self.output_df_path)
+            logger.info(
+                "[TRACK] output_df append: status=%s, v_id=%s, url=%s worker=%s",
+                result.status,
+                new_row["v_id"],
+                result.source_url,
+                result.worker_id,
+            )
 
         if self.channel_crawl_enabled and self.crawl_queue_df is not None and self.save_crawl_queue:
             queue_video_id = (result.video_id or "").strip()

@@ -1762,6 +1762,9 @@ def process_single_video(
             logger.info(f"  Response length: {response_length} characters")
             
         except Exception as e:
+            if (isinstance(e, run_budget.RunBudgetExpired) or
+                    getattr(e, "category", "") == "run_budget_expired"):
+                return _vr("deferred_run_budget", video_id, str(e), stage="summarize")
             error_category = "SUMMARY_GENERATION_ERROR"
             error_type = type(e).__name__
             error_msg = f"{getattr(e, 'category', error_type)}: {str(e)}"
@@ -2018,6 +2021,9 @@ def process_single_video(
         raise  # Re-raise to be handled by main()
         
     except Exception as e:
+        if (isinstance(e, run_budget.RunBudgetExpired) or
+                getattr(e, "category", "") == "run_budget_expired"):
+            return _vr("deferred_run_budget", video_id or "unknown", str(e), stage="run_budget")
         error_category = error_category or "UNKNOWN_ERROR"
         error_type = type(e).__name__
         error_msg = f"{error_type}: {str(e)}"
@@ -2564,6 +2570,7 @@ def process_videos(config: dict):
         vid: (url, source_url) for vid, url, source_url in manual_urls
     }
     manual_ledger_lock = threading.Lock()
+    manual_dispatch_snapshots = {}
     manual_channel_overlap_ids = {
         manual_video_input.normalize_youtube_url(u)["video_id"]
         for u in url_list if manual_video_input.normalize_youtube_url(u)["kind"] == "video"
@@ -2581,6 +2588,8 @@ def process_videos(config: dict):
         canonical_url, source_url = item
         with manual_ledger_lock:
             manual_ledger = manual_video_input.read_ledger(manual_ledger_path)
+            manual_dispatch_snapshots[video_id] = manual_video_input.snapshot_dispatch_state(
+                manual_ledger, video_id)
             manual_ledger = manual_video_input._mark_manual_queue_processing(
                 manual_ledger, video_id, canonical_url, source_url,
                 channel_overlap=video_id in manual_channel_overlap_ids,
@@ -2804,24 +2813,39 @@ def process_videos(config: dict):
             ledger_model = str(result.metadata_updates.get("model", ""))
             try:
                 md_path = result.output_md_path or ""
-                md_exists = md_path.startswith("drive-api:") or os.path.isfile(md_path)
-                status, reason, md_path, drive_state = manual_video_input.ledger_outcome(
-                    result.status, result.error_message or "", md_path,
-                    md_exists=md_exists,
-                    drive_disabled=os.getenv("P03_DRIVE_SYNC_ENABLED", "1").strip() == "0",
-                    drive_verified=bool(result.metadata_updates.get("drive_verified")))
-                ledger_status, ledger_drive_state = status, drive_state
-                md_sha256 = (hashlib.sha256(Path(md_path).read_text(encoding="utf-8-sig").encode("utf-8")).hexdigest()
-                             if md_path and os.path.isfile(md_path) else "")
-                with manual_ledger_lock:
-                    manual_ledger = manual_video_input.read_ledger(manual_ledger_path)
-                    manual_ledger = manual_video_input.upsert_ledger(
-                        manual_ledger, video_id=result.video_id,
-                        canonical_url=next((u for vid, u, _ in manual_urls if vid == result.video_id), v_url),
-                        source_url=next((src for vid, _, src in manual_urls if vid == result.video_id), v_url),
-                        status=status, reason=reason, md_path=md_path, drive_verified=drive_state,
-                        model=str(result.metadata_updates.get("model", "")), md_sha256=md_sha256)
-                    manual_video_input.save_ledger(manual_ledger, manual_ledger_path)
+                if result.status == "deferred_run_budget":
+                    with manual_ledger_lock:
+                        manual_ledger = manual_video_input.read_ledger(manual_ledger_path)
+                        manual_ledger = manual_video_input.restore_dispatch_state(
+                            manual_ledger, result.video_id,
+                            manual_dispatch_snapshots.get(result.video_id),
+                        )
+                        manual_video_input.save_ledger(manual_ledger, manual_ledger_path)
+                    ledger_status = "deferred_run_budget"
+                    ledger_drive_state = "false"
+                    status = result.status
+                    reason = result.error_message or result.status
+                    md_path = ""
+                    drive_state = "false"
+                    md_sha256 = ""
+                else:
+                    status, reason, md_path, drive_state = manual_video_input.ledger_outcome(
+                        result.status, result.error_message or "", md_path,
+                        md_exists=md_path.startswith("drive-api:") or os.path.isfile(md_path),
+                        drive_disabled=os.getenv("P03_DRIVE_SYNC_ENABLED", "1").strip() == "0",
+                        drive_verified=bool(result.metadata_updates.get("drive_verified")))
+                    ledger_status, ledger_drive_state = status, drive_state
+                    md_sha256 = (hashlib.sha256(Path(md_path).read_text(encoding="utf-8-sig").encode("utf-8")).hexdigest()
+                                 if md_path and os.path.isfile(md_path) else "")
+                    with manual_ledger_lock:
+                        manual_ledger = manual_video_input.read_ledger(manual_ledger_path)
+                        manual_ledger = manual_video_input.upsert_ledger(
+                            manual_ledger, video_id=result.video_id,
+                            canonical_url=next((u for vid, u, _ in manual_urls if vid == result.video_id), v_url),
+                            source_url=next((src for vid, _, src in manual_urls if vid == result.video_id), v_url),
+                            status=status, reason=reason, md_path=md_path, drive_verified=drive_state,
+                            model=str(result.metadata_updates.get("model", "")), md_sha256=md_sha256)
+                        manual_video_input.save_ledger(manual_ledger, manual_ledger_path)
             except Exception as ledger_exc:
                 # Keep the result visible even if manual-specific persistence fails.
                 logger.error("Manual input ledger write failed for %s: %s", result.video_id, ledger_exc)

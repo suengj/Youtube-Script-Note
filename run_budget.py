@@ -10,6 +10,8 @@ try:
 except ModuleNotFoundError:  # openai 3.x vendors its compatible client as httpx2
     import httpx2 as httpx
 
+from openai._base_client import DefaultHttpxClient
+
 _lock = threading.Lock()
 _deadline: float | None = None
 
@@ -42,8 +44,8 @@ class _BudgetExpiredResponse(httpx.Response):
         raise RunBudgetExpired("P03 run budget expired before paid LLM HTTP request")
 
 
-class _BudgetAwareClient(httpx.Client):
-    """Check each dispatch while preserving normal HTTPX setup and SDK retry behavior."""
+class _BudgetAwareClient(DefaultHttpxClient):
+    """Check each dispatch while preserving the OpenAI SDK's HTTP defaults."""
 
     def send(self, request, *args, **kwargs):
         if expired():
@@ -52,5 +54,12 @@ class _BudgetAwareClient(httpx.Client):
 
 
 def make_http_client(**kwargs) -> httpx.Client:
-    """Create an HTTPX client gated before every SDK-managed HTTP attempt."""
+    """Create an SDK-default client gated before every SDK-managed HTTP attempt."""
+    # Keep the SDK class's timeout, connection limits, and redirect defaults. An
+    # event hook also marks requests that passed the budget gate for diagnostics.
+    event_hooks = dict(kwargs.pop("event_hooks", {}) or {})
+    request_hooks = list(event_hooks.get("request", []))
+    request_hooks.append(lambda request: request.extensions.__setitem__("p03_budget_checked", True))
+    event_hooks["request"] = request_hooks
+    kwargs["event_hooks"] = event_hooks
     return _BudgetAwareClient(**kwargs)

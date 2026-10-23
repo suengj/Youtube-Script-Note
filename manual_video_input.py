@@ -314,6 +314,34 @@ def _mark_manual_queue_processing(ledger, video_id, canonical_url, source_url, *
     )
 
 
+_DISPATCH_STATE_COLUMNS = (
+    "status", "attempts", "regen_attempts", "retry_count", "reason", "last_attempt_at",
+)
+
+
+def snapshot_dispatch_state(ledger, video_id):
+    """Capture fields changed while claiming a manual row for processing."""
+    matches = ledger.index[ledger.video_id.astype(str) == str(video_id)].tolist() if len(ledger) else []
+    if not matches:
+        return None
+    row = ledger.loc[matches[-1]]
+    return {column: row.get(column, "") for column in _DISPATCH_STATE_COLUMNS}
+
+
+def restore_dispatch_state(ledger, video_id, snapshot):
+    """Restore a pre-dispatch row after run-budget deferral."""
+    if snapshot is None or not len(ledger):
+        return ledger
+    matches = ledger.index[ledger.video_id.astype(str) == str(video_id)].tolist()
+    if not matches:
+        return ledger
+    idx = matches[-1]
+    for column in _DISPATCH_STATE_COLUMNS:
+        if column in ledger.columns:
+            ledger.at[idx, column] = snapshot.get(column, "")
+    return ledger
+
+
 def prepare_manual_queue(manual_rows, channel_urls, output_df, ledger, max_retries: int = 3,
                          *, duration_map=None, shorts_threshold_seconds: int = 0,
                          channel_auto_sub_only=None, video_channel_ids=None,

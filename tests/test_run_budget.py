@@ -473,8 +473,92 @@ def test_deadline_crossed_during_sdk_retry_blocks_next_request_and_defers(monkey
         from pipeline_models import VideoProcessResult
         import manual_video_input
         deferred = VideoProcessResult.from_legacy_tuple(
-            "api_error", "abcdefghijk", "run_budget_expired", source_url="https://youtu.be/abcdefghijk")
-        assert deferred.retryable is True
-        assert manual_video_input.ledger_outcome("api_error", "run_budget_expired")[0] == "retryable_failed"
+            "deferred_run_budget", "abcdefghijk", "run_budget_expired", source_url="https://youtu.be/abcdefghijk")
+        assert deferred.retryable is False
+    finally:
+        client.close()
+
+
+def test_run_budget_deferral_restores_manual_and_channel_rows_for_next_run(tmp_path):
+    import channel_crawl
+    import manual_video_input as mvi
+    from pipeline_models import VideoProcessResult
+    from shared_state_writer import SharedStateWriter
+
+    manual = mvi.read_ledger(tmp_path / "missing.csv")
+    manual = mvi.upsert_ledger(
+        manual, video_id="manual00001", canonical_url="https://youtu.be/manual00001",
+        source_url="https://youtu.be/manual00001", status="retryable_failed",
+        reason="prior API failure")
+    manual.loc[manual.video_id == "manual00001", "attempts"] = 2
+    manual.loc[manual.video_id == "manual00001", "regen_attempts"] = 0
+    manual.loc[manual.video_id == "manual00001", "retry_count"] = 0
+    manual.loc[manual.video_id == "manual00001", "last_attempt_at"] = "before-dispatch"
+    snapshot = mvi.snapshot_dispatch_state(manual, "manual00001")
+    claimed = mvi._mark_manual_queue_processing(
+        manual.copy(), "manual00001", "https://youtu.be/manual00001", "https://youtu.be/manual00001")
+    assert int(claimed.iloc[0].attempts) == 3
+    restored = mvi.restore_dispatch_state(claimed, "manual00001", snapshot)
+    row = restored.iloc[0]
+    assert row.status == "retryable_failed" and int(row.attempts) == 2
+    assert int(row.regen_attempts) == 0 and int(row.retry_count) == 0
+    assert row.reason == "prior API failure" and row.last_attempt_at == "before-dispatch"
+    assert "manual00001" not in mvi.terminal_manual_ids(restored, max_retries=3)
+    queued, _ = mvi.prepare_manual_queue(
+        ["https://youtu.be/manual00001"], [], pd.DataFrame(), restored, 3,
+        processed_video_ids=set(), mark_processing=False)
+    assert [item[0] for item in queued] == ["manual00001"]
+
+    queue = pd.DataFrame([{
+        "video_id": "channel0001", "status": "failed", "retry_count": 1,
+        "last_attempted_at": "before-dispatch", "last_error": "prior failure",
+        "done_at": "", "published_at": "2026-10-20", "discovered_at": "2026-10-21",
+    }])
+    deferred_queue = channel_crawl.apply_result_to_queue(
+        queue, "channel0001", "deferred_run_budget", "run budget expired")
+    assert deferred_queue.iloc[0].to_dict() == queue.iloc[0].to_dict()
+    selected = channel_crawl.select_process_candidates(deferred_queue, max_retries=3)
+    assert selected.video_id.tolist() == ["channel0001"]
+
+    persisted_output = []
+    writer = SharedStateWriter(
+        data_root=str(tmp_path), output_df=pd.DataFrame(), output_df_path="unused",
+        save_output_df=lambda frame, _path: persisted_output.append(frame.copy()),
+        crawl_queue_df=queue, save_crawl_queue=lambda _root, frame: persisted_output.append(frame.copy()),
+        channel_crawl_enabled=True,
+    )
+    writer.apply(VideoProcessResult(
+        video_id="channel0001", source_url="https://youtu.be/channel0001",
+        status="deferred_run_budget", error_message="run budget expired"))
+    assert len(writer.get_output_df()) == 0
+    assert channel_crawl.select_process_candidates(writer.get_crawl_queue_df(), max_retries=3).video_id.tolist() == [
+        "channel0001"]
+
+
+def test_run_budget_http_client_keeps_sdk_redirect_defaults():
+    import run_budget
+    from openai import OpenAI
+    httpx = run_budget.httpx
+
+    seen = []
+    def handler(request):
+        seen.append(request.url.path)
+        if request.url.path == "/v1/responses":
+            return httpx.Response(307, headers={"location": "/v1/responses-final"})
+        return httpx.Response(200, json={
+            "id": "resp_test", "object": "response", "created_at": 1,
+            "status": "completed", "model": "gpt-4.1",
+            "output": [{"type": "message", "role": "assistant", "content": [
+                {"type": "output_text", "text": "redirect worked", "annotations": []}
+            ]}],
+            "usage": {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+        })
+
+    client = OpenAI(api_key="test", http_client=run_budget.make_http_client(
+        transport=httpx.MockTransport(handler)))
+    try:
+        result = client.responses.create(model="gpt-4.1", input="hello")
+        assert result.output_text == "redirect worked"
+        assert seen == ["/v1/responses", "/v1/responses-final"]
     finally:
         client.close()
