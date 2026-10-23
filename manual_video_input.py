@@ -200,18 +200,34 @@ def _attempt_count(value) -> int:
         return 0
 
 
+def _ensure_ledger_flag_columns(df):
+    """Keep persisted boolean-like ledger flags assignable as strings."""
+    for col in ("drive_verified", "sheet_synced", "needs_manual_check"):
+        if col not in df.columns:
+            df[col] = ""
+        else:
+            # Callers may construct a ledger directly, leaving an all-empty
+            # flag column inferred as float64 under pandas 3.
+            df[col] = df[col].astype(object)
+    return df
+
+
 def read_ledger(path: str | Path):
     import pandas as pd
     p = Path(path)
     if not p.exists():
-        return pd.DataFrame(columns=LEDGER_COLUMNS)
+        return _ensure_ledger_flag_columns(pd.DataFrame(columns=LEDGER_COLUMNS))
     try:
-        df = pd.read_csv(p, encoding="utf-8-sig")
+        df = pd.read_csv(p, dtype=str, keep_default_na=False, encoding="utf-8-sig")
     except UnicodeDecodeError:
-        df = pd.read_csv(p, encoding="cp949")
+        df = pd.read_csv(p, dtype=str, keep_default_na=False, encoding="cp949")
     for col in LEDGER_COLUMNS:
         if col not in df.columns:
             df[col] = ""
+    _ensure_ledger_flag_columns(df)
+    # Counters remain numeric in memory; all other ledger CSV values stay text.
+    for col in ("attempts", "regen_attempts"):
+        df[col] = df[col].map(_attempt_count)
     # Migrate the earlier, non-terminal name without making those rows runnable.
     legacy = df.status.astype(str) == "deferred_backfill"
     df.loc[legacy, "status"] = "skipped_historical"
@@ -238,6 +254,7 @@ def upsert_ledger(df, *, video_id: str, canonical_url: str = "", source_url: str
                   sheet_synced: str = "", md_sha256: str = "", attempted: bool = False):
     if status not in LEDGER_STATUSES:
         raise ValueError(f"invalid manual ledger status: {status}")
+    _ensure_ledger_flag_columns(df)
     now = _now()
     matches = df.index[df.video_id.astype(str) == str(video_id)].tolist() if len(df) else []
     if matches:
@@ -450,6 +467,7 @@ def read_sheet_rows(service, spreadsheet_id: str = SHEET_ID, tab: str = SHEET_TA
 
 def writeback_success_rows(ledger, service, *, spreadsheet_id: str = SHEET_ID, tab: str = SHEET_TAB):
     """Write model and blank provenance cells for successful, Drive-verified manual videos."""
+    _ensure_ledger_flag_columns(ledger)
     def col_letter(n):
         result = ""
         while n:
