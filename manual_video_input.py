@@ -291,10 +291,33 @@ def upsert_ledger(df, *, video_id: str, canonical_url: str = "", source_url: str
     return df
 
 
+def _mark_manual_queue_processing(ledger, video_id, canonical_url, source_url, *, channel_overlap=False):
+    prior = ledger[ledger.video_id.astype(str) == str(video_id)]
+    prior_status = str(prior.iloc[-1].get("status") or "") if len(prior) else ""
+    reason = str(prior.iloc[-1].get("reason") or "") if len(prior) else ""
+    regen_attempts = _attempt_count(prior.iloc[-1].get("regen_attempts")) if len(prior) else 0
+    regen_pending = ("staged Markdown missing or hash mismatch" in reason or
+                     reason.startswith("regen attempt") or regen_attempts > 0)
+    if prior_status == "retryable_failed" and regen_pending:
+        mask = ledger.video_id.astype(str) == str(video_id)
+        ledger.loc[mask, "regen_attempts"] = regen_attempts + 1
+        ledger.loc[mask, "last_attempt_at"] = _now()
+        return upsert_ledger(ledger, video_id=video_id, canonical_url=canonical_url,
+                             source_url=source_url, status="processing",
+                             reason=f"regen attempt {regen_attempts + 1}/{MAX_REGEN_ATTEMPTS}")
+    return upsert_ledger(
+        ledger, video_id=video_id, canonical_url=canonical_url, source_url=source_url,
+        status="processing",
+        reason=("manual ownership retained; selected channel candidate will process once"
+                if channel_overlap else ""),
+        attempted=True,
+    )
+
+
 def prepare_manual_queue(manual_rows, channel_urls, output_df, ledger, max_retries: int = 3,
                          *, duration_map=None, shorts_threshold_seconds: int = 0,
                          channel_auto_sub_only=None, video_channel_ids=None,
-                         processed_video_ids=None):
+                         processed_video_ids=None, mark_processing=True):
     """Return unique canonical manual items and the ledger with pre-run decisions recorded."""
     if processed_video_ids is None:
         logging.getLogger(__name__).warning("processed_videos.csv is unavailable; manual queue is fail-closed")
@@ -381,37 +404,27 @@ def prepare_manual_queue(manual_rows, channel_urls, output_df, ledger, max_retri
             if vid not in seen:
                 seen.add(vid)
                 queued.append((vid, item["canonical_url"], source_url))
-                if prior_status == "retryable_failed" and regen_pending:
-                    mask = ledger.video_id.astype(str) == vid
-                    ledger.loc[mask, "regen_attempts"] = regen_attempts + 1
-                    ledger.loc[mask, "last_attempt_at"] = _now()
-                    ledger = upsert_ledger(ledger, video_id=vid, canonical_url=item["canonical_url"],
-                                           source_url=source_url, status="processing",
-                                           reason=f"regen attempt {regen_attempts + 1}/{MAX_REGEN_ATTEMPTS}")
-                else:
-                    ledger = upsert_ledger(ledger, video_id=vid, canonical_url=item["canonical_url"],
-                                           source_url=source_url, status="processing",
-                                           reason="manual ownership retained; selected channel candidate will process once",
-                                           attempted=True)
+                if mark_processing:
+                    ledger = _mark_manual_queue_processing(
+                        ledger, vid, item["canonical_url"], source_url, channel_overlap=True)
             continue
         if prior_status == "retryable_failed" and regen_pending:
             if vid not in seen:
                 seen.add(vid)
                 queued.append((vid, item["canonical_url"], source_url))
-                mask = ledger.video_id.astype(str) == vid
-                ledger.loc[mask, "regen_attempts"] = regen_attempts + 1
-                ledger.loc[mask, "status"] = "processing"
-                ledger.loc[mask, "reason"] = f"regen attempt {regen_attempts + 1}/{MAX_REGEN_ATTEMPTS}"
+                if mark_processing:
+                    ledger = _mark_manual_queue_processing(ledger, vid, item["canonical_url"], source_url)
             continue
         if vid in seen:
-            ledger = upsert_ledger(ledger, video_id=vid, canonical_url=item["canonical_url"],
-                                   source_url=source_url, status="processing",
-                                   reason="duplicate URL form merged by video ID")
+            if mark_processing:
+                ledger = upsert_ledger(ledger, video_id=vid, canonical_url=item["canonical_url"],
+                                       source_url=source_url, status="processing",
+                                       reason="duplicate URL form merged by video ID")
             continue
         seen.add(vid)
         queued.append((vid, item["canonical_url"], source_url))
-        ledger = upsert_ledger(ledger, video_id=vid, canonical_url=item["canonical_url"],
-                               source_url=source_url, status="processing", attempted=True)
+        if mark_processing:
+            ledger = _mark_manual_queue_processing(ledger, vid, item["canonical_url"], source_url)
     return queued, ledger
 
 

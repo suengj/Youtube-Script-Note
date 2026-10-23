@@ -117,6 +117,30 @@ def test_provider_failure_keeps_stale_entry_and_retries_next_run(env):
     assert cl.retry_errors(env.index, env.root / "source", provider=healthy).provider_calls == 0
 
 
+def test_retry_errors_does_not_start_paid_call_after_deadline(env, monkeypatch):
+    run(env, FakeProvider(fail=True))
+    healthy = FakeProvider()
+    monkeypatch.setattr(cl.time, "time", lambda: 100.0)
+
+    summary = cl.retry_errors(env.index, env.root / "source", deadline=100.0, provider=healthy)
+
+    assert summary.provider_calls == 0
+    assert healthy.calls == 0
+
+
+def test_sync_classification_is_skipped_after_deadline(tmp_path, monkeypatch):
+    from scripts.drive_yt_summary import sync
+
+    called = []
+    monkeypatch.setattr(sync.time, "time", lambda: 100.0)
+    monkeypatch.setattr("scripts.jev_classify.classify.classify_after_publish",
+                        lambda *_args: called.append(True))
+
+    sync._classify(tmp_path / "note.md", tmp_path, deadline=100.0)
+
+    assert called == []
+
+
 def test_new_source_failure_records_error_entry_then_retries(env):
     run(env, FakeProvider(fail=True))
     assert entries(env)[VID]["error"]

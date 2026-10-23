@@ -8,6 +8,7 @@ from dataclasses import dataclass, field
 import hashlib
 import os
 import sys
+import time
 import unicodedata
 from datetime import datetime, timezone
 from pathlib import Path
@@ -279,8 +280,10 @@ def find_canonical_for_truncated(
     return matches[0] if len(matches) == 1 else None
 
 
-def _classify(dest: Path, sync_root: Path) -> None:
+def _classify(dest: Path, sync_root: Path, deadline: Optional[float] = None) -> None:
     """SUE-1327: classify-if-needed after a written Drive copy (flag-gated, never raises)."""
+    if deadline is not None and time.time() >= deadline:
+        return
     try:
         from scripts.jev_classify.classify import classify_after_publish
 
@@ -300,6 +303,7 @@ def run_sync(
     work_path: Optional[str] = None,
     md_path: Optional[str] = None,
     sync_root: Optional[str] = None,
+    classification_deadline: Optional[float] = None,
 ) -> SyncResult:
     result = SyncResult(dry_run=dry_run)
     bounded_date = backfill_date or date_folder
@@ -402,7 +406,7 @@ def run_sync(
                 written_files[rel] = new_files[rel]
                 result.created += 1
                 result.actions.append(f"created: {rel} → {dest}")
-                _classify(dest, config.sync_root)
+                _classify(dest, config.sync_root, classification_deadline)
             elif prev.content_hash == item.content_hash:
                 result.skipped += 1
             else:
@@ -421,7 +425,7 @@ def run_sync(
                 written_files[rel] = new_files[rel]
                 result.updated += 1
                 result.actions.append(f"updated: {rel} → {prev.dest_path}")
-                _classify(Path(prev.dest_path), config.sync_root)
+                _classify(Path(prev.dest_path), config.sync_root, classification_deadline)
         except FilesystemSyncError as exc:
             result.errors += 1
             result.error_messages.append(f"{rel}: {exc}")
@@ -453,6 +457,7 @@ def run_sync_safe(
     limit: Optional[int] = None,
     date_folder: Optional[str] = None,
     backfill_date: Optional[str] = None,
+    classification_deadline: Optional[float] = None,
 ) -> SyncResult:
     """Entry for main.py — never raises; failures returned in SyncResult."""
     try:
@@ -462,6 +467,7 @@ def run_sync_safe(
             limit=limit,
             date_folder=date_folder,
             backfill_date=backfill_date,
+            classification_deadline=classification_deadline,
         )
     except Exception as exc:
         result = SyncResult(dry_run=dry_run, errors=1)

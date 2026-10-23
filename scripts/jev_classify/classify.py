@@ -14,6 +14,7 @@ import logging
 import os
 import re
 import threading
+import time
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -266,7 +267,8 @@ class RunSummary:
                 "errors": [f"{o.video_id or '?'}: {o.error}" for o in self.outcomes if o.error][:20]}
 
 
-def retry_errors(index_path: Path, source_dir: Path, *, limit: int = DEFAULT_RETRY_LIMIT, **kwargs: Any) -> RunSummary:
+def retry_errors(index_path: Path, source_dir: Path, *, limit: int = DEFAULT_RETRY_LIMIT,
+                 deadline: float | None = None, **kwargs: Any) -> RunSummary:
     """Daily-path retry of entries whose last attempt failed (bounded; never a corpus backfill)."""
     summary = RunSummary()
     if not index_path.exists():
@@ -274,6 +276,8 @@ def retry_errors(index_path: Path, source_dir: Path, *, limit: int = DEFAULT_RET
     index, _ = load_index(index_path)
     pending = [e for e in index["entries"].values() if isinstance(e, dict) and e.get("error")]
     for entry in sorted(pending, key=lambda e: e.get("video_id", ""))[:limit]:
+        if deadline is not None and time.time() >= deadline:
+            break
         name = (entry.get("lineage") or {}).get("drive_name")
         path = source_dir / name if name else None
         if path is None or not path.is_file():

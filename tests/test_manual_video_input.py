@@ -394,6 +394,28 @@ def test_manual_queue_dedupes_by_id_preserves_channel_processing_and_skips_succe
     assert ledger.loc[ledger.status == "unsupported", "reason"].str.contains("playlist").any()
 
 
+def test_deferred_manual_queue_keeps_prior_ledger_row_byte_equal():
+    ledger = mvi.read_ledger("/missing/manual.csv")
+    ledger = mvi.upsert_ledger(
+        ledger, video_id="defer000001", canonical_url="https://www.youtube.com/watch?v=defer000001",
+        source_url="https://youtu.be/defer000001", status="retryable_failed",
+        reason="staged Markdown missing or hash mismatch; reprocessing required",
+        attempted=True,
+    )
+    before = ledger.loc[ledger.video_id == "defer000001", mvi.LEDGER_COLUMNS].to_csv(
+        index=False, lineterminator="\n").encode("utf-8")
+
+    queued, after = mvi.prepare_manual_queue(
+        ["https://youtu.be/defer000001"], [], pd.DataFrame(), ledger, 3,
+        processed_video_ids=set(), mark_processing=False,
+    )
+
+    assert queued[0][0] == "defer000001"
+    row_after = after.loc[after.video_id == "defer000001", mvi.LEDGER_COLUMNS].to_csv(
+        index=False, lineterminator="\n").encode("utf-8")
+    assert row_after == before
+
+
 def test_manual_queue_keeps_failures_retryable_and_caps_attempts():
     ledger = mvi.read_ledger("/missing/manual.csv")
     for _ in range(2):

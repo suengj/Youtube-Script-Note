@@ -2544,7 +2544,7 @@ def process_videos(config: dict):
         duration_map=manual_duration_map, shorts_threshold_seconds=shorts_threshold,
         channel_auto_sub_only=manual_channel_auto_sub_only,
         video_channel_ids=manual_video_channel_ids,
-        processed_video_ids=processed_video_ids)
+        processed_video_ids=processed_video_ids, mark_processing=False)
     url_list = manual_video_input.exclude_skipped_historical_urls(url_list, manual_ledger)
     manual_auto_subs_only_ids = {
         vid for vid, channel_id in manual_video_channel_ids.items()
@@ -2552,10 +2552,31 @@ def process_videos(config: dict):
     }
     # Persist the ledger before processing so failed writes cannot start duplicate work.
     manual_video_input.save_ledger(manual_ledger, manual_ledger_path)
+    manual_dispatch_rows = {
+        vid: (url, source_url) for vid, url, source_url in manual_urls
+    }
+    manual_channel_overlap_ids = {
+        manual_video_input.normalize_youtube_url(u)["video_id"]
+        for u in url_list if manual_video_input.normalize_youtube_url(u)["kind"] == "video"
+    } if config.get("CHANNEL_CRAWL") else set()
+
+    def _mark_manual_dispatch(url):
+        nonlocal manual_ledger
+        try:
+            video_id = str(stt.extract_youtube_id(url) or "").strip()
+        except (ValueError, TypeError):
+            return
+        item = manual_dispatch_rows.get(video_id)
+        if item is None:
+            return
+        canonical_url, source_url = item
+        manual_ledger = manual_video_input._mark_manual_queue_processing(
+            manual_ledger, video_id, canonical_url, source_url,
+            channel_overlap=video_id in manual_channel_overlap_ids,
+        )
+        manual_video_input.save_ledger(manual_ledger, manual_ledger_path)
     if manual_urls:
-        channel_video_ids = {manual_video_input.normalize_youtube_url(u)["video_id"]
-                             for u in url_list if manual_video_input.normalize_youtube_url(u)["kind"] == "video"}
-        url_list.extend(url for vid, url, _ in manual_urls if vid not in channel_video_ids)
+        url_list.extend(url for vid, url, _ in manual_urls if vid not in manual_channel_overlap_ids)
         direct_input_set = {url for _, url, _ in manual_urls}
         url_from_input_set = set(direct_input_set)
         logger.info("Added %d canonical manual video URL(s) by video ID", len(manual_urls))
@@ -2892,6 +2913,7 @@ def process_videos(config: dict):
                     logger.info("Skipping URL (active claim): %s vid=%s", v_url, claim_vid)
                     pbar.update(1)
                     continue
+                _mark_manual_dispatch(v_url)
                 result = _worker_run(0, v_url, video_config, claim_vid)
                 _finalize_result(result, v_url, claim_vid, i, pbar)
                 if api_storage_failure:
@@ -2933,6 +2955,7 @@ def process_videos(config: dict):
                             pbar.update(1)
                             completed += 1
                             continue
+                        _mark_manual_dispatch(v_url)
                         fut = executor.submit(_worker_run, widx, v_url, video_config, claim_vid)
                         in_flight[fut] = (i, v_url, claim_vid)
                     if not in_flight:
@@ -3058,7 +3081,7 @@ def process_videos(config: dict):
                     sum(1 for r in retried if r.drive_ok),
                     len(retried),
                 )
-            drive_result = run_sync_safe()
+            drive_result = run_sync_safe(classification_deadline=run_started_monotonic + run_budget_seconds)
             if drive_result.errors:
                 logger.warning(
                     "Drive YT_summary sync failed (non-fatal): %s",
@@ -3083,7 +3106,10 @@ def process_videos(config: dict):
 
                 yt_root = discover_yt_summary_root()
                 if yt_root is not None:
-                    retry = retry_errors(yt_root / "classification-index.json", yt_root / "source")
+                    retry = retry_errors(
+                        yt_root / "classification-index.json", yt_root / "source",
+                        deadline=run_started_monotonic + run_budget_seconds,
+                    )
                     if retry.outcomes:
                         logger.info("JEV classify retry: %s", retry.as_dict())
         except Exception as ce:
