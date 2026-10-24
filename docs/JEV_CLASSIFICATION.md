@@ -37,6 +37,17 @@ systems (AES, intelligence-library, social-publisher) may read the index as deri
 
 ## Operator commands (not part of the daily path)
 
+### Linux Drive API batch and backfill
+
+On OVH, the batch end phase uses the Drive API index ID above (without a Drive Desktop sync root). Enable it with
+`P03_JEV_CLASSIFY_ENABLED=1`; `P03_JEV_PHASE_MAX_MIN` sets the end-phase cap in minutes (default `10`). The hook
+classifies verified uploads from that batch, retries up to 20 previous errors, backs up the current index to the
+sibling `classification-index.json.prev`, and verifies the updated file by SHA-256 readback. Failures are non-fatal.
+
+Backfill manifest items with `python -m scripts.jev_classify backfill-drive --max-calls N` in bounded runs, or
+`python -m scripts.jev_classify backfill-drive --all` to process the full set. Add `--dry-run` to count candidates
+without JEV calls or Drive writes. Backfill writes progress in chunks of 100 calls.
+
 ```bash
 python -m scripts.jev_classify classify --date 2026-10-06 [--dry-run]   # window by date folder
 python -m scripts.jev_classify classify --since 2026-10-01 --until 2026-10-06

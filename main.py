@@ -90,6 +90,23 @@ class VideoNotQueuedError(ValueError):
     """Explicit --video-id is absent from the selected queue."""
 
 
+def _copy_video_config(config: dict) -> dict:
+    """Copy worker settings while retaining a shared per-run JEV receipt list."""
+    config.setdefault("_JEV_DRIVE_UPLOADS", [])
+    return {**config}
+
+
+def _record_jev_drive_upload(config: dict, receipt, name: str, summary: bytes) -> None:
+    """Record a verified Drive summary upload for the batch-end JEV hook."""
+    try:
+        summary_id = (receipt or {}).get("summary", {}).get("id")
+        uploads = config.get("_JEV_DRIVE_UPLOADS")
+        if summary_id and uploads is not None:
+            uploads.append((summary_id, name, summary))
+    except Exception:
+        pass  # optional classification bookkeeping must not affect a verified publish
+
+
 def select_batch_manual_rows(data_root, manual_df, cutoff, max_rows, output_df, ledger,
                              exclude_ids=None, return_processed=False):
     """Select manual rows only when every processed-ID source is readable."""
@@ -1868,8 +1885,9 @@ def process_single_video(
                     "transcript_date": v_date, "created_at": datetime.now().astimezone().isoformat(),
                 }
                 sink = api_sink or config.get("DRIVE_API_SINK") or DriveApiSink()
-                sink.upload_video(summary_name=output_file, summary=summary_bytes,
-                                  transcript=transcript_bytes, metadata=metadata, video_id=video_id or "")
+                upload_receipt = sink.upload_video(summary_name=output_file, summary=summary_bytes,
+                                                   transcript=transcript_bytes, metadata=metadata, video_id=video_id or "")
+                _record_jev_drive_upload(config, upload_receipt, output_file, summary_bytes)
                 api_verified = True
                 if subs_path:
                     delete_subtitle_file(subs_path)
@@ -2690,7 +2708,7 @@ def process_videos(config: dict):
         ]
 
     def _video_config_for_url(v_url: str) -> dict:
-        video_config = {**config}
+        video_config = _copy_video_config(config)
         # Channel-crawl videos mirror only when channel_df marks the channel `recording`
         # (unknown channel => off). Direct input_df.csv URLs are specific videos the owner
         # asked for, so they always mirror to Obsidian (Drive is written for every video).
@@ -3057,18 +3075,20 @@ def process_videos(config: dict):
         except Exception as ds:
             logger.warning("Drive YT_summary sync failed (non-fatal): %s", ds)
 
-        # SUE-1327: retry JEV entries whose last attempt failed (bounded; flag-gated; never a backfill).
+        # SUE-1799: classify this run's Drive API uploads and retry prior errors.
         try:
-            from scripts.jev_classify.classify import classify_enabled, retry_errors
-
-            if classify_enabled():
-                from scripts.drive_yt_summary.config import discover_yt_summary_root
-
-                yt_root = discover_yt_summary_root()
-                if yt_root is not None:
-                    retry = retry_errors(yt_root / "classification-index.json", yt_root / "source")
-                    if retry.outcomes:
-                        logger.info("JEV classify retry: %s", retry.as_dict())
+            if os.getenv("P03_DRIVE_BACKEND", "api" if sys.platform.startswith("linux") else "desktop").strip().lower() == "api":
+                from scripts.jev_classify.drive import classify_batch
+                classify_batch(config.get("_JEV_DRIVE_UPLOADS", []))
+            else:
+                from scripts.jev_classify.classify import classify_enabled, retry_errors
+                if classify_enabled():
+                    from scripts.drive_yt_summary.config import discover_yt_summary_root
+                    yt_root = discover_yt_summary_root()
+                    if yt_root is not None:
+                        retry = retry_errors(yt_root / "classification-index.json", yt_root / "source")
+                        if retry.outcomes:
+                            logger.info("JEV classify retry: %s", retry.as_dict())
         except Exception as ce:
             logger.warning("JEV classify retry failed (non-fatal): %s", type(ce).__name__)
 
