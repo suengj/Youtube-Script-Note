@@ -4,6 +4,7 @@
   python -m scripts.jev_classify classify (--path MD ... | --date YYYY-MM-DD | --since D [--until D] | --all)
                                           [--force] [--dry-run]
   python -m scripts.jev_classify retry-errors [--limit N]
+  python -m scripts.jev_classify backfill-drive (--max-calls N | --all) [--dry-run]
 
 `classify` is the explicit backfill/reclassify command: sources come from P03's own Drive sync
 state (date folder of relative_path), never from a Drive crawl. Without --force only new,
@@ -95,9 +96,24 @@ def main(argv: list[str] | None = None) -> int:
     c.add_argument("--dry-run", action="store_true")
     r = sub.add_parser("retry-errors")
     r.add_argument("--limit", type=int, default=20)
+    b = sub.add_parser("backfill-drive", help="classify missing entries from the canonical Drive manifest")
+    b.add_argument("--dry-run", action="store_true")
+    cap = b.add_mutually_exclusive_group(required=True)
+    cap.add_argument("--max-calls", type=int)
+    cap.add_argument("--all", action="store_true")
     args = parser.parse_args(argv)
     if args.cmd == "classify" and args.until and not args.since:
         parser.error("--until requires --since")
+
+    if args.cmd == "backfill-drive":
+        if args.max_calls is not None and args.max_calls < 1:
+            parser.error("--max-calls must be positive")
+        from .drive import backfill_drive
+        result = backfill_drive(dry_run=args.dry_run, max_calls=args.max_calls, all_sources=args.all)
+        if not args.dry_run:
+            json.dump(result, sys.stdout, ensure_ascii=False, indent=2, sort_keys=True)
+            sys.stdout.write("\n")
+        return 0
 
     sync_root = _sync_root(args.sync_root)
     index_path = Path(args.index).expanduser() if args.index else sync_root / INDEX_FILENAME
