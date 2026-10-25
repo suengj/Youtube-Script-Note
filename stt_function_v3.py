@@ -301,6 +301,7 @@ def sanitize_filename(filename, replacement="_", max_length=50):
     # Sanitize the base name
     invalid_chars = r'[<>:"/\\|?*\x00-\x1F]'
     sanitized = re.sub(invalid_chars, replacement, base_name)
+    sanitized_extension = re.sub(invalid_chars, replacement, extension)
 
     # Optionally strip leading/trailing whitespace or dots
     sanitized = sanitized.strip(" ").rstrip(".")
@@ -311,7 +312,7 @@ def sanitize_filename(filename, replacement="_", max_length=50):
 
     # Reassemble the sanitized name with the extension
     if extension:
-        return f"{sanitized}.{extension}"
+        return f"{sanitized}.{sanitized_extension}"
         
     return sanitized
 
