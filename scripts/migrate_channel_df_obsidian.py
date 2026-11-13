@@ -24,6 +24,7 @@ from typing import Dict, List, Optional
 _ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(_ROOT))
 
+from atomic_io import preserve_replace_permissions  # noqa: E402
 import channel_crawl as cc  # noqa: E402
 import run_lock  # noqa: E402
 
@@ -75,6 +76,7 @@ def apply(path: str, lock_dir: Optional[str]) -> Dict:
         except Exception:
             os.remove(tmp_path)
             raise
+        preserve_replace_permissions(tmp_path, path)
         os.replace(tmp_path, path)
         return {**p, "applied": True, "backup": backup}
     finally:

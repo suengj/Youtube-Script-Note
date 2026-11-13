@@ -33,6 +33,8 @@ try:
 except ImportError:
     Request = urlopen = urlencode = unquote = quote = None  # type: ignore
 
+from atomic_io import preserve_replace_permissions
+
 logger = logging.getLogger(__name__)
 
 # YouTube Data API v3
@@ -440,6 +442,7 @@ def write_channel_df_atomic(path: str, header: List[str], rows: List[Dict[str, A
         w = csv.DictWriter(f, fieldnames=header, extrasaction="ignore")
         w.writeheader()
         w.writerows(rows)
+    preserve_replace_permissions(tmp_path, path)
     os.replace(tmp_path, path)
 
 
@@ -644,6 +647,7 @@ def save_crawl_queue_df(base_path: str, queue_df) -> None:
     for attempt in range(max_retries):
         try:
             q.to_csv(tmp_path, index=False, encoding="utf-8-sig")
+            preserve_replace_permissions(tmp_path, path)
             os.replace(tmp_path, path)
             return
         except OSError as e:

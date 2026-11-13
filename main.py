@@ -56,6 +56,7 @@ import stt_function_v3 as stt
 import channel_crawl
 import manual_video_input
 import processed_video_registry
+from atomic_io import preserve_replace_permissions
 from input_df_csv import read_input_df
 from scripts import import_manual_urls_from_sheet
 from filename_utils import fit_filename, parse_note_name, validate_llm_suffix
@@ -892,6 +893,7 @@ def _save_output_df_with_retry(output_df: pd.DataFrame, output_df_path: str, na_
     for attempt in range(max_retries):
         try:
             output_df.to_csv(tmp_path, na_rep=na_rep, index=False, encoding="utf-8-sig")
+            preserve_replace_permissions(tmp_path, output_df_path)
             os.replace(tmp_path, output_df_path)
             return
         except OSError as e:

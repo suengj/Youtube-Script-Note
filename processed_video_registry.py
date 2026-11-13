@@ -11,6 +11,8 @@ from pathlib import Path
 
 import pandas as pd
 
+from atomic_io import preserve_replace_permissions
+
 REGISTRY_NAME = "processed_videos.csv"
 REGISTRY_COLUMNS = ["video_id", "first_seen_at", "sources", "last_status", "model"]
 REGISTRY_SOURCES = {"output_df", "sheet_marked", "manual_success", "channel_success", "skipped_historical"}
@@ -75,6 +77,7 @@ def _write_registry_unlocked(frame, path: str | Path) -> None:
     os.close(fd)
     try:
         frame[REGISTRY_COLUMNS].to_csv(tmp, index=False, encoding="utf-8-sig")
+        preserve_replace_permissions(tmp, p)
         os.replace(tmp, p)
     finally:
         if os.path.exists(tmp):

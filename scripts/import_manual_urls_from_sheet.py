@@ -14,6 +14,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 from manual_video_input import (SHEET_ID, SHEET_TAB, normalize_youtube_url,
                                 build_sheets_service, read_sheet_rows)  # noqa: E402
+from atomic_io import preserve_replace_permissions  # noqa: E402
 from input_df_csv import read_input_df  # noqa: E402
 from processed_video_registry import (input_video_ids, processed_ids, processed_id_union,
                                       read_registry)  # noqa: E402
@@ -53,6 +54,7 @@ def _write_frame_atomic(frame, path: Path, encoding: str) -> None:
     os.close(fd)
     try:
         frame.to_csv(tmp, index=False, encoding=encoding)
+        preserve_replace_permissions(tmp, path)
         os.replace(tmp, path)
     finally:
         if os.path.exists(tmp):

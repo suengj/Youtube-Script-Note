@@ -19,9 +19,14 @@ import argparse
 import os
 import re
 import shutil
+import sys
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
 import pandas as pd
+
+from atomic_io import preserve_replace_permissions
 
 
 def _video_id_from_watch_url(url: str) -> str:
@@ -93,6 +98,7 @@ def main() -> None:
     out_kept = out.loc[~mask].copy()
     tmp = out_path.with_suffix(".csv.tmp")
     out_kept.to_csv(tmp, index=False, encoding="utf-8-sig")
+    preserve_replace_permissions(tmp, out_path)
     os.replace(tmp, out_path)
     print(f"Wrote output_df_new.csv ({len(out_kept)} rows)")
 
@@ -119,6 +125,7 @@ def main() -> None:
 
     qt = queue_path.with_suffix(".csv.tmp")
     q.to_csv(qt, index=False, encoding="utf-8-sig")
+    preserve_replace_permissions(qt, queue_path)
     os.replace(qt, queue_path)
     print(f"Wrote crawl_yt_list.csv (reset {n_reset} queue row(s) across {len(vids)} video_id(s))")
 
