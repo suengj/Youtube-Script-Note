@@ -59,8 +59,9 @@ def test_rewrite_removes_inherited_access_acl(tmp_path):
 
 @pytest.mark.parametrize("status, expected", [
     ("Name:\tpython\nUmask:\t0027\n", 0o027),
-    ("Name:\tpython\n", 0o022),
-    ("Umask:\tinvalid\n", 0o022),
+    ("Name:\tpython\n", None),
+    ("Umask:\tinvalid\n", None),
+    ("Umask:\t-022\n", None),
 ])
 def test_current_umask_parsing_and_fallback(monkeypatch, status, expected):
     monkeypatch.setattr(atomic_io, "_read_proc_status", lambda: status)
@@ -71,7 +72,7 @@ def test_current_umask_fallback_when_status_unavailable(monkeypatch):
     def unavailable():
         raise OSError("unavailable")
     monkeypatch.setattr(atomic_io, "_read_proc_status", unavailable)
-    assert atomic_io._current_umask() == 0o022
+    assert atomic_io._current_umask() is None
 
 
 def test_new_file_uses_umask_default(tmp_path, monkeypatch):
@@ -79,6 +80,15 @@ def test_new_file_uses_umask_default(tmp_path, monkeypatch):
     monkeypatch.setattr(atomic_io, "_read_proc_status", lambda: "Umask:\t0022\n")
     _rewrite_ledger(path)
     assert stat.S_IMODE(path.stat().st_mode) == 0o644
+
+
+def test_new_file_keeps_temp_mode_when_umask_unavailable(tmp_path, monkeypatch):
+    def unavailable():
+        raise OSError("unavailable")
+    monkeypatch.setattr(atomic_io, "_read_proc_status", unavailable)
+    path = tmp_path / "new.csv"
+    _rewrite_ledger(path)
+    assert stat.S_IMODE(path.stat().st_mode) == 0o600
 
 
 def test_permission_failure_does_not_prevent_replace(tmp_path, monkeypatch, caplog):

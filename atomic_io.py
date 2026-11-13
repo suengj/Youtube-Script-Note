@@ -20,10 +20,12 @@ def _current_umask():
     try:
         for line in _read_proc_status().splitlines():
             if line.startswith("Umask:"):
-                return int(line.split(":", 1)[1].strip(), 8)
+                value = line.split(":", 1)[1].strip()
+                if len(value) == 4 and value[0] == "0" and all(c in "01234567" for c in value):
+                    return int(value, 8)
     except (OSError, ValueError):
         pass
-    return 0o022
+    return None
 
 
 def preserve_replace_permissions(temp_path, destination) -> None:
@@ -35,7 +37,10 @@ def preserve_replace_permissions(temp_path, destination) -> None:
     try:
         mode = stat.S_IMODE(os.stat(destination).st_mode)
     except FileNotFoundError:
-        mode = 0o666 & ~_current_umask()
+        umask = _current_umask()
+        if umask is None:
+            return
+        mode = 0o666 & ~umask
         is_new = True
     except OSError as exc:
         _LOG.warning("Could not read permissions for %s: %s", destination, exc)
