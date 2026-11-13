@@ -8,6 +8,7 @@ import tempfile
 import pandas as pd
 import pytest
 
+import atomic_io
 from atomic_io import preserve_replace_permissions
 from manual_video_input import LEDGER_COLUMNS, save_ledger
 
@@ -40,13 +41,43 @@ def test_ledger_rewrite_preserves_access_acl(tmp_path):
     assert "mask::r--" in entries
 
 
-def test_new_file_uses_umask_default(tmp_path):
+def test_rewrite_removes_inherited_access_acl(tmp_path):
+    setfacl, getfacl = shutil.which("setfacl"), shutil.which("getfacl")
+    if not setfacl or not getfacl:
+        pytest.skip("setfacl and getfacl are required for the ACL regression")
+    path = tmp_path / "manual_input_status.csv"
+    path.write_text("old data")
+    path.chmod(0o640)
+    result = subprocess.run([setfacl, "-m", f"d:u:{os.getuid()}:rwx", str(tmp_path)], capture_output=True, text=True)
+    if result.returncode:
+        pytest.skip(f"temporary filesystem does not support setting ACLs: {result.stderr.strip()}")
+    _rewrite_ledger(path)
+    result = subprocess.run([getfacl, "-n", "-c", str(path)], capture_output=True, text=True, check=True)
+    assert not any(line.startswith(f"user:{os.getuid()}:") for line in result.stdout.splitlines())
+    assert stat.S_IMODE(path.stat().st_mode) == 0o640
+
+
+@pytest.mark.parametrize("status, expected", [
+    ("Name:\tpython\nUmask:\t0027\n", 0o027),
+    ("Name:\tpython\n", 0o022),
+    ("Umask:\tinvalid\n", 0o022),
+])
+def test_current_umask_parsing_and_fallback(monkeypatch, status, expected):
+    monkeypatch.setattr(atomic_io, "_read_proc_status", lambda: status)
+    assert atomic_io._current_umask() == expected
+
+
+def test_current_umask_fallback_when_status_unavailable(monkeypatch):
+    def unavailable():
+        raise OSError("unavailable")
+    monkeypatch.setattr(atomic_io, "_read_proc_status", unavailable)
+    assert atomic_io._current_umask() == 0o022
+
+
+def test_new_file_uses_umask_default(tmp_path, monkeypatch):
     path = tmp_path / "new.csv"
-    old_mask = os.umask(0o022)
-    try:
-        _rewrite_ledger(path)
-    finally:
-        os.umask(old_mask)
+    monkeypatch.setattr(atomic_io, "_read_proc_status", lambda: "Umask:\t0022\n")
+    _rewrite_ledger(path)
     assert stat.S_IMODE(path.stat().st_mode) == 0o644
 
 

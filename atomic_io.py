@@ -11,6 +11,21 @@ _UNSUPPORTED = {getattr(errno, name) for name in ("ENOTSUP", "EOPNOTSUPP", "ENOD
                 if hasattr(errno, name)}
 
 
+def _read_proc_status():
+    with open("/proc/self/status") as status:
+        return status.read()
+
+
+def _current_umask():
+    try:
+        for line in _read_proc_status().splitlines():
+            if line.startswith("Umask:"):
+                return int(line.split(":", 1)[1].strip(), 8)
+    except (OSError, ValueError):
+        pass
+    return 0o022
+
+
 def preserve_replace_permissions(temp_path, destination) -> None:
     """Apply the destination's mode and access ACL before replacing it.
 
@@ -20,10 +35,7 @@ def preserve_replace_permissions(temp_path, destination) -> None:
     try:
         mode = stat.S_IMODE(os.stat(destination).st_mode)
     except FileNotFoundError:
-        # Python has no read-only umask API. Restore it immediately after reading.
-        mask = os.umask(0)
-        os.umask(mask)
-        mode = 0o666 & ~mask
+        mode = 0o666 & ~_current_umask()
         is_new = True
     except OSError as exc:
         _LOG.warning("Could not read permissions for %s: %s", destination, exc)
@@ -39,6 +51,27 @@ def preserve_replace_permissions(temp_path, destination) -> None:
 
     try:
         acl = os.getxattr(destination, "system.posix_acl_access")
+    except AttributeError:
+        return
+    except OSError as exc:
+        if exc.errno == getattr(errno, "ENODATA", None):
+            try:
+                os.removexattr(temp_path, "system.posix_acl_access")
+            except AttributeError:
+                pass
+            except OSError as remove_exc:
+                if remove_exc.errno not in _UNSUPPORTED:
+                    _LOG.warning("Could not remove access ACL from %s: %s", temp_path, remove_exc)
+            try:
+                os.chmod(temp_path, mode)
+            except OSError as chmod_exc:
+                _LOG.warning("Could not set permissions on %s: %s", temp_path, chmod_exc)
+            return
+        if exc.errno not in _UNSUPPORTED:
+            _LOG.warning("Could not copy access ACL from %s to %s: %s", destination, temp_path, exc)
+        return
+
+    try:
         os.setxattr(temp_path, "system.posix_acl_access", acl)
     except AttributeError:
         pass
