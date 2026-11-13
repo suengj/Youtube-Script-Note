@@ -12,6 +12,7 @@ from datetime import date, datetime, timezone
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
+from atomic_io import preserve_replace_permissions
 from input_df_csv import normalize_input_df_columns
 
 VIDEO_ID_RE = re.compile(r"^[A-Za-z0-9_-]{11}$")
@@ -249,6 +250,7 @@ def save_ledger(df, path: str | Path) -> None:
     os.close(fd)
     try:
         df[LEDGER_COLUMNS].to_csv(tmp, index=False, encoding="utf-8-sig")
+        preserve_replace_permissions(tmp, p)
         os.replace(tmp, p)
     finally:
         if os.path.exists(tmp):
