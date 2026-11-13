@@ -14,7 +14,26 @@ import pandas as pd
 REGISTRY_NAME = "processed_videos.csv"
 REGISTRY_COLUMNS = ["video_id", "first_seen_at", "sources", "last_status", "model"]
 REGISTRY_SOURCES = {"output_df", "sheet_marked", "manual_success", "channel_success", "skipped_historical"}
+# "unknown" is legacy output history, not a success; its video ID remains processed.
+REGISTRY_STATUSES = frozenset({
+    "unknown", "success", "already_existed", "oversized_file", "passed_shorts", "short",
+    "video_unavailable", "skipped_auto_subs_only", "sheet_marked", "done", "queued",
+    "failed", "retry_exhausted", "error", "download_failed", "mlx_error",
+    "captions_error", "source_unavailable", "api_error", "file_error",
+    "no_auto_caption", "manual_review", "durable_transcript_unreadable", "live_scheduled",
+})
 _REGISTRY_THREAD_LOCK = threading.Lock()
+
+
+def validate_registry_statuses(statuses) -> None:
+    """Reject unsupported statuses, including empty values, without relabeling them."""
+    from manual_video_input import LEDGER_STATUSES
+
+    allowed = REGISTRY_STATUSES | {value.casefold() for value in LEDGER_STATUSES}
+    invalid = sorted({str(value).strip().casefold() for value in statuses
+                      if str(value).strip().casefold() not in allowed})
+    if invalid:
+        raise ValueError(f"processed registry has unknown status values: {', '.join(repr(value) for value in invalid)}")
 
 
 def registry_path(data_root: str | Path) -> Path:
@@ -153,6 +172,7 @@ def merge_records(path: str | Path, records) -> None:
                 row["first_seen_at"] = (seen_at[0] if seen_at else "") or now
             by_id[video_id] = row
         merged = pd.DataFrame([by_id[key] for key in sorted(by_id)], columns=REGISTRY_COLUMNS)
+        validate_registry_statuses(merged.last_status)
         _write_registry_unlocked(merged, path)
 
 
@@ -202,18 +222,7 @@ def processed_id_union(data_root: str | Path, normalize, output_df=None, *,
         str(value).strip() for value in registry_frame.video_id
         if str(value).strip() and str(value).strip().lower() != "unknown"
     }
-    from manual_video_input import LEDGER_STATUSES
-    known_statuses = {value.casefold() for value in LEDGER_STATUSES} | {
-        "success", "already_existed", "oversized_file", "passed_shorts", "short",
-        "video_unavailable", "skipped_auto_subs_only", "sheet_marked", "done", "queued",
-        "failed", "retry_exhausted", "error", "download_failed", "mlx_error",
-        "captions_error", "source_unavailable", "api_error", "file_error",
-        "no_auto_caption", "manual_review", "durable_transcript_unreadable", "live_scheduled",
-    }
-    unknown_statuses = sorted({str(value).strip().casefold() for value in registry_frame.last_status
-                               if str(value).strip().casefold() not in known_statuses})
-    if unknown_statuses:
-        raise ValueError(f"processed registry has unknown status values: {', '.join(unknown_statuses)}")
+    validate_registry_statuses(registry_frame.last_status)
     if sheet_rows is None:
         sheet_ids = read_sheet_marked_ids()
     else:
@@ -245,7 +254,7 @@ def _video_id(value, normalize):
 
 
 def build_registry(data_root: str | Path, *, include_sheet: bool = True, sheet_rows=None, dry_run: bool = False):
-    """Build/merge all durable processed sources without deleting prior IDs."""
+    """Build/merge durable sources; refuse unsupported output statuses without writing."""
     from manual_video_input import normalize_youtube_url, read_ledger, build_sheets_service, read_sheet_rows, SHEET_ID, SHEET_TAB
 
     root = Path(data_root)
@@ -265,6 +274,7 @@ def build_registry(data_root: str | Path, *, include_sheet: bool = True, sheet_r
                     if vid:
                         break
             if vid:
+                validate_registry_statuses([row.get("status", "")])
                 records.append((vid, "output_df", row.get("status", ""), row.get("model", "")))
                 source_counts["output_df"] += 1
     ledger = read_ledger(root / "manual_input_status.csv")

@@ -239,3 +239,104 @@ def test_manual_queue_uses_registry_as_processed_authority():
         pd.DataFrame([{"v_id": "abcdefghijk", "status": "success"}]),
         mvi.read_ledger("/missing/ledger.csv"), processed_video_ids=set())
     assert queued == []
+
+
+def _write_registry_status(root, status):
+    pd.DataFrame([{"video_id": "legacy00001", "first_seen_at": "2026-01-01",
+                   "sources": "output_df", "last_status": status, "model": ""}],
+                 columns=pvr.REGISTRY_COLUMNS).to_csv(pvr.registry_path(root), index=False)
+
+
+def _manual_selector():
+    # Load only the admission function: importing main loads runtime dependencies
+    # and dotenv, neither of which is needed for this focused test.
+    import ast
+    import logging
+    import manual_video_input as mvi
+
+    tree = ast.parse((ROOT / "main.py").read_text(encoding="utf-8"))
+    function = next(node for node in tree.body
+                    if isinstance(node, ast.FunctionDef) and node.name == "select_batch_manual_rows")
+    namespace = {"processed_video_registry": pvr, "manual_video_input": mvi,
+                 "logger": logging.getLogger(__name__)}
+    exec(compile(ast.Module(body=[function], type_ignores=[]), str(ROOT / "main.py"), "exec"), namespace)
+    return namespace[function.name]
+
+
+def test_legacy_unknown_excludes_identity_and_allows_manual_admission_and_import(tmp_path, monkeypatch, capsys):
+    import manual_video_input as mvi
+
+    _write_registry_status(tmp_path, "unknown")
+    monkeypatch.setattr(pvr, "read_sheet_marked_ids", lambda: set())
+    manual = pd.DataFrame([{"date": "2026-10-22", "url": "https://youtu.be/legacy00001"},
+                           {"date": "2026-10-21", "url": "https://youtu.be/freshvid001"}])
+    selected, processed = _manual_selector()(
+        tmp_path, manual, "2026-10-01", 1, pd.DataFrame(),
+        mvi.read_ledger(tmp_path / "ledger.csv"), return_processed=True)
+    assert "legacy00001" in processed
+    assert len(selected) == 1 and "freshvid001" in str(selected[0])
+    rows = [["URL", "Source", "Download 여부"],
+            ["https://youtu.be/legacy00001", "", ""],
+            ["https://youtu.be/freshvid001", "", ""]]
+    result = import_rows(rows, tmp_path / "input_df.csv", tmp_path, max_new=1)
+    assert result["new"] == 1 and result["already_processed"] == 1
+    assert "already-success: 0" in capsys.readouterr().out.lower()
+    assert pvr.read_registry(pvr.registry_path(tmp_path)).iloc[0].last_status == "unknown"
+
+
+@pytest.mark.parametrize("status", ["bogus", ""])
+def test_invalid_registry_status_disables_manual_admission_and_import(tmp_path, monkeypatch, status):
+    import manual_video_input as mvi
+
+    _write_registry_status(tmp_path, status)
+    monkeypatch.setattr(pvr, "read_sheet_marked_ids", lambda: set())
+    manual = pd.DataFrame([{"date": "2026-10-22", "url": "https://youtu.be/freshvid001"}])
+    selected, processed = _manual_selector()(
+        tmp_path, manual, "2026-10-01", 5, pd.DataFrame(),
+        mvi.read_ledger(tmp_path / "ledger.csv"), return_processed=True)
+    assert selected == [] and processed is None
+    result = import_rows([["URL", "Source", "Download 여부"],
+                          ["https://youtu.be/freshvid001", "", ""]],
+                         tmp_path / "input_df.csv", tmp_path)
+    assert result["new"] == 0 and not (tmp_path / "input_df.csv").exists()
+
+
+@pytest.mark.parametrize("status", ["bogus", ""])
+def test_builder_refuses_invalid_output_status_without_writing(tmp_path, status):
+    _empty_registry(tmp_path)
+    before = pvr.registry_path(tmp_path).read_bytes()
+    pd.DataFrame([{"v_id": "legacy00001", "status": status}]).to_csv(
+        tmp_path / "output_df_new.csv", index=False)
+    with pytest.raises(ValueError, match="unknown status"):
+        pvr.build_registry(tmp_path, include_sheet=False)
+    assert pvr.registry_path(tmp_path).read_bytes() == before
+
+
+def test_builder_preserves_legacy_unknown(tmp_path):
+    pd.DataFrame([{"v_id": "legacy00001", "status": "unknown"}]).to_csv(
+        tmp_path / "output_df_new.csv", index=False)
+    pvr.build_registry(tmp_path, include_sheet=False)
+    assert pvr.read_registry(pvr.registry_path(tmp_path)).iloc[0].last_status == "unknown"
+    assert pvr.processed_ids(pvr.registry_path(tmp_path)) == {"legacy00001"}
+
+
+def test_manual_admission_still_fails_closed_on_sheet_error(tmp_path, monkeypatch):
+    import manual_video_input as mvi
+
+    _write_registry_status(tmp_path, "unknown")
+    def fail_sheet():
+        raise OSError("offline")
+    monkeypatch.setattr(pvr, "read_sheet_marked_ids", fail_sheet)
+    manual = pd.DataFrame([{"date": "2026-10-22", "url": "https://youtu.be/freshvid001"}])
+    assert _manual_selector()(tmp_path, manual, "2026-10-01", 5, pd.DataFrame(),
+                              mvi.read_ledger(tmp_path / "ledger.csv")) == []
+
+
+def test_malformed_registry_schema_still_disables_admission(tmp_path, monkeypatch):
+    import manual_video_input as mvi
+
+    pvr.registry_path(tmp_path).write_text("video_id,last_status\nlegacy00001,unknown\n")
+    monkeypatch.setattr(pvr, "read_sheet_marked_ids", lambda: set())
+    manual = pd.DataFrame([{"date": "2026-10-22", "url": "https://youtu.be/freshvid001"}])
+    assert _manual_selector()(tmp_path, manual, "2026-10-01", 5, pd.DataFrame(),
+                              mvi.read_ledger(tmp_path / "ledger.csv")) == []
