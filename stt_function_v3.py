@@ -706,7 +706,12 @@ def _yt_download_subs_only(URL, video_id, subs_path, logger, subs_langs=None, vi
             return None
         except Exception as e:
             err_str = str(e)
-            is_errno11 = getattr(e, "errno", None) == 11 or "errno 11" in err_str.lower() or "resource deadlock" in err_str.lower()
+            is_errno11 = (
+                getattr(e, "errno", None) == 11
+                or "errno 11" in err_str.lower()
+                or "resource deadlock" in err_str.lower()
+                or "did not get any data blocks" in err_str.lower()
+            )
             if is_errno11 and subs_attempt < max_subs_retries - 1:
                 _cleanup_ytdlp_subs_artifacts(subs_path, video_id, logger)
                 wait_s = random.uniform(5, 12)
@@ -806,7 +811,12 @@ def _yt_download_auto_subs_only(URL, video_id, subs_path, logger, subs_langs=Non
             return None
         except Exception as e:
             err_str = str(e)
-            is_errno11 = getattr(e, "errno", None) == 11 or "errno 11" in err_str.lower() or "resource deadlock" in err_str.lower()
+            is_errno11 = (
+                getattr(e, "errno", None) == 11
+                or "errno 11" in err_str.lower()
+                or "resource deadlock" in err_str.lower()
+                or "did not get any data blocks" in err_str.lower()
+            )
             if is_errno11 and subs_attempt < max_subs_retries - 1:
                 _cleanup_ytdlp_subs_artifacts(subs_path, video_id, logger)
                 wait_s = random.uniform(5, 12)
