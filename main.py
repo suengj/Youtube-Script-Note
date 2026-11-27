@@ -1482,7 +1482,9 @@ def process_single_video(
                 logger.error(f"  Stack trace:", exc_info=True)
             
                 # Check for specific error types
-                if "RegexMatchError" in error_type:
+                if "page needs to be reloaded" in str(e).lower():
+                    logger.error("  Cause: YouTube extractor change; yt-dlp likely outdated, update yt-dlp")
+                elif "RegexMatchError" in error_type:
                     logger.error("  Cause: YouTube JavaScript structure changed or yt-dlp needs an update")
                 elif "VideoUnavailable" in error_type:
                     logger.error(f"  Cause: Video is unavailable or private")
